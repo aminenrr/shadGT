@@ -17,11 +17,8 @@ namespace Common {
 /// PERF-DIAG-007: CPU time used by each thread of this process since the previous call,
 /// as "name pct%" entries for the busiest threads (percent of one core), plus the process total.
 /// Returns an empty string where unsupported.
-#ifdef SHADGT_DIAGNOSTICS
+/// PRT-PERF: in every build, for the PRT-PERF line in Release.
 std::string SampleThreadCpuUsage(size_t max_threads);
-#else
-inline std::string SampleThreadCpuUsage(size_t) { return {}; }
-#endif
 
 #ifdef SHADGT_DIAGNOSTICS
 using DiagnosticCounter = std::atomic<u64>;

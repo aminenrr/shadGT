@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <string>
 #include <immintrin.h>
 #include <boost/container/small_vector.hpp>
+#include <fmt/format.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -97,9 +99,26 @@ void Scheduler::StartPerfMonitor() {
 #ifndef NDEBUG
     perf_monitor_thread = std::jthread(std::bind_front(&Scheduler::PerfMonitorThread, this));
 #endif
+    // PRT-PERF (pr-tests, RYGT_PERF_LINE=0 turns it off): only in builds without diagnostics;
+    // with them the perf monitor above logs its own line with the busiest threads.
+    static const bool perf_line = !Common::DiagnosticsBuilt && [] {
+        const char* env = std::getenv("RYGT_PERF_LINE");
+        return !(env && env[0] == '0');
+    }();
+    if (perf_line && !prt_perf_thread.joinable()) {
+        try {
+            prt_perf_thread = std::jthread(std::bind_front(&Scheduler::PrtPerfThread, this));
+        } catch (const std::exception& e) {
+            LOG_WARNING(Render_Vulkan, "PRT-PERF: line unavailable: {}", e.what());
+        }
+    }
 }
 
 Scheduler::~Scheduler() {
+    if (prt_perf_thread.joinable()) { // PRT-PERF
+        prt_perf_thread.request_stop();
+        prt_perf_thread.join();
+    }
     if (command_thread.joinable()) {
         command_thread.request_stop();
         ring->Wake();
@@ -749,6 +768,49 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
 }
 
 #endif
+void Scheduler::PrtPerfThread(std::stop_token stoken) {
+    // PRT-PERF (pr-tests): every 10 s, how busy the GPU was (sampled every 1 ms: submitted work
+    // not yet complete, as PERF-DIAG-007), the submits, video memory used of the budget and the
+    // busiest threads, to tell GPU-bound from CPU-bound frames in a player's Release log.
+    Common::SetCurrentThreadName("shadGT:PrtPerf");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    Common::SampleThreadCpuUsage(0);
+    auto window_start = std::chrono::steady_clock::now();
+    u64 samples = 0;
+    u64 busy_samples = 0;
+    u64 window_tick = CurrentTick();
+    while (!stoken.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        work_semaphore.Refresh();
+        const u64 submitted = work_semaphore.CurrentTick() - 1;
+        ++samples;
+        busy_samples += work_semaphore.KnownGpuTick() < submitted ? 1 : 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window_start < std::chrono::seconds{10}) {
+            continue;
+        }
+        const u64 tick = work_semaphore.CurrentTick();
+        std::string vram{"n/a"};
+        if (instance.CanReportMemoryUsage()) {
+            vram = fmt::format("{} of {} MB", instance.GetDeviceMemoryUsage() >> 20,
+                               instance.GetTotalMemoryBudget() >> 20);
+        }
+        std::string cpu = Common::SampleThreadCpuUsage(8);
+        if (cpu.empty()) {
+            cpu = "n/a";
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-PERF {:.1f} s: GPU busy {:.0f}% (95%+ = GPU-bound), {} submits; VRAM {}; "
+                    "CPU {}",
+                    std::chrono::duration<double>(now - window_start).count(),
+                    samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick, vram, cpu);
+        window_start = now;
+        window_tick = tick;
+        samples = 0;
+        busy_samples = 0;
+    }
+}
+
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadGT:GpuSchedPriorityPendingOpsRunner");
 

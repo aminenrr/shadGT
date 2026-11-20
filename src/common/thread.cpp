@@ -21,6 +21,7 @@
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
+#include "common/diagnostics.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -697,6 +698,9 @@ bool ForEachProcessThread(unsigned long access,
 }
 
 void ConfineDriverCompileThreads() {
+    if (PrewarmOnly()) {
+        return; // PRT-PREWARM-ONLY: no game to keep cores for
+    }
     const auto& classes = GetCoreClasses();
     if (!ProcessPolicyStillAllowed()) {
         ReleaseDriverCompileThreads();

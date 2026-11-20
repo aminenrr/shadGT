@@ -491,6 +491,181 @@ static bool ManifestRecordOn() {
     }();
     return on;
 }
+
+// PRT-PREWARM (pr-tests): records the game's pipelines and builds them again at the next start
+// (PipelineCache::PrtPrewarmPipelines). On by default in GT7 (RYGT_PIPELINE_PREWARM=0 turns it
+// off, =1 turns it on in any game); always on in the launcher's prewarm mode (PRT-PREWARM-ONLY).
+// Never together with shadGT's own stored pipeline prewarm (PERF-038, SHADGT_PREWARM).
+static bool PrtPrewarmOn() {
+    static const bool on = [] {
+        if (Common::PrewarmOnly()) {
+            return true;
+        }
+        const char* env = std::getenv("RYGT_PIPELINE_PREWARM");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+// PRT-DIRTY (pr-tests, RYGT_PREWARM_DIRTY_MARK=0 turns it off): a game session that records a
+// pipeline not recorded before creates <exe folder>\prewarm.dirty, once; the launcher skips its
+// prewarm pass when the file is absent (nothing new to build).
+static bool PrtDirtyMarkOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PREWARM_DIRTY_MARK");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// PRT-KEEP (pr-tests): the pipeline records, <serial>.prewarm\<vendor>-<device> in the shaders
+// folder, outside the shader store.
+static std::filesystem::path g_prt_prewarm_dir;
+
+// PRT-KEYNORM (pr-tests, RYGT_PIPELINE_KEY_NORMALIZE: on in GT7 unless =0, =1 on in any game):
+// state the pipeline build never reads is cleared from the key, so a draw and a recorded pipeline
+// (PRT-PREWARM) that differ only there get the same pipeline:
+//  - colour targets past num_color_attachments: the first pass of RefreshGraphicsKey fills
+//    color_buffers for every bound target, before the pixel shader's MRT mask is known; the
+//    build reads only the first num_color_attachments (target 0's HDR-UI bits are kept, the
+//    recorder reads them even without colour targets);
+//  - BlendControl is copied whole from the register: its alpha factors and function are read
+//    only with separate_alpha_blend, its unnamed bits and disable_rop3 never.
+static bool KeyNormalizeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PIPELINE_KEY_NORMALIZE");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+static void NormalizePipelineKey(GraphicsPipelineKey& key) {
+    if (!KeyNormalizeOn()) {
+        return;
+    }
+    const u32 used = (std::min)(key.num_color_attachments, u32{AmdGpu::NUM_COLOR_BUFFERS});
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        auto& bc = key.blend_controls[cb];
+        if (cb >= used) {
+            const u32 hdr_ui_layer = key.color_buffers[cb].hdr_ui_layer;
+            const u32 hdr_ui_alpha1 = key.color_buffers[cb].hdr_ui_alpha1;
+            std::memset(static_cast<void*>(&key.color_buffers[cb]), 0,
+                        sizeof(key.color_buffers[cb]));
+            if (cb == 0) {
+                key.color_buffers[cb].hdr_ui_layer = hdr_ui_layer;
+                key.color_buffers[cb].hdr_ui_alpha1 = hdr_ui_alpha1;
+            }
+            std::memset(static_cast<void*>(&bc), 0, sizeof(bc));
+            key.write_masks[cb] = vk::ColorComponentFlags{};
+            key.color_samples[cb] = 0;
+            continue;
+        }
+        if (!bc.enable) {
+            std::memset(static_cast<void*>(&bc), 0, sizeof(bc));
+            continue;
+        }
+        AmdGpu::BlendControl clean;
+        std::memset(static_cast<void*>(&clean), 0, sizeof(clean));
+        clean.color_src_factor = bc.color_src_factor;
+        clean.color_func = bc.color_func;
+        clean.color_dst_factor = bc.color_dst_factor;
+        if (bc.separate_alpha_blend) {
+            clean.alpha_src_factor = bc.alpha_src_factor;
+            clean.alpha_func = bc.alpha_func;
+            clean.alpha_dst_factor = bc.alpha_dst_factor;
+            clean.separate_alpha_blend = 1;
+        }
+        clean.enable = 1;
+        std::memcpy(static_cast<void*>(&bc), &clean, sizeof(bc));
+    }
+}
+
+// PRT-KEYNORM (diagnosis): the key fields two keys differ in, by name (the PRT-KEEP lines).
+static std::string DescribeKeyDiff(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
+    std::string out;
+    const auto add = [&](const std::string& name) {
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += name;
+    };
+    const auto differs = [](const auto& x, const auto& y) {
+        return std::memcmp(&x, &y, sizeof(x)) != 0;
+    };
+    if (differs(a.stage_hashes, b.stage_hashes)) {
+        add("stages");
+    }
+    if (differs(a.vertex_buffer_formats, b.vertex_buffer_formats)) {
+        add("vertex formats");
+    }
+    if (a.patch_control_points != b.patch_control_points) {
+        add("patch points");
+    }
+    if (a.num_color_attachments != b.num_color_attachments) {
+        add(fmt::format("targets {}/{}", a.num_color_attachments, b.num_color_attachments));
+    }
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        if (differs(a.color_buffers[cb], b.color_buffers[cb])) {
+            add(fmt::format("cb{} format", cb));
+        }
+        if (differs(a.blend_controls[cb], b.blend_controls[cb])) {
+            add(fmt::format("cb{} blend", cb));
+        }
+        if (a.write_masks[cb] != b.write_masks[cb]) {
+            add(fmt::format("cb{} mask", cb));
+        }
+        if (a.color_samples[cb] != b.color_samples[cb]) {
+            add(fmt::format("cb{} samples", cb));
+        }
+    }
+    if (differs(a.cb_shader_mask, b.cb_shader_mask)) {
+        add("shader mask");
+    }
+    if (a.logic_op != b.logic_op) {
+        add("logic op");
+    }
+    if (a.num_samples != b.num_samples || a.depth_samples != b.depth_samples) {
+        add("samples");
+    }
+    if (a.mrt_mask != b.mrt_mask) {
+        add("mrt");
+    }
+    if (a.z_format != b.z_format || a.stencil_format != b.stencil_format) {
+        add("depth format");
+    }
+    if (a.depth_clamp_enable != b.depth_clamp_enable) {
+        add("depth clamp");
+    }
+    if (a.alpha_to_coverage != b.alpha_to_coverage) {
+        add("alpha to coverage");
+    }
+    if (a.prim_type != b.prim_type) {
+        add(fmt::format("prim {}/{}", static_cast<u32>(a.prim_type),
+                        static_cast<u32>(b.prim_type)));
+    }
+    if (a.polygon_mode != b.polygon_mode) {
+        add("polygon mode");
+    }
+    if (a.clip_space != b.clip_space) {
+        add("clip space");
+    }
+    if (a.provoking_vtx_last != b.provoking_vtx_last) {
+        add("provoking vertex");
+    }
+    if (a.depth_clip_enable != b.depth_clip_enable) {
+        add("depth clip");
+    }
+    if (out.empty()) {
+        add("padding");
+    }
+    return out;
+}
 static_assert(std::is_trivially_copyable_v<Shader::RuntimeInfo>);
 static_assert(std::is_trivially_copyable_v<Shader::Backend::Bindings>);
 static_assert(std::is_trivially_copyable_v<Shader::Info::PinnedFetchSharp>);
@@ -1885,14 +2060,30 @@ std::filesystem::path PipelineCache::WarmComputeDir() {
 
 void PipelineCache::WarmComputePipelines(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:WarmCompute");
-    Common::PreferCompileCores();
-    SCOPE_EXIT { Common::ReleaseCompileCores(); };
-    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    // PRT-PREWARM-ONLY: counted for the launcher's progress (compute_running set by the
+    // constructor, cleared however this ends); every core, normal priority, when no game runs.
+    SCOPE_EXIT { BootProgress::compute_running.store(false, std::memory_order_release); };
+    const bool prewarm_only = Common::PrewarmOnly();
+    if (prewarm_only) {
+        Common::AllowAllCores();
+    } else {
+        Common::PreferCompileCores();
+    }
+    SCOPE_EXIT {
+        if (!prewarm_only) {
+            Common::ReleaseCompileCores();
+        }
+    };
+    Common::SetCurrentThreadPriority(prewarm_only ? Common::ThreadPriority::Normal
+                                                  : Common::ThreadPriority::Low);
     const auto policy_suffix = fmt::format("-{:#018x}", ComputePipeline::RecipePolicy(instance, profile));
     const auto files = ListComputeWarmRecipes(WarmComputeDir(), policy_suffix);
+    BootProgress::compute_done.store(0, std::memory_order_relaxed);
+    BootProgress::compute_total.store(static_cast<u32>(files.size()), std::memory_order_relaxed);
     u32 warmed = 0;
     for (const auto& file : files) {
         if (stop.stop_requested()) return;
+        BootProgress::compute_done.fetch_add(1, std::memory_order_relaxed);
         if (ComputePipeline::WarmFromRecipe(instance, profile, *pipeline_cache, file, stop)) ++warmed;
     }
     LOG_INFO(Render_Vulkan, "PERF-GT7-037: warmed {} of {} compute recipes", warmed, files.size());
@@ -2104,7 +2295,9 @@ static void NormalizeForeignRecord(ManifestRecord& r, const Shader::Profile& pro
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
     SCOPE_EXIT { g_pretranslate_pending = false; }; // FEAT-GTS-469
-    SleepUnlessStopped(stop, std::chrono::seconds{2});
+    if (!Common::PrewarmOnly()) { // PRT-PREWARM-ONLY: no game to give the first seconds to
+        SleepUnlessStopped(stop, std::chrono::seconds{2});
+    }
     if (stop.stop_requested() || !use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
         LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
         return;
@@ -2139,7 +2332,8 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     std::unordered_map<u64, Stored> programs;
     // FEAT-GTS-469: while the splash precompile holds the game for it, every logical processor
     // translates at normal priority; during play a few low-priority threads, as before.
-    const bool held = PrecompileHoldsGame();
+    // PRT-PREWARM-ONLY: no game runs, so every core at normal priority as when held.
+    const bool held = PrecompileHoldsGame() || Common::PrewarmOnly();
     const auto work = [&] {
         Common::SetCurrentThreadPriority(held ? Common::ThreadPriority::Normal
                                               : Common::ThreadPriority::Low);
@@ -2781,12 +2975,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     CreateDriverCache();
     if (WarmComputeOn()) {
         try {
+            BootProgress::compute_running.store(true, std::memory_order_release); // PRT-PREWARM-ONLY
             warm_compute_thread = std::jthread([this](std::stop_token stop) {
                 try { WarmComputePipelines(stop); }
                 catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "Warm compute stopped: {}", e.what()); }
                 catch (...) { LOG_WARNING(Render_Vulkan, "Warm compute stopped unexpectedly"); }
             });
         } catch (const std::exception& e) {
+            BootProgress::compute_running.store(false, std::memory_order_release);
             LOG_WARNING(Render_Vulkan, "Warm compute unavailable: {}", e.what());
         }
     }
@@ -2823,6 +3019,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial);
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
         g_programs_dir = cache_dir / fmt::format("{}-programs", serial); // FEAT-GTS-470
+        // PRT-KEEP: the pipeline records (PRT-PREWARM), per GPU, outside the shader store.
+        g_prt_prewarm_dir = cache_dir / fmt::format("{}.prewarm", serial) /
+                            fmt::format("{:04x}-{:04x}", instance.GetVendorID(),
+                                        instance.GetDeviceID());
         const auto manifest_on = [](const char* name) {
             const char* env = std::getenv(name);
             return env && env[0] == '1';
@@ -2875,6 +3075,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             Storage::DataBase::Instance().Open();
             use_stored_shaders = Storage::DataBase::Instance().IsOpened();
             if (use_stored_shaders) LoadElseScopeFixed();
+            if (use_stored_shaders && PrtPrewarmOn()) {
+                // PRT-PREWARM (FIX-018): what the store reads skip at this start, for the prewarm
+                // thread (the map is the command thread's from here on).
+                for (const auto& [hash, program] : else_scope_fixed) {
+                    prt_else_fixed[hash] = program.boundary;
+                }
+            }
             if (pretranslate_wanted && use_stored_shaders) { // PERF-GT7-117
                 try {
                     g_pretranslate_pending = true; // FEAT-GTS-469, before the precompile starts
@@ -2952,6 +3159,26 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
         }
     }
+    // PRT-PREWARM: after the pre-translation thread started (it waits on g_pretranslate_pending);
+    // never with PERF-038's background builds.
+    if (PrtPrewarmOn() && use_stored_shaders && !prewarm_enabled) {
+        try {
+            BootProgress::prewarm_started.store(true, std::memory_order_release); // PRT-SPLASH
+            BootProgress::prewarm_running.store(true, std::memory_order_release);
+            prt_prewarm_thread = std::jthread([this](std::stop_token stop) {
+                try { PrtPrewarmPipelines(stop); }
+                catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "PRT-PREWARM: stopped: {}", e.what()); }
+                catch (...) { LOG_WARNING(Render_Vulkan, "PRT-PREWARM: stopped unexpectedly"); }
+            });
+        } catch (const std::exception& e) {
+            BootProgress::prewarm_started.store(false, std::memory_order_release);
+            BootProgress::prewarm_running.store(false, std::memory_order_release);
+            LOG_WARNING(Render_Vulkan, "PRT-PREWARM: unavailable: {}", e.what());
+        }
+    } else if (PrtPrewarmOn()) {
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no pipeline prewarm ({})",
+                    use_stored_shaders ? "PERF-038 background builds are on" : "no shader store");
+    }
     if (CompileMode() == 1 && AsyncPipelines()) {
         static std::jthread slow_motion{SlowMotionThread}; // PERF-103
     }
@@ -2985,6 +3212,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() {
     ExitCacheRegistry().Unregister(this); // Wait for an in-flight close save before teardown.
+    if (prt_prewarm_thread.joinable()) { // PRT-PREWARM: it reads the store, tables and device
+        prt_prewarm_thread.request_stop();
+        prt_prewarm_thread.join();
+    }
     Shader::DirectLearning::Save(); // PERF-GTS-479
     if (compile_pack_thread.joinable()) { // PERF-GT7-108: before the device and caches go
         compile_pack_thread.request_stop();
@@ -3025,7 +3256,34 @@ PipelineCache::~PipelineCache() {
     scheduler.Finish();
     scheduler.PopPendingOperations();
     FlushCompletedPipelineOwners(); // PERF-SGT-017
+    {
+        // PRT-PREWARM: prewarmed pipelines no draw took (never bound) go with the retired ones.
+        std::vector<std::shared_ptr<const void>> untaken;
+        {
+            std::scoped_lock lk{prt_mutex};
+            for (auto it = prt_ready.begin(); it != prt_ready.end(); ++it) {
+                if (it.value().pipeline) {
+                    untaken.emplace_back(
+                        std::shared_ptr<GraphicsPipeline>(std::move(it.value().pipeline)));
+                }
+            }
+            prt_ready.clear();
+            prt_waiting.store(0, std::memory_order_relaxed);
+        }
+        if (!untaken.empty()) {
+            PipelineRetirementWorker().Enqueue([untaken = std::move(untaken)] {});
+        }
+    }
     PipelineRetirementWorker().Drain();
+    {
+        // PRT-PREWARM: the modules no program took, once the pipelines above are gone.
+        std::scoped_lock lk{prt_mutex};
+        for (const auto& [hash, module] : prt_modules) {
+            ForgetModuleCode(instance.GetDevice(), module);
+            instance.GetDevice().destroyShaderModule(module);
+        }
+        prt_modules.clear();
+    }
     SaveDriverCache(true);
 }
 
@@ -4836,8 +5094,8 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             return false;
         }
-        if (pending_builds.contains(S().graphics_key)) {
-            return false;
+        if (pending_builds.contains(S().graphics_key) || PrtPrewarmReady(S().graphics_key)) {
+            return false; // PRT-PREWARM: a prewarmed one is taken by its draw
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
 #ifndef NDEBUG
@@ -5044,6 +5302,9 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
 #endif
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             return !read_ahead_blocked;
+        }
+        if (!pending_builds.contains(S().graphics_key) && PrtPrewarmReady(S().graphics_key)) {
+            return true; // PRT-PREWARM: a prewarmed one is taken by its draw
         }
         if (const auto pending = pending_builds.find(S().graphics_key);
             pending != pending_builds.end()) {
@@ -5565,6 +5826,27 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         }
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(S().graphics_key);
+    if (is_new && prt_waiting.load(std::memory_order_relaxed) != 0 &&
+        !pending_builds.contains(S().graphics_key)) {
+        // PRT-PREWARM: built at start from the recorded pipelines.
+        if (auto prewarmed = PrtTakePrewarmed(S().graphics_key); prewarmed.pipeline) {
+            prewarmed.pipeline->SetStageInfos(S().infos);
+            it.value() = std::move(prewarmed.pipeline);
+            if (!S().key_uses_legacy) {
+                RegisterPipelineData(S().graphics_key,
+                                     std::hash<GraphicsPipelineKey>{}(S().graphics_key),
+                                     prewarmed.sdata);
+            }
+            retention_now = std::chrono::steady_clock::now();
+            pipeline_last_use[it->second.get()] = retention_now;
+            const u32 installed = prt_installed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (installed == 1 || installed % 250 == 0) {
+                LOG_WARNING(Render_Vulkan, "PRT-PREWARM: {} prewarmed pipelines taken by draws",
+                            installed);
+            }
+            return it->second.get();
+        }
+    }
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(S().graphics_key);
         // An async draw retries an empty map slot until its existing build completes.
@@ -5709,6 +5991,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 }
                 retention_now = std::chrono::steady_clock::now();
                 pipeline_last_use[it->second.get()] = retention_now;
+                if (it->second) {
+                    PrtNoteInstalled(); // PRT-PREWARM
+                }
                 return it->second.get();
             }
             if ((stored->async || (CompileMode() == 2 && AsyncPipelines())) &&
@@ -5915,6 +6200,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
+        if (it->second) {
+            PrtNoteInstalled(); // PRT-PREWARM
+        }
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -6369,6 +6657,9 @@ bool PipelineCache::RefreshGraphicsKey() {
         }
     }
 
+    if (KeyNormalizeOn()) {
+        NormalizePipelineKey(key); // PRT-KEYNORM
+    }
     return true;
 }
 
@@ -6845,6 +7136,552 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
 
 void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
     ApplyStoredListing(ReadStoredListing(pgm_hash), program);
+}
+
+// PRT-PREWARM (pr-tests): the pipeline prewarm, ported from shadgt7 (d0235932, 50721c9b,
+// 54ab0de3). While playing, each new pipeline's key is recorded once in a file of its own
+// (PRT-KEEP, <serial>.prewarm\<gpu>\<key hash>.pwk; its stages are the shader store's
+// translations by permutation hash). At the next start, once the manifest pre-translation is
+// done, the recorded pipelines are built on low-priority threads, paused while the game is in
+// play, from the stored translations; a draw whose key is one of them takes it instead of
+// building it, and the prewarm's modules go to the programs that load the same translations.
+// Only what a draw would build the same way: vertex and pixel stage, no geometry stage, no image
+// whose bindings count the T#'s mip levels, translations the store still has and a draw would
+// load (ApplyStoredListing and LoadStoredModule's checks), on a GPU with dynamic vertex input,
+// without shader objects or shader patches.
+namespace {
+constexpr u32 PrtRecordMagic = 0x57505247; // "GRPW"
+// PRT-KEEP: bump PrtKeyLayout whenever GraphicsPipelineKey's fields change (its size alone can
+// stay the same): records of another layout are not read. 2: shadGT's key (shadgt7's was 1).
+constexpr u32 PrtFileVersion = 2;
+constexpr u32 PrtKeyLayout = 2;
+
+u64 PrtStagesHash(const GraphicsPipelineKey& key) {
+    return XXH3_64bits(key.stage_hashes.data(), sizeof(key.stage_hashes));
+}
+
+bool PrtCountsMipLevels(const Shader::Info& info) {
+    return std::ranges::any_of(info.images, [](const auto& image) {
+        return image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+    });
+}
+
+bool PrtColorTargetsSupported(const GraphicsPipelineKey& key) {
+    if (key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
+        return false;
+    }
+    for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
+        const auto& color_buffer = key.color_buffers[cb];
+        if (color_buffer.data_format != AmdGpu::DataFormat::FormatInvalid &&
+            LiverpoolToVK::TrySurfaceFormat(color_buffer.data_format, color_buffer.num_format) ==
+                vk::Format::eUndefined) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// PRT-KEEP: a pipeline's record file. False when it was there already or not written.
+bool PrtWriteRecord(const GraphicsPipelineKey& key, u64 hash) {
+    std::error_code ec;
+    const auto file = g_prt_prewarm_dir / fmt::format("{:016x}.pwk", hash);
+    if (std::filesystem::exists(file, ec)) {
+        return false;
+    }
+    std::filesystem::create_directories(g_prt_prewarm_dir, ec);
+    const std::array<u32, 4> header{PrtRecordMagic, PrtFileVersion,
+                                    static_cast<u32>(sizeof(GraphicsPipelineKey)), PrtKeyLayout};
+    bool ok = false;
+    {
+        std::ofstream out{file, std::ios::binary | std::ios::trunc};
+        if (out) {
+            out.write(reinterpret_cast<const char*>(header.data()), sizeof(header));
+            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            ok = static_cast<bool>(out);
+        }
+    }
+    if (!ok) {
+        std::filesystem::remove(file, ec);
+    }
+    return ok;
+}
+} // namespace
+
+bool PipelineCache::PrtPrewarmReady(const GraphicsPipelineKey& key) {
+    if (prt_waiting.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::scoped_lock lk{prt_mutex};
+    return prt_ready.contains(key);
+}
+
+PipelineCache::PrtReady PipelineCache::PrtTakePrewarmed(const GraphicsPipelineKey& key) {
+    std::scoped_lock lk{prt_mutex};
+    // Not built at start any more, whether or not it was: the game has it from here.
+    prt_seen.insert(std::hash<GraphicsPipelineKey>{}(key));
+    const auto it = prt_ready.find(key);
+    if (it == prt_ready.end()) {
+        return {};
+    }
+    PrtReady ready = std::move(it.value());
+    prt_ready.erase(it);
+    prt_waiting.fetch_sub(1, std::memory_order_relaxed);
+    return ready;
+}
+
+vk::ShaderModule PipelineCache::PrtTakeModule(u64 perm_hash) {
+    if (!PrtPrewarmOn()) {
+        return {};
+    }
+    std::scoped_lock lk{prt_mutex};
+    const auto it = prt_modules.find(perm_hash);
+    if (it == prt_modules.end()) {
+        return {};
+    }
+    const auto module = it->second;
+    prt_modules.erase(it); // the program owns it from here
+    return module;
+}
+
+void PipelineCache::PrtNoteInstalled() {
+    if (!PrtPrewarmOn() || S().key_uses_legacy) {
+        return;
+    }
+    const auto& key = S().graphics_key;
+    const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
+    {
+        std::scoped_lock lk{prt_mutex};
+        prt_seen.insert(hash);
+        if (!prt_recorded.insert(hash).second) {
+            return;
+        }
+    }
+    PrtNoteMiss(key); // PRT-KEEP diagnosis
+    if (key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0 ||
+        key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0 ||
+        key.stage_hashes[u32(Shader::SwStage::Fragment)] == 0 || g_prt_prewarm_dir.empty()) {
+        return;
+    }
+    for (const auto* info : S().infos) {
+        if (info && PrtCountsMipLevels(*info)) {
+            return;
+        }
+    }
+    if (!PrtWriteRecord(key, hash)) {
+        return;
+    }
+    // PRT-DIRTY: a pipeline not recorded before: the launcher's next prewarm pass has work.
+    if (!Common::PrewarmOnly() && PrtDirtyMarkOn() && !prt_dirty_marked.exchange(true)) {
+        const auto mark =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() / "prewarm.dirty";
+        std::ofstream created{mark, std::ios::binary | std::ios::trunc};
+    }
+}
+
+// PRT-KEEP (pr-tests) diagnosis: a pipeline the game builds whose stages (the same stored
+// translations) match a recorded pipeline's but whose key differs elsewhere: the fields that
+// differ, for the first 20, then a tally every 100. Tells which state keeps such pipelines from
+// being prewarmed.
+void PipelineCache::PrtNoteMiss(const GraphicsPipelineKey& key) {
+    // PRT-KEYNORM: the differing fields by name, and a tally of them in the every-100 line.
+    static std::unordered_map<std::string, u32> by_fields; // under prt_mutex
+    std::string fields;
+    std::string tally;
+    u32 count = 0;
+    {
+        std::scoped_lock lk{prt_mutex};
+        const auto it = prt_by_stages.find(PrtStagesHash(key));
+        if (it == prt_by_stages.end()) {
+            return;
+        }
+        if (std::memcmp(&it->second, &key, sizeof(key)) == 0) {
+            return;
+        }
+        fields = DescribeKeyDiff(it->second, key);
+        ++by_fields[fields];
+        count = ++prt_misses;
+        if (count > 20 && count % 100 != 0) {
+            return;
+        }
+        if (count > 20) {
+            std::vector<std::pair<std::string, u32>> sorted(by_fields.begin(), by_fields.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& x, const auto& y) { return x.second > y.second; });
+            for (size_t n = 0; n < sorted.size() && n < 8; ++n) {
+                tally += fmt::format(" [{}]={}", sorted[n].first, sorted[n].second);
+            }
+        }
+    }
+    if (count <= 20) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-KEEP: a new pipeline has a recorded one's stages but another key (miss "
+                    "{}; differing: {}; PRT-KEYNORM {})",
+                    count, fields, KeyNormalizeOn() ? "on" : "off");
+    } else {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-KEEP: {} new pipelines had a recorded one's stages but another key "
+                    "(PRT-KEYNORM {}); most often:{}",
+                    count, KeyNormalizeOn() ? "on" : "off", tally);
+    }
+}
+
+const PipelineCache::PrtStage* PipelineCache::PrtGetStage(u64 perm_hash) {
+    {
+        std::scoped_lock lk{prt_mutex};
+        if (const auto it = prt_stages.find(perm_hash); it != prt_stages.end()) {
+            return it->second->ok ? it->second.get() : nullptr;
+        }
+    }
+    // Made outside the lock (several threads may make the same one: the first one kept wins).
+    auto stage = std::make_unique<PrtStage>();
+    const auto make = [&] {
+        auto& store = Storage::DataBase::Instance();
+        const auto meta_name = fmt::format("{:#018x}", perm_hash);
+        if (!store.Exists(Storage::BlobType::ShaderMeta, meta_name)) {
+            return;
+        }
+        std::vector<u8> meta;
+        store.Load(Storage::BlobType::ShaderMeta, meta_name, meta);
+        auto info = std::make_unique<Shader::Info>();
+        Shader::StageSpecialization spec{};
+        spec.info = info.get();
+        size_t perm_idx{};
+        Serialization::Archive ar{std::move(meta)};
+        bool valid = false;
+        try {
+            Common::RecoverableScope recoverable;
+            valid = ar.SizeBytes() >= 24 && LoadShaderMeta(ar, *info, spec, perm_idx);
+        } catch (const Common::RecoverableFailure&) {
+            valid = false;
+        }
+        if (!valid || HashCombine(info->pgm_hash, u64{perm_idx}) != perm_hash) {
+            return;
+        }
+        // D10: as ApplyStoredListing reads it.
+        info->uses_direct = std::ranges::any_of(info->buffers, [](const auto& buffer) {
+            return buffer.buffer_type == Shader::BufferType::DirectTable;
+        });
+        // FIX-018/020: translated before a translator fix (a draw translates it again).
+        if (const auto fixed = prt_else_fixed.find(info->pgm_hash);
+            fixed != prt_else_fixed.end() && perm_idx < fixed->second) {
+            return;
+        }
+        // PERF-GTS-479/490: a draw would translate it again for its direct path.
+        if (!LearnedDirectMatches(*info, profile)) {
+            return;
+        }
+        if (!info->attribute_flags_known || info->sw_stage == Shader::SwStage::Geometry ||
+            PrtCountsMipLevels(*info)) {
+            return;
+        }
+        std::vector<u32> spv;
+        store.Load(Storage::BlobType::ShaderBinary,
+                   fmt::format("{:#018x}_{}", info->pgm_hash, perm_idx), spv);
+        // LoadStoredModule's checks: a draw would translate these again.
+        if (!IsCompleteSpirv(spv)) {
+            return;
+        }
+        if (const auto emulation = FindFloatAtomicEmulation(spv);
+            emulation != FloatAtomicEmulation::None &&
+            emulation != (Shader::Backend::SPIRV::FloatAtomicExact()
+                              ? FloatAtomicEmulation::OneAtomic
+                              : FloatAtomicEmulation::BothAtomics)) {
+            return;
+        }
+        stage->module = CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
+        if (!stage->module) {
+            return;
+        }
+        stage->runtime_info = spec.runtime_info;
+        if (!spec.fetch_shader_data.Empty()) {
+            stage->fetch = spec.fetch_shader_data;
+        }
+        stage->info = std::move(info);
+        stage->ok = true;
+    };
+    try {
+        make();
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: stored permutation {:#x} not loadable: {}",
+                    perm_hash, e.what());
+        stage->ok = false;
+    }
+    vk::ShaderModule unused{};
+    const PrtStage* result = nullptr;
+    {
+        std::scoped_lock lk{prt_mutex};
+        const auto it = prt_stages.find(perm_hash);
+        if (it != prt_stages.end()) {
+            unused = stage->module; // another thread made it first
+            result = it->second->ok ? it->second.get() : nullptr;
+        } else {
+            const auto module = stage->module;
+            const bool ok = stage->ok;
+            if (!ok) {
+                unused = module;
+                stage->module = vk::ShaderModule{};
+            }
+            auto& kept = prt_stages[perm_hash];
+            kept = std::move(stage);
+            if (ok) {
+                prt_modules.emplace(perm_hash, module);
+                result = kept.get();
+            }
+        }
+    }
+    if (unused) {
+        instance.GetDevice().destroyShaderModule(unused);
+    }
+    return result;
+}
+
+void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:PrtPrewarm");
+    // PRT-SPLASH: set by the constructor before this thread starts, cleared however it ends.
+    struct PrewarmDone {
+        ~PrewarmDone() {
+            BootProgress::prewarm_running.store(false, std::memory_order_release);
+        }
+    } prewarm_done_guard;
+    const bool prewarm_only = Common::PrewarmOnly(); // PRT-PREWARM-ONLY
+    if (!prewarm_only) {
+        SleepUnlessStopped(stop, std::chrono::seconds{2});
+    }
+    // The pre-translation stores translations the pipelines are built from: after it.
+    while (!stop.stop_requested() && g_pretranslate_pending.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    }
+    if (stop.stop_requested()) {
+        return;
+    }
+    const char* why_not = nullptr;
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        why_not = "no shader store";
+    } else if (!instance.IsVertexInputDynamicState()) {
+        why_not = "the GPU has no dynamic vertex input (a draw's buffers give the vertex layout)";
+    } else if (instance.IsShaderObjectEnabled()) {
+        why_not = "shader objects are on";
+    } else if (EmulatorSettings.IsPatchShaders()) {
+        why_not = "shader patches are on";
+    } else if (g_prt_prewarm_dir.empty()) {
+        why_not = "no record folder";
+    }
+    if (why_not) {
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no pipeline prewarm: {}", why_not);
+        return;
+    }
+    std::vector<GraphicsPipelineKey> keys;
+    u32 unreadable = 0;
+    {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(g_prt_prewarm_dir, ec)) {
+            if (stop.stop_requested()) {
+                break;
+            }
+            if (entry.path().extension() != ".pwk") {
+                continue;
+            }
+            std::array<u32, 4> header{};
+            GraphicsPipelineKey key{};
+            bool ok = false;
+            {
+                std::ifstream in{entry.path(), std::ios::binary};
+                if (in) {
+                    in.read(reinterpret_cast<char*>(header.data()), sizeof(header));
+                    ok = static_cast<bool>(in) && header[0] == PrtRecordMagic &&
+                         header[1] == PrtFileVersion &&
+                         header[2] == sizeof(GraphicsPipelineKey) && header[3] == PrtKeyLayout;
+                    if (ok) {
+                        in.read(reinterpret_cast<char*>(&key), sizeof(key));
+                        ok = static_cast<bool>(in);
+                    }
+                }
+            }
+            if (ok) {
+                keys.push_back(key);
+            } else {
+                ++unreadable;
+            }
+        }
+    }
+    // PRT-KEYNORM: records written before it (or with it off) match normalised draws again.
+    for (auto& key : keys) {
+        NormalizePipelineKey(key);
+    }
+    {
+        // Two records can normalise to the same key: once each.
+        std::unordered_set<u64> unique;
+        std::erase_if(keys, [&](const GraphicsPipelineKey& key) {
+            return !unique.insert(std::hash<GraphicsPipelineKey>{}(key)).second;
+        });
+    }
+    {
+        std::scoped_lock lk{prt_mutex};
+        for (const auto& key : keys) {
+            prt_recorded.insert(std::hash<GraphicsPipelineKey>{}(key));
+            prt_by_stages.emplace(PrtStagesHash(key), key); // PRT-KEEP diagnosis
+        }
+    }
+    BootProgress::prewarm_done.store(0, std::memory_order_relaxed);
+    BootProgress::prewarm_built.store(0, std::memory_order_relaxed);
+    BootProgress::prewarm_total.store(static_cast<u32>(keys.size()), std::memory_order_relaxed);
+    if (keys.empty()) {
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no recorded pipelines yet ({} unreadable); "
+                                   "the ones built while playing are prewarmed at the next start",
+                    unreadable);
+        return;
+    }
+    const auto start_time = std::chrono::steady_clock::now();
+    std::atomic<size_t> next{0};
+    std::atomic<u32> built{0}, game_first{0}, not_buildable{0}, failed{0};
+    // PRT-KEYNORM (diagnosis): why records were not buildable.
+    std::atomic<u32> nb_targets{0}, nb_geometry{0}, nb_no_vertex{0}, nb_stage{0};
+    const auto paused = [] {
+        if (g_game_in_play.load(std::memory_order_relaxed)) {
+            return true;
+        }
+#ifdef RYTY_GPU
+        return RytyRaceRunning();
+#else
+        return false;
+#endif
+    };
+    const auto work = [&](u32 index) {
+        Common::SetCurrentThreadName(fmt::format("shadGT:PrtPrewarm{}", index).c_str());
+        if (prewarm_only) {
+            Common::AllowAllCores(); // PRT-PREWARM-ONLY: no game, every core
+        } else {
+            Common::PreferCompileCores();
+        }
+        SCOPE_EXIT {
+            if (!prewarm_only) {
+                Common::ReleaseCompileCores();
+            }
+        };
+        Common::SetCurrentThreadPriority(prewarm_only ? Common::ThreadPriority::Normal
+                                                      : Common::ThreadPriority::Low);
+        for (size_t i = next++; i < keys.size() && !stop.stop_requested(); i = next++) {
+            // Paused while the game is in play (a race): the cores and the driver are its.
+            while (!prewarm_only && paused() && !stop.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            }
+            BootProgress::prewarm_done.fetch_add(1, std::memory_order_relaxed);
+            const auto& key = keys[i];
+            const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
+            {
+                std::scoped_lock lk{prt_mutex};
+                if (prt_seen.contains(hash)) {
+                    ++game_first;
+                    continue;
+                }
+            }
+            if (!PrtColorTargetsSupported(key)) {
+                ++not_buildable;
+                ++nb_targets;
+                continue;
+            }
+            if (key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0) {
+                ++not_buildable;
+                ++nb_geometry;
+                continue;
+            }
+            if (key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0 ||
+                key.stage_hashes[u32(Shader::SwStage::Fragment)] == 0) {
+                ++not_buildable;
+                ++nb_no_vertex;
+                continue;
+            }
+            std::array<const Shader::Info*, MaxShaderStages> infos{};
+            std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+            std::array<vk::ShaderModule, MaxShaderStages> modules{};
+            const Shader::Gcn::FetchShaderData* fetch = nullptr;
+            bool usable = true;
+            for (u32 st = 0; st < MaxShaderStages; ++st) {
+                if (key.stage_hashes[st] == 0) {
+                    continue;
+                }
+                const PrtStage* stage = PrtGetStage(key.stage_hashes[st]);
+                if (!stage) {
+                    usable = false;
+                    break;
+                }
+                infos[st] = stage->info.get();
+                runtime_infos[st] = stage->runtime_info;
+                modules[st] = stage->module;
+                if (stage->fetch && (!fetch || st == u32(Shader::SwStage::Vertex))) {
+                    fetch = &*stage->fetch;
+                }
+            }
+            if (!usable) {
+                ++not_buildable;
+                ++nb_stage;
+                continue;
+            }
+            PrtReady ready;
+            try {
+                Common::RecoverableScope recoverable;
+                ready.pipeline = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos,
+                    runtime_infos, fetch, modules, ready.sdata, true);
+            } catch (const Common::RecoverableFailure&) {
+                ready.pipeline.reset();
+            } catch (...) {
+                ready.pipeline.reset();
+            }
+            if (!ready.pipeline) {
+                ++failed;
+                continue;
+            }
+            if (prewarm_only) {
+                // PRT-PREWARM-ONLY: no game takes it; what counts is the driver's cache.
+                ++built;
+                BootProgress::prewarm_built.fetch_add(1, std::memory_order_relaxed);
+                ready.pipeline.reset();
+                continue;
+            }
+            bool kept = false;
+            {
+                std::scoped_lock lk{prt_mutex};
+                if (!prt_seen.contains(hash) && !prt_ready.contains(key)) {
+                    prt_ready.emplace(key, std::move(ready));
+                    prt_waiting.fetch_add(1, std::memory_order_relaxed);
+                    kept = true;
+                }
+            }
+            if (kept) {
+                ++built;
+                BootProgress::prewarm_built.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ++game_first; // the game built it meanwhile; this one goes (outside the lock)
+                ready.pipeline.reset();
+            }
+        }
+    };
+    // PRT-PREWARM-ONLY: every core at normal priority when no game runs.
+    const u32 count = prewarm_only
+                          ? (std::max)(1u, std::thread::hardware_concurrency())
+                          : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    {
+        std::vector<std::jthread> threads;
+        for (u32 t = 0; t < count; ++t) {
+            threads.emplace_back(work, t);
+        }
+    }
+    // In the driver's cache too: the GPU thread's next MaybeSaveDriverCache writes it.
+    driver_cache_save_requested.store(true, std::memory_order_release);
+    LOG_WARNING(Render_Vulkan,
+                "PRT-PREWARM: {} recorded pipelines in {:.1f} s on {} threads: {} built, {} "
+                "skipped ({} built by the game first, {} not buildable from the store: {} "
+                "colour targets, {} geometry stage, {} no vertex or pixel stage, {} a stage not "
+                "in the store or not loadable), {} failed; {} records unreadable; PRT-KEYNORM "
+                "{}{}",
+                keys.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time)
+                    .count(),
+                count, built.load(), game_first.load() + not_buildable.load(), game_first.load(),
+                not_buildable.load(), nb_targets.load(), nb_geometry.load(), nb_no_vertex.load(),
+                nb_stage.load(), failed.load(), unreadable, KeyNormalizeOn() ? "on" : "off",
+                stop.stop_requested() ? " (stopped)" : "");
 }
 
 // PERF-038: one stored pipeline, read and parsed by the reader thread.
@@ -8041,6 +8878,12 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
                                                  Storage::DataBase& store) {
     static u64 loaded = 0;
     static u64 prefetched = 0;
+    if (&store == &Storage::DataBase::Instance()) {
+        // PRT-PREWARM: made by the pipeline prewarm already (its pipelines use this module).
+        if (const auto module = PrtTakeModule(HashCombine(pgm_hash, u64{perm_idx}))) {
+            return module;
+        }
+    }
     if (&store == &Storage::DataBase::Instance()) {
         // PERF-GT7-118: made by a store reader already.
         std::scoped_lock lk{prefetched_mutex};
@@ -10582,5 +11425,101 @@ void PipelineCache::RetireUnclaimedPrewarm(std::vector<std::shared_ptr<const voi
                  prewarm_unclaimed.size() - prewarm_settle_queue.size(),
                  prewarm_settle_queue.size(), graphics_pipelines.size());
     }
+}
+
+// PRT-PREWARM-ONLY (pr-tests): stops the start-up background builds (the launcher's cancel).
+void PipelineCache::StopStartupBuilds() {
+    for (std::jthread* thread : {&pretranslate_thread, &prt_prewarm_thread, &warm_compute_thread}) {
+        thread->request_stop(); // jthread's stop source: safe from another thread
+    }
+}
+
+// PRT-PREWARM-ONLY: the prewarm requests a save (driver_cache_save_requested) without counting
+// num_new_pipelines, so the cache is written whatever the counters say.
+int PipelineCache::SaveDriverCacheMb() {
+    std::unique_lock lock{lookup_mutex};
+    driver_cache_save_requested.store(false, std::memory_order_release);
+    SaveDriverCache(true);
+    if (driver_cache_path.empty() || rejected_driver_cache.load()) {
+        return -1;
+    }
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(driver_cache_path, ec);
+    return ec ? -1 : static_cast<int>(size >> 20);
+}
+
+// PRT-PREWARM-ONLY (pr-tests, RYGT_PREWARM_ONLY=1): the launcher's "Precompile graphics shaders"
+// step. The launcher reads the last PRT-PREWARM- line of prewarm.progress.
+int RunPrewarmOnly() {
+    using namespace std::chrono_literals;
+    const auto root = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path();
+    const auto progress_file = root / "prewarm.progress";
+    const auto cancel_file = root / "prewarm.cancel";
+    std::error_code ec;
+    std::filesystem::remove(cancel_file, ec);
+    const auto start = std::chrono::steady_clock::now();
+    const auto seconds = [&] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    // One line to stdout and the progress file (rewritten whole).
+    std::string last_line;
+    const auto report = [&](const std::string& line) {
+        if (line == last_line) {
+            return;
+        }
+        last_line = line;
+        std::fprintf(stdout, "%s\n", line.c_str());
+        std::fflush(stdout);
+        if (std::FILE* f = std::fopen(progress_file.string().c_str(), "w")) {
+            std::fprintf(f, "%s\n", line.c_str());
+            std::fclose(f);
+        }
+    };
+    // The pipeline cache registers itself at the end of its constructor.
+    for (int i = 0; i < 300 && !ExitCacheRegistry().Invoke([](PipelineCache&) {}); ++i) {
+        std::this_thread::sleep_for(100ms);
+    }
+    LOG_WARNING(Render_Vulkan, "PRT-PREWARM-ONLY: renderer set up as in game; building the "
+                               "recorded pipelines and compute recipes on every core");
+    bool cancelled = false;
+    for (;;) {
+        const bool translating = g_pretranslate_pending.load(std::memory_order_acquire);
+        const bool prewarming = BootProgress::prewarm_running.load(std::memory_order_acquire);
+        const bool computing = BootProgress::compute_running.load(std::memory_order_acquire);
+        const u32 pipe_done = BootProgress::prewarm_done.load(std::memory_order_relaxed);
+        const u32 pipe_total = BootProgress::prewarm_total.load(std::memory_order_relaxed);
+        const PrecompileProgress translate = GetPretranslateProgress();
+        report(fmt::format(
+            "PRT-PREWARM-PROGRESS {}/{} phase {} translate {}/{} compute {}/{}",
+            (std::min)(pipe_done, pipe_total), pipe_total,
+            translating ? "translate" : prewarming ? "pipelines" : computing ? "compute" : "save",
+            translate.done, translate.total,
+            BootProgress::compute_done.load(std::memory_order_relaxed),
+            BootProgress::compute_total.load(std::memory_order_relaxed)));
+        if (!translating && !prewarming && !computing) {
+            break;
+        }
+        if (!cancelled && std::filesystem::exists(cancel_file, ec)) {
+            cancelled = true;
+            LOG_WARNING(Render_Vulkan, "PRT-PREWARM-ONLY: cancelled after {:.1f} s", seconds());
+            ExitCacheRegistry().Invoke([](PipelineCache& cache) { cache.StopStartupBuilds(); });
+        }
+        std::this_thread::sleep_for(200ms);
+    }
+    std::filesystem::remove(cancel_file, ec);
+    const auto save_start = std::chrono::steady_clock::now();
+    int saved_mb = -1;
+    ExitCacheRegistry().Invoke(
+        [&saved_mb](PipelineCache& cache) { saved_mb = cache.SaveDriverCacheMb(); });
+    const u32 pipe_total = BootProgress::prewarm_total.load();
+    const std::string done = fmt::format(
+        "PRT-PREWARM-DONE {} pipelines {}/{} compute {}/{} in {:.1f} s, driver cache {} ({:.1f} s)",
+        cancelled ? "cancelled" : "ok", (std::min)(BootProgress::prewarm_done.load(), pipe_total),
+        pipe_total, BootProgress::compute_done.load(), BootProgress::compute_total.load(),
+        seconds(), saved_mb >= 0 ? fmt::format("{} MB saved", saved_mb) : std::string{"unchanged"},
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - save_start).count());
+    LOG_WARNING(Render_Vulkan, "{}", done);
+    report(done);
+    return cancelled ? 2 : 0;
 }
 }

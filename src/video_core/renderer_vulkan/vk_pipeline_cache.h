@@ -118,6 +118,13 @@ bool CompileSlowMotion();
 u32 PipelineBuildsRunning();
 /// Active shader translation or driver pipeline compilation, independent of guest-clock holds.
 bool CompilationInProgress();
+/// PRT-PREWARM-ONLY (pr-tests, RYGT_PREWARM_ONLY=1): called once the renderer is set up as in
+/// game and before the game's code runs. Waits for the manifest pre-translation, the recorded
+/// pipeline prewarm (PRT-PREWARM) and the compute recipes (all on every core), writes
+/// PRT-PREWARM-PROGRESS lines (stdout and <exe folder>\prewarm.progress), stops early when
+/// prewarm.cancel appears there and saves the driver's pipeline cache. Returns the exit code (0,
+/// 2 when cancelled); the caller ends the process without DLL teardown.
+int RunPrewarmOnly();
 
 /// NAT-031: the pipeline cache's lookup lock. The command and recorder threads take it
 /// exclusively (as before); game job threads looking pipelines up take it shared, and step aside
@@ -258,6 +265,11 @@ public:
     LookupLock& LookupMutex() {
         return lookup_mutex;
     }
+    /// PRT-PREWARM-ONLY (pr-tests): stops the start-up background builds (cancel).
+    void StopStartupBuilds();
+    /// PRT-PREWARM-ONLY (pr-tests): saves the driver cache now and waits for the write; the
+    /// file's size in MB, or -1 when there is no driver cache file.
+    int SaveDriverCacheMb();
 #ifndef NDEBUG
     // Diagnostic only: drops rather than waiting for the cache lookup lock.
     void TraceRecorderSelected(const GraphicsPipeline& pipeline, const DrawIndirectParams& params) noexcept;
@@ -910,6 +922,51 @@ private:
     std::deque<u64> prefetched_order;
     static constexpr size_t MaxPrefetchedModules = 1024;
     u64 prefetched_evicted = 0; ///< under prefetched_mutex
+
+    /// PRT-PREWARM (pr-tests, RYGT_PIPELINE_PREWARM, on for GT7 unless =0): each pipeline the
+    /// game installs is recorded once (its key alone, <serial>.prewarm\<gpu>\<key>.pwk, PRT-KEEP;
+    /// its stages are the shader store's translations by permutation hash). At the next start,
+    /// after the manifest pre-translation, the recorded pipelines are built on low-priority
+    /// threads (paused in races) from the stored translations, and a draw whose key is one of
+    /// them takes it instead of building it. Separate from PERF-038 (SHADGT_PREWARM): never both.
+    struct PrtStage {
+        std::unique_ptr<Shader::Info> info;
+        Shader::RuntimeInfo runtime_info{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch;
+        vk::ShaderModule module{};
+        bool ok = false;
+    };
+    struct PrtReady {
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        GraphicsPipeline::SerializationSupport sdata{};
+    };
+    void PrtPrewarmPipelines(std::stop_token stop);
+    /// The stage of a stored permutation (HashCombine(program, index)); null when it can't be
+    /// built from the store as a draw would use it.
+    const PrtStage* PrtGetStage(u64 perm_hash);
+    /// A new pipeline was installed for the current key: recorded once (PRT-DIRTY marks it).
+    void PrtNoteInstalled();
+    /// PRT-KEEP diagnosis: a new key whose stages match a recorded key's: which fields differ.
+    void PrtNoteMiss(const GraphicsPipelineKey& key);
+    /// A prewarmed pipeline for the key, taken out (no pipeline when none).
+    PrtReady PrtTakePrewarmed(const GraphicsPipelineKey& key);
+    bool PrtPrewarmReady(const GraphicsPipelineKey& key);
+    /// A stored permutation's module made by the prewarm, handed to the program that loads it.
+    vk::ShaderModule PrtTakeModule(u64 perm_hash);
+    std::mutex prt_mutex;
+    std::unordered_map<u64, std::unique_ptr<PrtStage>> prt_stages; ///< by permutation hash
+    /// Modules not taken by a program yet (destroyed at exit), by permutation hash.
+    std::unordered_map<u64, vk::ShaderModule> prt_modules;
+    std::unordered_set<u64> prt_seen;     ///< keys (hashed) the game built or took
+    std::unordered_set<u64> prt_recorded; ///< keys (hashed) already recorded
+    std::unordered_map<u64, size_t> prt_else_fixed; ///< FIX-018 boundaries at start
+    std::unordered_map<u64, GraphicsPipelineKey> prt_by_stages; ///< PRT-KEEP diagnosis
+    u32 prt_misses = 0;                                         ///< under prt_mutex
+    tsl::robin_map<GraphicsPipelineKey, PrtReady> prt_ready;
+    std::atomic<u32> prt_waiting{}; ///< size of prt_ready
+    std::atomic<u32> prt_installed{};
+    std::atomic<bool> prt_dirty_marked{}; ///< PRT-DIRTY: prewarm.dirty written this session
+    std::jthread prt_prewarm_thread;
 
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;

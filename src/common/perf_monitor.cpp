@@ -42,8 +42,7 @@ GameFrameTotals GetGameFrameTotals() {
     return {frames, cadence_us.load(std::memory_order_relaxed)};
 }
 
-#ifdef SHADGT_DIAGNOSTICS
-
+// PRT-PERF: the thread sampling below is built without diagnostics too (the PRT-PERF line).
 #ifdef _WIN32
 namespace {
 
@@ -163,6 +162,8 @@ std::string SampleThreadCpuUsage(size_t) {
     return {};
 }
 #endif
+
+#ifdef SHADGT_DIAGNOSTICS
 
 u64 PhaseTimer::ReadTscFallback() {
     return std::chrono::steady_clock::now().time_since_epoch().count();

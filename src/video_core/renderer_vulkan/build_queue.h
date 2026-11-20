@@ -25,6 +25,22 @@ inline std::atomic<u32> g_build_jobs{0};
 /// cores at its usual width, and background compiles that read it pause.
 inline std::atomic<bool> g_game_in_play{false};
 
+/// PRT-SPLASH (pr-tests): progress of the recorded pipeline prewarm (PRT-PREWARM) for the splash
+/// screen's bar and the launcher's prewarm mode. The manifest pre-translation keeps its own
+/// counters (GetPretranslateProgress). Totals are 0 until the work knows them; `running` is set
+/// before its thread starts and cleared when it ends; `started` stays set once it was.
+namespace BootProgress {
+inline std::atomic<bool> prewarm_started{false};
+inline std::atomic<bool> prewarm_running{false};
+inline std::atomic<u32> prewarm_total{0};
+inline std::atomic<u32> prewarm_done{0};
+inline std::atomic<u32> prewarm_built{0};
+// PRT-PREWARM-ONLY (pr-tests): the compute recipes (PERF-GT7-037) built at start.
+inline std::atomic<bool> compute_running{false};
+inline std::atomic<u32> compute_total{0};
+inline std::atomic<u32> compute_done{0};
+} // namespace BootProgress
+
 /// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run last-first,
 /// then FIX-GT7-009's Screen jobs (draws skipped again) in order, then Soon jobs (a draw went
 /// on, PERF-GT7-025) in draw order, then PERF-171's tessellated read-ahead jobs (the cars), then

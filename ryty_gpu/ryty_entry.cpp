@@ -73,6 +73,7 @@ extern "C" void __llvm_profile_initialize_file();
 
 namespace Libraries::SystemService {
 void NoteGameDrew(); // ryty_stubs.cpp: the splash screen ends at the game's first drawn frame
+bool IsSplashVisible(); // ryty_stubs.cpp (PRT-SPLASH)
 }
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // ryty_write_watch.cpp
@@ -333,6 +334,117 @@ void DrawPrecompileProgress() {
     DrawProgressBar(shown, state, doing, "Shaders ready", 0.90f);
 }
 
+// PRT-SPLASH (pr-tests, from shadgt7 d0235932/50721c9b): with Show Splash on, while the manifest
+// pre-translation (GetPretranslateProgress) and the recorded pipeline prewarm (PRT-PREWARM,
+// Vulkan::BootProgress) run at start, a bar near the bottom of the splash screen: "Building
+// shaders 12,345 / 25,226", then "Building pipelines", then "Shaders ready   N pipelines" held 2 s.
+// Drawn by the present thread from the workers' counters; hidden in a race. Used instead of
+// DrawPrecompileProgress once the prewarm started. RYGT_SPLASH_SHADER_PROGRESS=0 turns it off.
+bool SplashProgressOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SPLASH_SHADER_PROGRESS");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+std::string WithThousands(u64 value) {
+    std::string digits = std::to_string(value);
+    for (int at = static_cast<int>(digits.size()) - 3; at > 0; at -= 3) {
+        digits.insert(static_cast<size_t>(at), ",");
+    }
+    return digits;
+}
+
+void DrawBootShaderProgress() {
+    if (!EmulatorSettings.IsShowSplash()) {
+        return;
+    }
+    namespace Progress = Vulkan::BootProgress;
+    using Clock = std::chrono::steady_clock;
+    static bool armed = false;
+    static bool saw_work = false;
+    static Clock::time_point finished{};
+    const auto translate = Vulkan::GetPretranslateProgress();
+    const bool translating = translate.active;
+    const bool prewarming = Progress::prewarm_running.load(std::memory_order_acquire);
+    const bool running = translating || prewarming;
+    // PRT-SPLASH: the work can start, and even end, before the splash screen shows: it is noted
+    // from the start, and the bar arms on the splash screen's first frame.
+    saw_work |= running;
+    if (!armed) {
+        if (!saw_work || !Libraries::SystemService::IsSplashVisible()) {
+            return;
+        }
+        armed = true;
+    }
+    float alpha = 1.0f;
+    if (running) {
+        finished = {};
+    } else {
+        if (finished == Clock::time_point{}) {
+            finished = Clock::now();
+        }
+        const float since = std::chrono::duration<float>(Clock::now() - finished).count();
+        alpha = std::clamp(1.0f - (since - 2.0f) / 0.5f, 0.0f, 1.0f);
+        if (alpha <= 0.0f) {
+            return;
+        }
+    }
+    if (Vulkan::g_game_in_play.load(std::memory_order_relaxed)) {
+        return; // a race: the prewarm pauses there too
+    }
+    u64 done = 0;
+    u64 total = 0;
+    const char* what = "Building shaders";
+    if (translating) {
+        done = translate.done;
+        total = translate.total;
+    } else if (prewarming) {
+        what = "Building pipelines";
+        done = Progress::prewarm_done.load(std::memory_order_relaxed);
+        total = Progress::prewarm_total.load(std::memory_order_relaxed);
+    }
+    done = (std::min)(done, total);
+    const float fraction = running ? (total ? float(done) / float(total) : 0.0f) : 1.0f;
+    char text[128];
+    if (!running) {
+        const u64 pipelines = Progress::prewarm_total.load(std::memory_order_relaxed);
+        if (pipelines != 0) {
+            std::snprintf(text, sizeof(text), "Shaders ready   %s pipelines",
+                          WithThousands(pipelines).c_str());
+        } else {
+            std::snprintf(text, sizeof(text), "Shaders ready");
+        }
+    } else if (total == 0) {
+        std::snprintf(text, sizeof(text), "%s...", what);
+    } else {
+        std::snprintf(text, sizeof(text), "%s   %s / %s   %.0f%%", what,
+                      WithThousands(done).c_str(), WithThousands(total).c_str(),
+                      fraction * 100.0f);
+    }
+    const auto a = [alpha](float value) { return static_cast<int>(value * alpha); };
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float width = std::clamp(viewport->Size.x * 0.36f, 240.0f, 720.0f);
+    const float bar_height = 6.0f;
+    const ImVec2 bar_min{viewport->Pos.x + (viewport->Size.x - width) * 0.5f,
+                         viewport->Pos.y + viewport->Size.y * 0.90f};
+    const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
+    draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, a(70)), bar_height * 0.5f);
+    if (fraction > 0.0f) {
+        draw->AddRectFilled(bar_min, {bar_min.x + width * fraction, bar_max.y},
+                            IM_COL32(70, 150, 255, a(175)), bar_height * 0.5f);
+    }
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const ImVec2 at{bar_min.x + (width - size.x) * 0.5f, bar_min.y - size.y - 6.0f};
+    for (const ImVec2 offset : {ImVec2{-1, 0}, ImVec2{1, 0}, ImVec2{0, -1}, ImVec2{0, 1},
+                                ImVec2{1, 1}, ImVec2{2, 2}}) {
+        draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, a(150)), text);
+    }
+    draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
+}
+
 // PERF-100: while a new shader compiles and the game is held, a translucent notice with a
 // moving bar over the last frame. Not for compiles shorter than 0.15 s.
 void DrawCompileNotice() {
@@ -447,7 +559,14 @@ void DrawFpsCounter() {
     DrawWatermark();
     Ryty::DrawControllerOverlay();
     Ryty::Camera::DrawOverlay();
-    DrawPrecompileProgress();
+    // PRT-SPLASH: the prewarm's bar replaces the precompile's once the prewarm started (shadGT's
+    // own PERF-038 precompile is off then).
+    if (SplashProgressOn() &&
+        Vulkan::BootProgress::prewarm_started.load(std::memory_order_acquire)) {
+        DrawBootShaderProgress();
+    } else {
+        DrawPrecompileProgress();
+    }
     if (!Vulkan::GetPrecompileProgress().active) {
         DrawCompileNotice();
     }
@@ -643,6 +762,15 @@ void Ryty::RytyLibraryInitialize() {
 
     Core::Loader::SymbolsResolver resolver;
     Libraries::GnmDriver::RegisterLib(&resolver);
+    // PRT-PREWARM-ONLY (pr-tests, RYGT_PREWARM_ONLY=1): the renderer is now set up as in game
+    // (instance, device, pipeline cache); the launcher's shader step builds what was recorded and
+    // the process ends here, before the game's code runs.
+    if (Common::PrewarmOnly()) {
+        const int code = Vulkan::RunPrewarmOnly();
+        Common::Log::Flush();
+        std::fflush(stdout);
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+    }
     Libraries::VideoOut::RegisterLib(&resolver);
     // ryGT: shadGT's on-screen keyboard (inline keyboard and keyboard dialog).
     Libraries::Ime::RegisterLib(&resolver);

@@ -553,6 +553,8 @@ private:
 #ifndef NDEBUG
     void PerfMonitorThread(std::stop_token stoken);
 #endif
+    /// PRT-PERF (pr-tests): one PRT-PERF line every 10 s in builds without diagnostics.
+    void PrtPerfThread(std::stop_token stoken);
 
 private:
     const Instance& instance;
@@ -596,6 +598,7 @@ private:
 #ifndef NDEBUG
     std::jthread perf_monitor_thread;
 #endif
+    std::jthread prt_perf_thread; ///< PRT-PERF; last, so it stops before the members it reads.
 };
 
 } // namespace Vulkan
