@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
@@ -106,6 +107,48 @@ static void EnsureSrtWalkerSignalHandler() {
     });
 }
 
+// PRT-SRTUSE (pr-tests, RYGT_SRT_USE_LOG, on unless =0): logs SRT walker code use each time the
+// reserved or live bytes cross another 16 MB, and every refused walker, so a launcher prewarm
+// that stops (shadgt7 B5: abort after "SRT walker code uses 240 MB of 256 MB") shows how full
+// shadGT's walker storage was.
+static bool SrtUseLogOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SRT_USE_LOG");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+static void ReportSrtWalkerUse(const char* refused = nullptr) {
+    if (!SrtUseLogOn()) return;
+    static std::atomic<size_t> next_report{16_MB};
+    static std::atomic<u32> refusals{};
+    const auto use = g_srt_storage->CurrentUsage();
+    if (refused) {
+        if (refusals.fetch_add(1) < 32)
+            LOG_WARNING(Render_Recompiler,
+                        "PRT-SRTUSE: SRT walker refused ({}): {} MB reserved, {} MB live of {} MB",
+                        refused, use.reserved >> 20, use.live >> 20, use.limit >> 20);
+        return;
+    }
+    const size_t used = (std::max)(use.reserved, use.live);
+    auto next = next_report.load();
+    if (used >= next && next_report.compare_exchange_strong(next, (used / 16_MB + 1) * 16_MB))
+        LOG_WARNING(Render_Recompiler,
+                    "PRT-SRTUSE: SRT walker code uses {} MB reserved, {} MB live of {} MB",
+                    use.reserved >> 20, use.live >> 20, use.limit >> 20);
+}
+static std::shared_ptr<Shader::SrtWalkerStorage<>::WalkerLease> PublishWalker(const u8* code,
+                                                                             size_t size) {
+    try {
+        auto owner = g_srt_storage->Publish(code, size);
+        ReportSrtWalkerUse();
+        return owner;
+    } catch (const Common::RecoverableFailure& e) {
+        ReportSrtWalkerUse(e.what());
+        throw;
+    }
+}
+
 namespace Shader {
 
 WalkerCode RegisterWalkerCode(const u8* ptr, size_t size, u64 key) {
@@ -116,7 +159,7 @@ WalkerCode RegisterWalkerCode(const u8* ptr, size_t size, u64 key) {
     (void)key;
 #endif
     EnsureSrtWalkerSignalHandler();
-    auto owner = g_srt_storage->Publish(ptr, size);
+    auto owner = PublishWalker(ptr, size);
 #ifndef NDEBUG
     if (trace) { ++SrtArenaTrace::counters.cache_misses; SrtArenaTrace::counters.cache_allocated += size; SrtArenaTrace::Progress(); }
 #endif
@@ -818,7 +861,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
 #endif
 
     EnsureSrtWalkerSignalHandler();
-    auto owner = g_srt_storage->Publish(c.getCode(), c.getSize());
+    auto owner = PublishWalker(c.getCode(), c.getSize());
     info.srt_info.walker_func = reinterpret_cast<PFN_SrtWalker>(const_cast<u8*>(owner->Code()));
     info.srt_info.walker_func_size = c.getSize();
     info.srt_walker_owner = std::move(owner);

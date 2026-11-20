@@ -101,6 +101,7 @@ public:
                 segment.hint = (slot + 1) % segment.slots;
                 lease->storage = this; lease->segment = n; lease->first = first;
                 lease->count = count; lease->code = target;
+                use_live += count * SlotBytes; // PRT-SRTUSE
 #ifndef NDEBUG
                 const auto live_now = (live_bytes += count * SlotBytes);
                 if (live_now > high_water) high_water = live_now;
@@ -127,6 +128,13 @@ public:
         return 0;
     }
     bool Contains(const void* address) const noexcept { return Available(address) != 0; }
+    // PRT-SRTUSE (pr-tests): bytes reserved (segments made), live (slots held) and the limit, in
+    // every build, for the walker usage log line.
+    struct Usage { std::size_t reserved, live, limit; };
+    Usage CurrentUsage() {
+        std::scoped_lock lock{mutex};
+        return {reserved, use_live, SegmentBytes * SegmentCount};
+    }
 #ifndef NDEBUG
     struct Statistics { std::size_t reserved, live, high_water, reclaimed, allocations, releases; };
     Statistics Stats() {
@@ -142,6 +150,7 @@ private:
             segment.live[i / 64].fetch_and(~(std::uint64_t{1} << (i % 64)), std::memory_order_release);
         segment.free_slots += count;
         segment.hint = first;
+        use_live -= count * SlotBytes; // PRT-SRTUSE
 #ifndef NDEBUG
         live_bytes -= count * SlotBytes;
         reclaimed_bytes += count * SlotBytes;
@@ -150,6 +159,7 @@ private:
     }
     std::mutex mutex;
     std::size_t reserved{};
+    std::size_t use_live{}; ///< PRT-SRTUSE
 #ifndef NDEBUG
     std::size_t live_bytes{}, high_water{}, reclaimed_bytes{}, allocations{}, releases{};
 #endif
