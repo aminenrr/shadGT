@@ -836,6 +836,7 @@ private:
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
+    u64 device_local_bytes{}; ///< PRT-VRAMAUTO: the device-local heaps' size
     std::vector<size_t> valid_heaps;
 };
 
