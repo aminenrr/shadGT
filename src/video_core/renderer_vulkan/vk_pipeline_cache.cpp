@@ -78,6 +78,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "common/scm_rev.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "common/read_capture.h"
@@ -7444,6 +7445,17 @@ const PipelineCache::PrtStage* PipelineCache::PrtGetStage(u64 perm_hash) {
     return result;
 }
 
+static bool PrtSkipUnbuildableOn() {
+    const char* env = std::getenv("RYGT_PREWARM_SKIP_UNBUILDABLE");
+    return !(env && env[0] == '0');
+}
+
+static std::string PrtUnbuildableIdentity(const Instance& instance) {
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    return fmt::format("PRT-UNBUILDABLE 1 renderer {} driver {:08x} device {:04x}-{:04x}",
+                       Common::g_scm_rev, props.driverVersion, props.vendorID, props.deviceID);
+}
+
 void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:PrtPrewarm");
     // PRT-SPLASH: set by the constructor before this thread starts, cleared however it ends.
@@ -7524,6 +7536,25 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
             return !unique.insert(std::hash<GraphicsPipelineKey>{}(key)).second;
         });
     }
+    const bool skip_unbuildable = PrtSkipUnbuildableOn();
+    const auto unbuildable_path = g_prt_prewarm_dir / "unbuildable.txt";
+    const std::string unbuildable_identity = PrtUnbuildableIdentity(instance);
+    std::unordered_set<u64> marked_unbuildable;
+    u32 skipped_marked = 0;
+    if (skip_unbuildable) {
+        std::ifstream in{unbuildable_path};
+        std::string line;
+        if (in && std::getline(in, line) && line == unbuildable_identity) {
+            while (std::getline(in, line)) {
+                if (!line.empty()) {
+                    marked_unbuildable.insert(std::strtoull(line.c_str(), nullptr, 16));
+                }
+            }
+        } else if (in) {
+            LOG_WARNING(Render_Vulkan, "PRT-UNBUILDABLE: renderer or driver changed, every "
+                                       "record is tried again");
+        }
+    }
     {
         std::scoped_lock lk{prt_mutex};
         for (const auto& key : keys) {
@@ -7531,6 +7562,23 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
             prt_by_stages.emplace(PrtStagesHash(key), key); // PRT-KEEP diagnosis
         }
     }
+    if (!marked_unbuildable.empty()) {
+        std::erase_if(keys, [&](const GraphicsPipelineKey& key) {
+            if (!marked_unbuildable.contains(std::hash<GraphicsPipelineKey>{}(key))) {
+                return false;
+            }
+            ++skipped_marked;
+            return true;
+        });
+    }
+    std::mutex unbuildable_mutex;
+    std::vector<u64> new_unbuildable;
+    const auto mark_unbuildable = [&](u64 hash) {
+        if (skip_unbuildable) {
+            std::scoped_lock lk{unbuildable_mutex};
+            new_unbuildable.push_back(hash);
+        }
+    };
     BootProgress::prewarm_done.store(0, std::memory_order_relaxed);
     BootProgress::prewarm_built.store(0, std::memory_order_relaxed);
     BootProgress::prewarm_total.store(static_cast<u32>(keys.size()), std::memory_order_relaxed);
@@ -7586,17 +7634,20 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
             }
             if (!PrtColorTargetsSupported(key)) {
                 ++not_buildable;
+                mark_unbuildable(hash);
                 ++nb_targets;
                 continue;
             }
             if (key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0) {
                 ++not_buildable;
+                mark_unbuildable(hash);
                 ++nb_geometry;
                 continue;
             }
             if (key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0 ||
                 key.stage_hashes[u32(Shader::SwStage::Fragment)] == 0) {
                 ++not_buildable;
+                mark_unbuildable(hash);
                 ++nb_no_vertex;
                 continue;
             }
@@ -7623,6 +7674,7 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
             }
             if (!usable) {
                 ++not_buildable;
+                mark_unbuildable(hash);
                 ++nb_stage;
                 continue;
             }
@@ -7639,6 +7691,7 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
             }
             if (!ready.pipeline) {
                 ++failed;
+                mark_unbuildable(hash);
                 continue;
             }
             if (prewarm_only) {
@@ -7691,6 +7744,22 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
                 not_buildable.load(), nb_targets.load(), nb_geometry.load(), nb_no_vertex.load(),
                 nb_stage.load(), failed.load(), unreadable, KeyNormalizeOn() ? "on" : "off",
                 stop.stop_requested() ? " (stopped)" : "");
+    if (skip_unbuildable) {
+        if (!stop.stop_requested()) {
+            for (const u64 hash : new_unbuildable) {
+                marked_unbuildable.insert(hash);
+            }
+            std::ofstream out{unbuildable_path, std::ios::trunc};
+            out << unbuildable_identity << '\n';
+            for (const u64 hash : marked_unbuildable) {
+                out << fmt::format("{:016x}", hash) << '\n';
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "PRT-UNBUILDABLE: {} records skipped as not buildable on this "
+                                   "renderer and driver, {} newly marked, {} marked in all "
+                                   "(RYGT_PREWARM_SKIP_UNBUILDABLE=0 tries them all)",
+                    skipped_marked, new_unbuildable.size(), marked_unbuildable.size());
+    }
 }
 
 // PERF-038: one stored pipeline, read and parsed by the reader thread.
