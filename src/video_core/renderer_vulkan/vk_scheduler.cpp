@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "common/nvtx.h"
 #include "video_core/amdgpu/draw_pipe.h"
+#include "video_core/renderer_vulkan/compile_width.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "ryty_gpu/ryty_diag.h"
 #include "parallel_submit_context.h"
@@ -700,6 +701,27 @@ void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
     }
 }
 
+// PERF-GT7-160 (port): a GPU stall: busy throughout with no GPU tick progress for StallSeconds,
+// reported once until the GPU moves again; the compile ceiling may be lowered on it, from the
+// monitor thread (the command thread may be the one stuck on the GPU).
+struct GpuStallWatch {
+    u64 gpu_tick = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    bool reported = false;
+    void Sample(u64 tick, bool busy, std::chrono::steady_clock::time_point now) {
+        if (!busy || tick != gpu_tick) {
+            gpu_tick = tick;
+            since = now;
+            reported = false;
+        } else if (!reported && now - since >= std::chrono::seconds{StallSeconds}) {
+            if (const auto hook = g_gpu_stall_hook.load()) {
+                hook();
+            }
+            reported = true;
+        }
+    }
+};
+
 #ifndef NDEBUG
 void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     // PERF-DIAG-007: every 2 s, how busy the GPU was (sampled: submitted work not yet complete)
@@ -718,13 +740,16 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     u64 samples = 0;
     u64 busy_samples = 0;
     u64 window_tick = CurrentTick();
+    GpuStallWatch stall_watch; // PERF-GT7-160 (port)
     while (!stoken.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
         work_semaphore.Refresh();
         const u64 submitted = work_semaphore.CurrentTick() - 1;
         ++samples;
-        busy_samples += work_semaphore.KnownGpuTick() < submitted ? 1 : 0;
+        const u64 gpu_tick = work_semaphore.KnownGpuTick();
+        busy_samples += gpu_tick < submitted ? 1 : 0;
         const auto now = std::chrono::steady_clock::now();
+        stall_watch.Sample(gpu_tick, gpu_tick < submitted, now); // PERF-GT7-160 (port)
         if (now - window_start < std::chrono::seconds{2}) {
             continue;
         }
@@ -779,13 +804,16 @@ void Scheduler::PrtPerfThread(std::stop_token stoken) {
     u64 samples = 0;
     u64 busy_samples = 0;
     u64 window_tick = CurrentTick();
+    GpuStallWatch stall_watch; // PERF-GT7-160 (port)
     while (!stoken.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
         work_semaphore.Refresh();
         const u64 submitted = work_semaphore.CurrentTick() - 1;
         ++samples;
-        busy_samples += work_semaphore.KnownGpuTick() < submitted ? 1 : 0;
+        const u64 gpu_tick = work_semaphore.KnownGpuTick();
+        busy_samples += gpu_tick < submitted ? 1 : 0;
         const auto now = std::chrono::steady_clock::now();
+        stall_watch.Sample(gpu_tick, gpu_tick < submitted, now); // PERF-GT7-160 (port)
         if (now - window_start < std::chrono::seconds{10}) {
             continue;
         }

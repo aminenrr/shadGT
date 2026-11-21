@@ -81,6 +81,7 @@
 #include "common/scm_rev.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/build_queue.h"
+#include "video_core/renderer_vulkan/compile_width.h"
 #include "common/read_capture.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "video_core/renderer_vulkan/compile_pack.h"
@@ -1297,6 +1298,14 @@ class PipelineCache::PipelineBuildWorkers {
 public:
     PipelineBuildWorkers()
         : queue{NumWorkers(), std::max(1u, NumWorkers() / 4), StartupWorkers()} {
+        // PERF-GT7-160 (port): the ceiling learned for this GPU + driver (LearnCeiling).
+        {
+            std::scoped_lock lk{learn_mutex};
+            if (ceiling_learned != 0) {
+                queue.SetCeiling(ceiling_learned);
+            }
+            learning = this;
+        }
         // Translation and pipeline pools share a topology-derived CPU budget.
         // Idle workers sleep; compiler priority leaves critical game threads first choice.
         for (u32 i = 0; i < NumWorkers(); ++i) {
@@ -1304,6 +1313,10 @@ public:
         }
     }
     ~PipelineBuildWorkers() {
+        {
+            std::scoped_lock lk{learn_mutex}; // PERF-GT7-160 (port)
+            if (learning == this) learning = nullptr;
+        }
         if (catch_up) SetCatchUpPolicy(false);
         if (backlog) Common::SetCompileBacklog(false); // FIX-GT7-106 (port)
         if (in_play) Common::SetCompileInPlay(false);  // FIX-GT7-109 (port)
@@ -1395,6 +1408,93 @@ public:
     size_t Pending() {
         return queue.Pending(); // DIAG-GT7-012 (port)
     }
+
+    // PERF-GT7-160 (port of RyGT-Team/shadgt7#45, adapted to this tree's queue): GT7 hung the GPU
+    // with many pipeline builds at once (DIAG-103 GPU work unfinished 10 s, then DIAG-243 device
+    // lost; 11-21 on GT Auto, RTX 3070 Ti laptop). A ceiling on builds at once is kept per GPU +
+    // driver in <cache>/compile_ceiling.txt. None at first on NVIDIA (6 on AMD proprietary); a
+    // GPU stall with more than the floor running, or a device loss with builds running, halves
+    // the peak of the last 10 to 20 s, stored at once, once per run; it never rises, and a new
+    // driver starts over. RYGT_COMPILE_ADAPTIVE=0: off; RYGT_COMPILE_MAX=n: fixed ceiling n.
+    static void LearnCeiling(const Instance& instance) {
+        const char* adaptive = std::getenv("RYGT_COMPILE_ADAPTIVE");
+        if (adaptive && adaptive[0] == '0') {
+            LOG_WARNING(Render_Vulkan, "PERF-GT7-160: adaptive compile ceiling off "
+                                       "(RYGT_COMPILE_ADAPTIVE=0)");
+            return;
+        }
+        std::scoped_lock lk{learn_mutex};
+        if (const char* max = std::getenv("RYGT_COMPILE_MAX"); max && *max) {
+            const u32 n = u32(std::strtoul(max, nullptr, 10));
+            if (n != 0) {
+                ceiling_learned = n;
+                LOG_WARNING(Render_Vulkan, "PERF-GT7-160: fixed compile ceiling {} "
+                                           "(RYGT_COMPILE_MAX)", n);
+                return;
+            }
+        }
+        ceiling_key = CompileCeiling::Key(instance.GetVendorID(), instance.GetDeviceID(),
+                                          instance.GetDriverVersion());
+        ceiling_file =
+            Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "compile_ceiling.txt";
+        const u32 widest = std::max(StartupWorkers(), NumWorkers());
+        ceiling_stored = CompileCeiling::Load(ceiling_file, ceiling_key)
+                             .value_or(CompileCeiling::FirstCeiling(
+                                 instance.GetDriverID() == vk::DriverId::eAmdProprietary,
+                                 widest));
+        ceiling_learned = ceiling_stored < widest ? std::max(Floor(), ceiling_stored) : 0;
+        adaptive_on = true;
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-160: compile ceiling {} for {} (widest {}, floor {})",
+                    ceiling_stored, ceiling_key, widest, Floor());
+        g_gpu_stall_hook.store(&OnGpuStall);
+        g_device_lost_hook.store(&OnDeviceLost);
+    }
+
+private:
+    static u32 Floor() {
+        return std::max(1u, std::min(2u, NumWorkers()));
+    }
+    static void OnGpuStall() {
+        LowerCeiling("GPU stall", true);
+    }
+    static void OnDeviceLost() {
+        try {
+            LowerCeiling("device lost", false);
+        } catch (...) {
+        }
+    }
+    static void LowerCeiling(const char* cause, bool need_running) {
+        std::scoped_lock lk{learn_mutex};
+        if (!adaptive_on || lowered || !learning) {
+            return;
+        }
+        const u32 running = learning->queue.Running();
+        if (need_running ? running <= Floor() : running == 0 && learning->queue.Pending() == 0) {
+            return; // the game's own pause, not ours
+        }
+        const u32 peak = std::max(running, learning->queue.PeakRunning());
+        const u32 next = CompileCeiling::AfterStall(ceiling_stored, peak, Floor());
+        if (next == ceiling_stored) {
+            return;
+        }
+        lowered = true;
+        CompileCeiling::Store(ceiling_file, ceiling_key, next);
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-160: compile ceiling {} {} -> {} ({}, peak {})",
+                    ceiling_key, ceiling_stored, next, cause, peak);
+        ceiling_stored = next;
+        ceiling_learned = next;
+        learning->queue.SetCeiling(next);
+    }
+    static inline std::mutex learn_mutex;
+    static inline PipelineBuildWorkers* learning = nullptr; ///< under learn_mutex
+    static inline std::string ceiling_key;
+    static inline std::filesystem::path ceiling_file;
+    static inline u32 ceiling_stored = 0;
+    static inline u32 ceiling_learned = 0; ///< 0: no ceiling
+    static inline bool adaptive_on = false;
+    static inline bool lowered = false;
+
+public:
 
 private:
     static void SetCatchUpPolicy(bool on) {
@@ -2855,6 +2955,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (liverpool) {
         liverpool->on_command_buffer_start = [this] { ReadAheadAtBufferStart(); };
     }
+    PipelineBuildWorkers::LearnCeiling(instance); // PERF-GT7-160 (port)
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),

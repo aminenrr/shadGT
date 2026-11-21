@@ -127,6 +127,7 @@ public:
                 if (is_read_ahead) *is_read_ahead = read_ahead;
                 running_read_ahead += read_ahead;
                 ++running_foreground;
+                NotePeak(); // PERF-GT7-160 (port)
                 return true;
             }
             const auto now = Clock::now();
@@ -141,6 +142,7 @@ public:
                 if (is_heavy) *is_heavy = heavy;
                 ++running_background;
                 ++running_read_ahead;
+                NotePeak(); // PERF-GT7-160 (port)
                 if (is_read_ahead) *is_read_ahead = true;
                 is_background = true;
                 return true;
@@ -241,6 +243,26 @@ public:
         cv.notify_all();
     }
 
+    /// PERF-GT7-160 (port): no more than this many builds run at once, whatever the other
+    /// limits say (~0u: none). Learned per GPU + driver in PipelineBuildWorkers.
+    void SetCeiling(u32 limit) {
+        { std::scoped_lock lk{mutex}; ceiling = std::max(1u, limit); }
+        cv.notify_all();
+    }
+
+    /// PERF-GT7-160 (port): builds running now, foreground and background.
+    u32 Running() {
+        std::scoped_lock lk{mutex};
+        return running_foreground + running_background;
+    }
+
+    /// PERF-GT7-160 (port): the most builds running at once over the last 10 to 20 s.
+    u32 PeakRunning() {
+        std::scoped_lock lk{mutex};
+        NotePeak();
+        return std::max(peak_now, peak_before);
+    }
+
     /// Wakes the workers waiting for jobs or a pause, so they can see a stop request.
     void NotifyAll() {
         cv.notify_all();
@@ -259,12 +281,13 @@ private:
                                      : max_foreground) +
                                 extra_running;
         return running_kind < kind_limit &&
-               running_foreground + running_background < total_limit;
+               running_foreground + running_background < std::min(total_limit, ceiling);
     }
     bool ReadAheadAvailable() const {
-        return boost.load(std::memory_order_relaxed) ||
-               (running_read_ahead < max_read_ahead &&
-                running_foreground + running_background < background_limit);
+        return running_foreground + running_background < ceiling && // PERF-GT7-160 (port)
+               (boost.load(std::memory_order_relaxed) ||
+                (running_read_ahead < max_read_ahead &&
+                 running_foreground + running_background < background_limit));
     }
     struct Entry { Job job; bool heavy; };
     std::deque<Entry> urgent;
@@ -298,6 +321,22 @@ private:
     u32 running_heavy{};
     u32 running_background{};
     u32 running_foreground{};
+    u32 ceiling{~0u}; ///< PERF-GT7-160 (port)
+    // PERF-GT7-160 (port): peak running count in two 10 s buckets (under mutex).
+    Clock::time_point peak_since{};
+    u32 peak_now{};
+    u32 peak_before{};
+    void NotePeak() {
+        const auto now = Clock::now();
+        const auto age = now - peak_since;
+        const u32 running_now = running_foreground + running_background;
+        if (age >= std::chrono::seconds{10}) {
+            peak_before = age >= std::chrono::seconds{20} ? running_now : peak_now;
+            peak_now = running_now;
+            peak_since = now;
+        }
+        peak_now = std::max(peak_now, running_now);
+    }
     Clock::time_point pause_until{};
 };
 

@@ -20,6 +20,7 @@
 #include "core/libraries/kernel/process.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/compile_width.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/native_mode.h"
 #include "video_core/renderer_vulkan/sample_locations.h"
@@ -1945,6 +1946,11 @@ void Instance::LogDeviceFault() const {
 // DIAG-243 (shadgt7's name): the same report as LogDeviceFault, once.
 void Instance::ReportDeviceLost() const {
     LogDeviceFault();
+    // PERF-GT7-160 (port): builds running at the loss lower the next run's compile ceiling.
+    // After the fault dump, which must not wait for the hook's file write.
+    if (const auto hook = g_device_lost_hook.load()) {
+        hook();
+    }
 }
 
 static void SendAntiLagStage(vk::Device device, vk::AntiLagStageAMD stage, u64 frame) {
