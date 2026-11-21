@@ -172,6 +172,14 @@ void CleanStaleStores(const std::stop_token& stop, std::filesystem::path origina
             continue;
         }
         if (path == live) continue;
+        // PRT-STORECLEAN-BASE (Round 4): the unversioned base folder is never deleted. On 11-21 it
+        // was the store in use for a game session and went with the launcher's run (776 MB,
+        // about 9000 shaders translated again). Only older same-family .vN copies go.
+        if (!suffix) {
+            LOG_INFO(Render, "PRT-STORECLEAN: kept {} (base store, never deleted)",
+                     path.filename().string());
+            continue;
+        }
         std::string version;
         bool has_version = false;
         {
@@ -404,7 +412,9 @@ void DataBase::Open() {
         if (cache_path != original)
             LOG_INFO(Render, "Preserved incompatible shader store {}; using compatible sibling {}",
                      original.string(), cache_path.string());
-        if (StoreCleanupOn()) {
+        // PRT-STORECLEAN-BASE: never from the launcher's prewarm run, whose store version can
+        // differ from the game's (other settings), so the game's store would look stale.
+        if (StoreCleanupOn() && !Common::PrewarmOnly()) {
             try {
                 clean_worker = std::jthread{CleanStaleStores, original, cache_path, StoreVersion};
             } catch (const std::exception& e) {
