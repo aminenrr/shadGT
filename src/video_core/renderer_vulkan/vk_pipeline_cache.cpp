@@ -511,6 +511,24 @@ static bool PrtPrewarmOn() {
     return on;
 }
 
+// PRT-RECORD (pr-tests, Round 4): recording the game's pipelines no longer depends on the splash
+// prewarm. RYGT_PIPELINE_PREWARM=0 (the launcher's splash toggle off) used to stop the records
+// too, so the launcher's own prewarm pass had nothing to build. On in GT7 and whenever
+// PRT-PREWARM is on; RYGT_PREWARM_RECORD=0 turns it off, =1 turns it on in any game.
+static bool PrtRecordOn() {
+    static const bool on = [] {
+        if (Common::PrewarmOnly()) {
+            return true;
+        }
+        const char* env = std::getenv("RYGT_PREWARM_RECORD");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7() || PrtPrewarmOn();
+    }();
+    return on;
+}
+
 // PRT-DIRTY (pr-tests, RYGT_PREWARM_DIRTY_MARK=0 turns it off): a game session that records a
 // pipeline not recorded before creates <exe folder>\prewarm.dirty, once; the launcher skips its
 // prewarm pass when the file is absent (nothing new to build).
@@ -3753,6 +3771,15 @@ static bool KeysAtBuildEnd() {
     return on;
 }
 
+// PRT-KEEPBUILT (pr-tests, Round 4): see FinishBuild.
+static bool PrtKeepBuiltOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PREWARM_KEEP_BUILT");
+        return PrtRecordOn() && !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 // FEAT-GTS-470 (SHADGT_DIAG_PRECOMPILE=1): the splash precompile's throughput, logged every
 // 5 s from IdlePrewarm: are the workers starved (few builds in flight) or blocked (many in flight,
 // each slower), e.g. on a lock in the driver.
@@ -3819,6 +3846,14 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
             try {
                 RegisterPipelineData(build.key, std::hash<GraphicsPipelineKey>{}(build.key),
                                      build.sdata);
+            } catch (...) {
+            }
+        }
+        // PRT-KEEPBUILT (RYGT_PREWARM_KEEP_BUILT=0 turns it off): the same for PRT-PREWARM's
+        // records, which were only written when a draw installed the pipeline.
+        if (build.remember && !build.preloading && !build.libraries_only && PrtKeepBuiltOn()) {
+            try {
+                PrtNoteKey(build.key, build.canonical);
             } catch (...) {
             }
         }
@@ -7284,10 +7319,18 @@ vk::ShaderModule PipelineCache::PrtTakeModule(u64 perm_hash) {
 }
 
 void PipelineCache::PrtNoteInstalled() {
-    if (!PrtPrewarmOn() || S().key_uses_legacy) {
+    if (!PrtRecordOn() || S().key_uses_legacy) {
         return;
     }
-    const auto& key = S().graphics_key;
+    PrtNoteKey(S().graphics_key, S().infos);
+}
+
+// PRT-RECORD + PRT-KEEPBUILT (Round 4): records one game pipeline, from a draw that installs it
+// (PrtNoteInstalled) or, as FIX-SGT-086 does for the store's keys, from the worker that built
+// it, so a draw skipped while its pipeline built (PERF-076) that never came back still leaves a
+// record for the next prewarm.
+void PipelineCache::PrtNoteKey(const GraphicsPipelineKey& key,
+                               const std::array<const Shader::Info*, MaxShaderStages>& infos) {
     const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
     {
         std::scoped_lock lk{prt_mutex};
@@ -7302,7 +7345,7 @@ void PipelineCache::PrtNoteInstalled() {
         key.stage_hashes[u32(Shader::SwStage::Fragment)] == 0 || g_prt_prewarm_dir.empty()) {
         return;
     }
-    for (const auto* info : S().infos) {
+    for (const auto* info : infos) {
         if (info && PrtCountsMipLevels(*info)) {
             return;
         }

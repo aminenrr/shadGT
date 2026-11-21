@@ -946,6 +946,8 @@ private:
     const PrtStage* PrtGetStage(u64 perm_hash);
     /// A new pipeline was installed for the current key: recorded once (PRT-DIRTY marks it).
     void PrtNoteInstalled();
+    void PrtNoteKey(const GraphicsPipelineKey& key,
+                    const std::array<const Shader::Info*, MaxShaderStages>& infos);
     /// PRT-KEEP diagnosis: a new key whose stages match a recorded key's: which fields differ.
     void PrtNoteMiss(const GraphicsPipelineKey& key);
     /// A prewarmed pipeline for the key, taken out (no pipeline when none).
