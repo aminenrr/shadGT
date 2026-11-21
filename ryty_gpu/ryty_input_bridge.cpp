@@ -61,6 +61,18 @@ struct RytyPadInputState {
     std::uint8_t deviceKind = 0;
 };
 
+// PRT-TOUCH: a finger pressed, lifted or moved.
+bool SameTouch(const std::array<RytyPadTouchPoint, 2>& a,
+               const std::array<RytyPadTouchPoint, 2>& b) {
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].active != b[i].active || a[i].x != b[i].x || a[i].y != b[i].y ||
+            a[i].id != b[i].id) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Mirrors Ryty's PadOutputState: what the game asked of the controller (rumble, light bar).
 struct RytyPadTriggerRequest {
     bool valid = false;
@@ -459,6 +471,23 @@ void ForwardInput() {
                             ClampAxis(state.axes[2]), ClampAxis(state.axes[3])};
             input.analogButtonsL2 = ClampAxis(state.axes[4]);
             input.analogButtonsR2 = ClampAxis(state.axes[5]);
+            // PRT-TOUCH (pr-tests, Round 4; RYGT_PAD_TOUCH=0 turns it off): the DualSense
+            // touchpad's fingers go to the game too. Only the buttons and sticks were passed, so a
+            // touchpad click reached GT7 with no finger on it and its left, center and right zones
+            // (turn signals, hazard lights) never worked. Ryty's pad sends these as touch data.
+            static const bool pass_touch = [] {
+                const char* env = std::getenv("RYGT_PAD_TOUCH");
+                return !(env && env[0] == '0');
+            }();
+            if (pass_touch) {
+                for (size_t finger = 0; finger < input.touch.size(); ++finger) {
+                    const auto& entry = state.touchpad[finger];
+                    input.touch[finger].active = entry.state;
+                    input.touch[finger].x = entry.x;
+                    input.touch[finger].y = entry.y;
+                    input.touch[finger].id = entry.ID;
+                }
+            }
 #ifndef NDEBUG
             if (slot == 0) {
                 input.buttons |= g_scripted_buttons.load();
@@ -479,7 +508,8 @@ void ForwardInput() {
             if (first[slot] || input.buttons != previous.buttons ||
                 input.sticks != previous.sticks ||
                 input.analogButtonsL2 != previous.analogButtonsL2 ||
-                input.analogButtonsR2 != previous.analogButtonsR2) {
+                input.analogButtonsR2 != previous.analogButtonsR2 ||
+                !SameTouch(input.touch, previous.touch)) {
                 if (players > 1) {
                     publish_slot(slot, input);
                 } else {
