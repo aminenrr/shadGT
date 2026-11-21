@@ -3127,8 +3127,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             // PERF-098: GPU.precompile_shaders unless the variable says otherwise, for both games
             // (PERF-GT7-137: GT7 no longer has its own "off"; the title-screen device loss that
             // kept it off went with FIX-GT7-187).
+            const char* exclusive = std::getenv("RYGT_PREWARM_EXCLUSIVE");
+            const bool prt_owns_prewarm =
+                !prewarm && PrtPrewarmOn() && !(exclusive && exclusive[0] == '0');
+            if (prt_owns_prewarm && EmulatorSettings.IsPrecompileShaders()) {
+                LOG_WARNING(Render_Vulkan, "PRT-PREWARM: GPU.precompile_shaders ignored, the "
+                                           "PRT-PREWARM path builds the stored pipelines "
+                                           "(RYGT_PREWARM_EXCLUSIVE=0 gives it back)");
+            }
             const bool prewarm_on =
-                prewarm ? prewarm[0] != '0' : EmulatorSettings.IsPrecompileShaders();
+                prewarm ? prewarm[0] != '0'
+                        : !prt_owns_prewarm && EmulatorSettings.IsPrecompileShaders();
 #else
             const bool prewarm_on = prewarm && prewarm[0] == '1';
 #endif
