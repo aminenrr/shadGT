@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include "common/diagnostics.h"
 #include "common/elf_info.h"
+#include "common/game_title.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
@@ -30,6 +31,8 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <string_view>
+#include <utility>
 
 namespace {
 
@@ -68,6 +71,97 @@ std::string StoreTag() {
     return tag;
 }
 
+
+bool StoreCleanupOn() {
+    const char* env = std::getenv("RYGT_SHADER_STORE_CLEANUP");
+    if (env && *env) {
+        return env[0] != '0';
+    }
+    return Common::IsGt7();
+}
+
+std::string StoreFamilyPrefix(std::string_view version) {
+    return std::string{version.substr(0, version.find(" ("))};
+}
+
+std::pair<u64, u64> TreeSize(const std::filesystem::path& path) {
+    u64 bytes = 0;
+    u64 files = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator{path, ec};
+         !ec && it != std::filesystem::recursive_directory_iterator{}; it.increment(ec)) {
+        std::error_code size_ec;
+        if (it->is_regular_file(size_ec)) {
+            const auto size = it->file_size(size_ec);
+            if (!size_ec) {
+                bytes += size;
+                ++files;
+            }
+        }
+    }
+    return {bytes, files};
+}
+
+void CleanStaleStores(const std::stop_token& stop, std::filesystem::path original,
+                      std::filesystem::path live, std::string expected) {
+    Common::SetCurrentThreadName("shadGT:StoreClean");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    const auto family = StoreFamilyPrefix(expected);
+    u64 freed = 0;
+    u32 deleted = 0;
+    for (unsigned suffix = 0; suffix != 1024 && !stop.stop_requested(); ++suffix) {
+        auto path = original;
+        if (suffix) path += ".v" + std::to_string(suffix);
+        std::error_code ec;
+        if (!std::filesystem::is_directory(path, ec)) {
+            if (suffix) break;
+            continue;
+        }
+        if (path == live) continue;
+        std::string version;
+        bool has_version = false;
+        {
+            std::ifstream file(path / "store-version.txt");
+            has_version = static_cast<bool>(file);
+            if (file) std::getline(file, version);
+        }
+        const bool stale = !has_version || (version != expected && StoreFamilyPrefix(version) == family);
+        if (!stale) {
+            LOG_INFO(Render, "PRT-STORECLEAN: kept {} (store of another GPU family: {})",
+                     path.filename().string(), version);
+            continue;
+        }
+        const auto [bytes, files] = TreeSize(path);
+        std::filesystem::remove_all(path, ec);
+        if (ec) {
+            LOG_WARNING(Render, "PRT-STORECLEAN: could not delete {} ({})", path.filename().string(),
+                        ec.message());
+            continue;
+        }
+        freed += bytes;
+        ++deleted;
+        LOG_WARNING(Render, "PRT-STORECLEAN: deleted stale shader store {} ({} MB, {} files, {})",
+                    path.filename().string(), bytes >> 20, files,
+                    has_version ? "older translations" : "no store version");
+    }
+    const auto old_cache = original.parent_path() /
+                           (std::string{Common::ElfInfo::Instance().GameSerial()} + ".vkpipelinecache");
+    std::error_code ec;
+    if (!stop.stop_requested() && std::filesystem::is_regular_file(old_cache, ec)) {
+        const auto bytes = std::filesystem::file_size(old_cache, ec);
+        if (!ec && std::filesystem::remove(old_cache, ec) && !ec) {
+            freed += bytes;
+            ++deleted;
+            LOG_WARNING(Render, "PRT-STORECLEAN: deleted old driver cache {} ({} MB, no longer read)",
+                        old_cache.filename().string(), bytes >> 20);
+        } else {
+            LOG_WARNING(Render, "PRT-STORECLEAN: could not delete {} ({})",
+                        old_cache.filename().string(), ec.message());
+        }
+    }
+    LOG_WARNING(Render, "PRT-STORECLEAN: {} deleted, {} MB freed (RYGT_SHADER_STORE_CLEANUP=0 keeps them)",
+                deleted, freed >> 20);
+}
 } // namespace
 
 std::filesystem::path RetranslationMarksPath() {
@@ -226,6 +320,13 @@ void DataBase::Open() {
         if (cache_path != original)
             LOG_INFO(Render, "Preserved incompatible shader store {}; using compatible sibling {}",
                      original.string(), cache_path.string());
+        if (StoreCleanupOn()) {
+            try {
+                clean_worker = std::jthread{CleanStaleStores, original, cache_path, StoreVersion};
+            } catch (const std::exception& e) {
+                LOG_WARNING(Render, "PRT-STORECLEAN: unavailable: {}", e.what());
+            }
+        }
     }
 
     io_worker = std::jthread{ProcessIO};
@@ -254,6 +355,10 @@ void DataBase::Close() {
     if (tidy_worker.joinable()) {
         tidy_worker.request_stop();
         tidy_worker.join();
+    }
+    if (clean_worker.joinable()) {
+        clean_worker.request_stop();
+        clean_worker.join();
     }
 
     if (archived) {
