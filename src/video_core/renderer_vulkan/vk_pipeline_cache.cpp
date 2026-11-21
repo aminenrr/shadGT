@@ -7733,6 +7733,7 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
         in.seekg(0);
         in.read(reinterpret_cast<char*>(bytes.data()), size);
         if (!in) bytes.clear();
+        if (path.extension() == ".spv") Storage::InflateShaderBlob(bytes);
         return bytes;
     };
     const auto read_text = [&](const fs::path& path) {
@@ -7979,6 +7980,7 @@ void PipelineCache::ExportPipelineRecipes(std::stop_token stop) {
         in.seekg(0);
         in.read(reinterpret_cast<char*>(bytes.data()), size);
         if (!in) bytes.clear();
+        if (path.extension() == ".spv") Storage::InflateShaderBlob(bytes);
         return bytes;
     };
     std::string switches;

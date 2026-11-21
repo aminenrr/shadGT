@@ -20,6 +20,9 @@ namespace Storage {
 /// that knows neither its commit nor its description).
 [[nodiscard]] bool StoreMayHoldOtherBuilds();
 
+[[nodiscard]] bool IsCompressedShaderBlob(const std::vector<u8>& data);
+bool InflateShaderBlob(std::vector<u8>& data);
+
 enum class BlobType : u32 {
     ShaderMeta,
     ShaderBinary,

@@ -31,6 +31,9 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <array>
+#include <atomic>
+#include <cstring>
 #include <string_view>
 #include <utility>
 
@@ -42,6 +45,57 @@ bool reported_blob_error{}; // Only the I/O worker uses this after Open.
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
+
+constexpr std::array<u8, 4> CompressedMagic{'R', 'Z', 'S', '1'};
+constexpr std::size_t CompressedHeader = 8;
+std::atomic<u64> compress_writes{};
+std::atomic<u64> compress_plain_bytes{};
+std::atomic<u64> compress_stored_bytes{};
+std::atomic<u64> inflate_count{};
+std::atomic<u64> inflate_us{};
+std::atomic<u64> inflate_failed{};
+
+bool CompressOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SHADER_STORE_COMPRESS");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+void ReportCompress(bool final_line) {
+    const u64 writes = compress_writes.load(std::memory_order_relaxed);
+    const u64 plain = compress_plain_bytes.load(std::memory_order_relaxed);
+    const u64 stored = compress_stored_bytes.load(std::memory_order_relaxed);
+    if (writes == 0 && inflate_count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    LOG_WARNING(Render, "PRT-STORECOMPRESS{}: {} SPIR-V written, {} KB -> {} KB (ratio {:.2f}); {} "
+                        "compressed read, {} ms inflating, {} unreadable",
+                final_line ? " (session)" : "", writes, plain >> 10, stored >> 10,
+                stored ? double(plain) / double(stored) : 0.0,
+                inflate_count.load(std::memory_order_relaxed),
+                inflate_us.load(std::memory_order_relaxed) / 1000,
+                inflate_failed.load(std::memory_order_relaxed));
+}
+
+std::vector<u8> DeflateShaderBlob(const u8* data, std::size_t size) {
+    mz_ulong bound = mz_compressBound(static_cast<mz_ulong>(size));
+    std::vector<u8> out(CompressedHeader + bound);
+    if (mz_compress2(out.data() + CompressedHeader, &bound, data, static_cast<mz_ulong>(size),
+                     MZ_DEFAULT_LEVEL) != MZ_OK ||
+        CompressedHeader + bound >= size) {
+        return {};
+    }
+    std::memcpy(out.data(), CompressedMagic.data(), CompressedMagic.size());
+    const u32 plain = static_cast<u32>(size);
+    std::memcpy(out.data() + 4, &plain, sizeof(plain));
+    out.resize(CompressedHeader + bound);
+    return out;
+}
 
 } // namespace
 
@@ -163,6 +217,36 @@ void CleanStaleStores(const std::stop_token& stop, std::filesystem::path origina
                 deleted, freed >> 20);
 }
 } // namespace
+
+bool IsCompressedShaderBlob(const std::vector<u8>& data) {
+    return data.size() >= CompressedHeader &&
+           std::memcmp(data.data(), CompressedMagic.data(), CompressedMagic.size()) == 0;
+}
+
+bool InflateShaderBlob(std::vector<u8>& data) {
+    if (!IsCompressedShaderBlob(data)) {
+        return true;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    u32 plain = 0;
+    std::memcpy(&plain, data.data() + 4, sizeof(plain));
+    std::vector<u8> out(plain);
+    mz_ulong length = plain;
+    const bool ok = mz_uncompress(out.data(), &length, data.data() + CompressedHeader,
+                                  static_cast<mz_ulong>(data.size() - CompressedHeader)) == MZ_OK &&
+                    length == plain;
+    if (!ok) {
+        inflate_failed.fetch_add(1, std::memory_order_relaxed);
+        data.clear();
+        return false;
+    }
+    data = std::move(out);
+    inflate_count.fetch_add(1, std::memory_order_relaxed);
+    inflate_us.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start).count()),
+                         std::memory_order_relaxed);
+    return true;
+}
 
 std::filesystem::path RetranslationMarksPath() {
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -352,6 +436,7 @@ void DataBase::Close() {
 
     io_worker.request_stop();
     io_worker.join();
+    ReportCompress(true);
     if (tidy_worker.joinable()) {
         tidy_worker.request_stop();
         tidy_worker.join();
@@ -386,7 +471,23 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else if (!directory_writes_paused.load(std::memory_order_relaxed)) {
+                std::vector<u8> packed;
+                if (type == BlobType::ShaderBinary && CompressOn() && !data.empty()) {
+                    packed = DeflateShaderBlob(reinterpret_cast<const u8*>(data.data()),
+                                               data.size() * sizeof(T));
+                    const u64 writes = compress_writes.fetch_add(1, std::memory_order_relaxed) + 1;
+                    compress_plain_bytes.fetch_add(data.size() * sizeof(T), std::memory_order_relaxed);
+                    compress_stored_bytes.fetch_add(packed.empty() ? data.size() * sizeof(T)
+                                                                   : packed.size(),
+                                                    std::memory_order_relaxed);
+                    if (writes % 1000 == 0) {
+                        ReportCompress(false);
+                    }
+                }
                 const auto error = PublishShaderBlob(path, [&](std::FILE* file) {
+                    if (!packed.empty()) {
+                        return std::fwrite(packed.data(), 1, packed.size(), file) == packed.size();
+                    }
                     return data.empty() ||
                            std::fwrite(data.data(), sizeof(T), data.size(), file) == data.size();
                 });
@@ -424,6 +525,15 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v, b
         mz_zip_reader_file_stat(&zip_ar, index, &stat);
         v.resize(stat.m_uncomp_size / sizeof(T));
         mz_zip_reader_extract_to_mem(&zip_ar, index, v.data(), stat.m_uncomp_size, 0);
+    } else if (type == BlobType::ShaderBinary) {
+        const auto file = IOFile{path, FileAccessMode::Read};
+        std::vector<u8> bytes(file.GetSize());
+        file.Read(bytes);
+        InflateShaderBlob(bytes);
+        v.resize(bytes.size() / sizeof(T));
+        if (!v.empty()) {
+            std::memcpy(v.data(), bytes.data(), v.size() * sizeof(T));
+        }
     } else {
         const auto file = IOFile{path, FileAccessMode::Read};
         v.resize(file.GetSize() / sizeof(T));
@@ -510,6 +620,9 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 if (file.IsOpen()) {
                     std::vector<u8> data(file.GetSize());
                     file.Read(data);
+                    if (type == BlobType::ShaderBinary) {
+                        InflateShaderBlob(data);
+                    }
                     func(std::move(data));
                 }
             }
