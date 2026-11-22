@@ -1191,6 +1191,7 @@ static std::atomic<bool> g_precompile_reading{};
 // PERF-102: while the precompile runs at start, the game waits on the splash screen (its clocks
 // held, so it sees no time pass), as if the splash screen were frozen until it is done.
 static std::atomic<bool> g_precompile_hold{};
+static std::atomic<bool> g_prt_splash_hold{};
 
 bool PrecompileHoldsGame() {
     return g_precompile_hold.load(std::memory_order_relaxed);
@@ -3477,8 +3478,13 @@ static bool PrtDriverCacheKeepOn() {
 }
 
 static void PrtDeleteOldDriverCache(const std::filesystem::path& path) {
-    static std::atomic<bool> done{false};
-    if (!PrtDriverCacheKeepOn() || done.exchange(true)) return;
+    static std::mutex done_mutex;
+    static std::unordered_set<std::string> done;
+    if (!PrtDriverCacheKeepOn()) return;
+    {
+        std::scoped_lock lock{done_mutex};
+        if (!done.insert(path.string()).second) return;
+    }
     auto old = path;
     old += ".old";
     std::error_code error;
@@ -3506,8 +3512,8 @@ static u64 DriverCacheRotateBytes() {
 
 // FIX-SGT-010: moves an oversized driver cache to <file>.old (replacing an earlier .old) before it
 // is opened. Returns true when the file was moved, so the session starts and saves a fresh cache.
-static bool RotateOversizedDriverCache(const std::filesystem::path& path) {
-    const u64 rotate = DriverCacheRotateBytes();
+static bool RotateOversizedDriverCache(const std::filesystem::path& path,
+                                       u64 rotate = DriverCacheRotateBytes()) {
     if (rotate == 0) return false;
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
@@ -3623,6 +3629,158 @@ static bool QuarantineRejectedDriverCache(const std::filesystem::path& source,
 // Preserve any cache that could not be verified or safely quarantined this run.
 static std::atomic<bool> rejected_driver_cache{false};
 
+static u32 PrtDriverShardCount() {
+    static const u32 count = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_SHARDS");
+        if (env && *env) {
+            return std::min<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 8);
+        }
+        return Common::IsGt7() ? 2u : 0u;
+    }();
+    return count >= 2 ? count : 0;
+}
+
+static bool PrtDriverLoadLogOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_LOAD_LOG");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+constexpr u64 PrtShardTargetBytes = u64{900} << 20;
+
+static u64 PrtShardRotateBytes() {
+    const char* env = std::getenv("SHADGT_DRIVER_CACHE_ROTATE_MB");
+    if (env && *env) {
+        return DriverCacheRotateBytes();
+    }
+    return u64{1024} << 20;
+}
+
+static bool PrtDriverCacheHeaderMatches(std::span<const u8> data,
+                                        const vk::PhysicalDeviceProperties& props) {
+    struct Header {
+        u32 size;
+        u32 version;
+        u32 vendor_id;
+        u32 device_id;
+        std::array<u8, VK_UUID_SIZE> uuid;
+    } header{};
+    if (data.size() < sizeof(Header)) {
+        return false;
+    }
+    std::memcpy(&header, data.data(), sizeof(Header));
+    return header.size >= sizeof(Header) && header.size <= data.size() &&
+           header.version == static_cast<u32>(vk::PipelineCacheHeaderVersion::eOne) &&
+           header.vendor_id == props.vendorID && header.device_id == props.deviceID &&
+           std::memcmp(header.uuid.data(), props.pipelineCacheUUID.data(), VK_UUID_SIZE) == 0;
+}
+
+static void PrtLogDriverLoad(vk::Device device, vk::PipelineCache cache,
+                             const std::filesystem::path& path, u64 file_bytes, size_t given) {
+    if (!PrtDriverLoadLogOn()) {
+        return;
+    }
+    size_t held = 0;
+    void* no_data = nullptr;
+    const auto result = device.getPipelineCacheData(cache, &held, no_data);
+    const auto mb = [](u64 bytes) { return double(bytes) / 1048576.0; };
+    LOG_WARNING(Render_Vulkan,
+                "PRT-DRVLOAD: {} file {:.1f} MB, given to the driver {:.1f} MB, driver cache data "
+                "after load {:.1f} MB ({}){}",
+                path.filename().string(), mb(file_bytes), mb(given), mb(held),
+                vk::to_string(result),
+                given != 0 && held + (u64{1} << 20) < given ? "; the driver kept less than it was given"
+                                                            : "");
+}
+
+void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& base) {
+    const u32 count = PrtDriverShardCount();
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    const vk::Device device = instance.GetDevice();
+    std::error_code old_error;
+    const u64 old_bytes = std::filesystem::exists(base, old_error)
+                              ? std::filesystem::file_size(base, old_error)
+                              : 0;
+    for (u32 index = 0; index < count; ++index) {
+        auto path = base;
+        path += fmt::format(".shard{}", index);
+        RotateOversizedDriverCache(path, PrtShardRotateBytes());
+        bool rejected = false;
+        u64 file_bytes = 0;
+        std::vector<u8> data;
+        try {
+            Common::RecoverableScope recoverable;
+            std::error_code ec;
+            if (std::filesystem::exists(path, ec)) {
+                const Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read};
+                if (!file.IsOpen() || file.GetSize() > DriverCacheMaxBytes()) {
+                    rejected = true;
+                } else {
+                    file_bytes = file.GetSize();
+                    data.resize(file_bytes);
+                    if (file.Read(data) != data.size()) {
+                        rejected = true;
+                        data.clear();
+                    }
+                }
+            } else if (ec) {
+                rejected = true;
+            }
+        } catch (...) {
+            rejected = true;
+            data.clear();
+        }
+        if (!data.empty() && !PrtDriverCacheHeaderMatches(data, props)) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVSHARD: {} is from another GPU or driver, starting "
+                                       "it empty",
+                        path.filename().string());
+            data.clear();
+        }
+        auto [result, cache] = device.createPipelineCacheUnique(vk::PipelineCacheCreateInfo{
+            .initialDataSize = data.size(),
+            .pInitialData = data.data(),
+        });
+        if (result != vk::Result::eSuccess && !data.empty()) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVSHARD: {} rejected by the driver ({}), starting it "
+                                       "empty",
+                        path.filename().string(), vk::to_string(result));
+            data.clear();
+            auto [empty_result, empty_cache] = device.createPipelineCacheUnique({});
+            result = empty_result;
+            cache = std::move(empty_cache);
+        }
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create pipeline cache shard: {}",
+                   vk::to_string(result));
+        PrtLogDriverLoad(device, *cache, path, file_bytes, data.size());
+        if (index == 0) {
+            pipeline_cache = std::move(cache);
+            driver_cache_path = path;
+            if (rejected) {
+                rejected_driver_cache.store(true);
+            }
+        } else {
+            prt_driver_shards.push_back(PrtDriverShard{std::move(cache), path, rejected});
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PRT-DRVSHARD: driver cache in {} shards ({}.shard0 to .shard{}), picked by "
+                "pipeline hash; {}",
+                count, base.filename().string(), count - 1,
+                old_bytes != 0 ? fmt::format("the single file ({} MB) is not read and left as it is",
+                                             old_bytes >> 20)
+                               : std::string{"no single file"});
+}
+
+vk::PipelineCache PipelineCache::DriverCacheFor(u64 hash) const {
+    if (prt_driver_shards.empty()) {
+        return *pipeline_cache;
+    }
+    const u64 index = hash % (prt_driver_shards.size() + 1);
+    return index == 0 ? *pipeline_cache : *prt_driver_shards[index - 1].cache;
+}
+
 void PipelineCache::CreateDriverCache() {
     std::vector<u8> data;
     try {
@@ -3635,6 +3793,12 @@ void PipelineCache::CreateDriverCache() {
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
             fmt::format("{}-{:04x}-{:04x}-{:08x}-{}.vkpipelinecache", serial,
                         identity.vendorID, identity.deviceID, identity.driverVersion, uuid);
+        if (PrtDriverShardCount() != 0) {
+            PrtCreateDriverShards(driver_cache_path);
+            pipelines_at_driver_save = num_new_pipelines;
+            driver_cache_saved_at = std::chrono::steady_clock::now();
+            return;
+        }
         RotateOversizedDriverCache(driver_cache_path); // FIX-SGT-010
         std::error_code exists_error;
         const bool existing_cache = std::filesystem::exists(driver_cache_path, exists_error);
@@ -3713,6 +3877,12 @@ void PipelineCache::CreateDriverCache() {
     pipeline_cache = std::move(cache);
     pipelines_at_driver_save = num_new_pipelines;
     driver_cache_saved_at = std::chrono::steady_clock::now();
+    if (!driver_cache_path.empty()) {
+        std::error_code size_error;
+        const auto file_bytes = std::filesystem::file_size(driver_cache_path, size_error);
+        PrtLogDriverLoad(instance.GetDevice(), *pipeline_cache, driver_cache_path,
+                         size_error ? 0 : u64(file_bytes), data.size());
+    }
     LOG_INFO(Render_Vulkan, "Driver pipeline cache: loaded {} bytes, hash {:016x}, file {}",
              data.size(), data.empty() ? 0ull : XXH3_64bits(data.data(), data.size()),
              driver_cache_path.string());
@@ -3747,7 +3917,20 @@ static std::vector<u8> ReadDriverCacheSnapshot(vk::Device device, vk::PipelineCa
 void PipelineCache::SaveDriverCache(bool wait) {
     // FIX-GT7-050: wait even when a rejected cache or empty path prevents a new save.
     if (wait && driver_cache_writer.joinable()) driver_cache_writer.join();
-    if (rejected_driver_cache.load() || driver_cache_path.empty() || !pipeline_cache) {
+    struct SaveTarget {
+        vk::PipelineCache cache;
+        std::filesystem::path path;
+    };
+    std::vector<SaveTarget> targets;
+    if (!rejected_driver_cache.load() && !driver_cache_path.empty() && pipeline_cache) {
+        targets.push_back({*pipeline_cache, driver_cache_path});
+    }
+    for (const auto& shard : prt_driver_shards) {
+        if (!shard.rejected && shard.cache && !shard.path.empty()) {
+            targets.push_back({*shard.cache, shard.path});
+        }
+    }
+    if (targets.empty()) {
         return;
     }
     // PERF-036: GT Sport's driver cache grows to several GB (3.4 GB on October 9). Reading it out
@@ -3764,7 +3947,8 @@ void PipelineCache::SaveDriverCache(bool wait) {
     }
     pipelines_at_driver_save = num_new_pipelines;
     driver_cache_saved_at = std::chrono::steady_clock::now();
-    const auto write = [path = driver_cache_path](std::vector<u8> data) {
+    const bool sharded = !prt_driver_shards.empty();
+    const auto write = [sharded](const std::filesystem::path& path, std::vector<u8> data) {
         // Write beside the file and rename, so an interrupted write never leaves a broken cache.
         auto temp = path;
         temp += ".tmp";
@@ -3785,53 +3969,76 @@ void PipelineCache::SaveDriverCache(bool wait) {
             "CACHE-SAVED: {} bytes, hash {:016x}, file {}", data.size(),
             XXH3_64bits(data.data(), data.size()), path.string());
         if (replaced) PrtDeleteOldDriverCache(path);
+        if (replaced && sharded && data.size() > PrtShardTargetBytes) {
+            static std::atomic<u32> over_logged{};
+            if (over_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-DRVSHARD: {} is {} MB, over the {} MB target; more shards "
+                            "(RYGT_DRIVER_CACHE_SHARDS) spread it",
+                            path.filename().string(), data.size() >> 20,
+                            PrtShardTargetBytes >> 20);
+            }
+        }
         return replaced;
     };
     const vk::Device device = instance.GetDevice();
-    const vk::PipelineCache cache = *pipeline_cache;
     if (off_thread) {
         driver_cache_writing = true;
-        driver_cache_writer = std::jthread([this, device, cache, write] {
+        driver_cache_writer = std::jthread([this, device, targets, write] {
             SCOPE_EXIT {
                 driver_cache_writing = false;
             };
-            try {
-                Common::RecoverableScope recoverable;
-                Common::SetCurrentThreadName("shadGT:DriverCacheSave");
-                const auto start = std::chrono::steady_clock::now();
-                auto data = ReadDriverCacheSnapshot(device, cache);
-                const auto read_end = std::chrono::steady_clock::now();
-                if (!data.empty()) {
+            Common::SetCurrentThreadName("shadGT:DriverCacheSave");
+            for (const auto& target : targets) {
+                try {
+                    Common::RecoverableScope recoverable;
+                    const auto start = std::chrono::steady_clock::now();
+                    auto data = ReadDriverCacheSnapshot(device, target.cache);
+                    const auto read_end = std::chrono::steady_clock::now();
+                    if (data.empty()) {
+                        continue;
+                    }
                     const size_t size = data.size();
-                    if (!write(std::move(data))) return;
+                    if (!write(target.path, std::move(data))) {
+                        continue;
+                    }
                     LOG_WARNING(Render_Vulkan,
                                 "PERF-036: driver pipeline cache saved off the GPU thread: {} MB, "
-                                "read {:.0f} ms, written {:.0f} ms",
+                                "read {:.0f} ms, written {:.0f} ms ({})",
                                 size >> 20,
                                 std::chrono::duration<double, std::milli>(read_end - start).count(),
                                 std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() - read_end)
-                                    .count());
+                                    .count(),
+                                target.path.filename().string());
+                } catch (const std::exception& error) {
+                    LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: cache save failed: {}", error.what());
                 }
-            } catch (const std::exception& error) {
-                LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: cache save failed: {}", error.what());
             }
         });
     } else {
-        auto data = ReadDriverCacheSnapshot(device, cache);
-        if (data.empty()) {
+        std::vector<std::pair<std::filesystem::path, std::vector<u8>>> snapshots;
+        for (const auto& target : targets) {
+            auto data = ReadDriverCacheSnapshot(device, target.cache);
+            if (!data.empty()) {
+                snapshots.emplace_back(target.path, std::move(data));
+            }
+        }
+        if (snapshots.empty()) {
             return;
         }
         driver_cache_writing = true;
-        driver_cache_writer = std::jthread([this, write, data = std::move(data)]() mutable {
+        driver_cache_writer = std::jthread([this, write, snapshots = std::move(snapshots)]() mutable {
             SCOPE_EXIT {
                 driver_cache_writing = false;
             };
-            try {
-                Common::RecoverableScope recoverable;
-                write(std::move(data));
-            } catch (const std::exception& error) {
-                LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: cache save failed: {}", error.what());
+            for (auto& [path, data] : snapshots) {
+                try {
+                    Common::RecoverableScope recoverable;
+                    write(path, std::move(data));
+                } catch (const std::exception& error) {
+                    LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: cache save failed: {}", error.what());
+                }
             }
         });
     }
@@ -3987,7 +4194,8 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
       SCOPE_EXIT { g_pipeline_libraries_only = false; };
       try {
         build.pipeline = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
+            instance, scheduler, desc_heap, profile, build.key,
+            DriverCacheFor(std::hash<GraphicsPipelineKey>{}(build.key)), build.infos,
             build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata,
             build.preloading);
         // The copies were only needed while building; draws use the cached infos.
@@ -7708,6 +7916,82 @@ static std::string PrtUnbuildableIdentity(const Instance& instance) {
                        Common::g_scm_rev, props.driverVersion, props.vendorID, props.deviceID);
 }
 
+static bool PrtSplashSkipOn() {
+    const char* env = std::getenv("RYGT_SPLASH_SKIP_AFTER_LAUNCHER");
+    return !(env && env[0] == '0');
+}
+
+static bool PrtSplashHoldOn() {
+    const char* env = std::getenv("RYGT_SPLASH_HOLD_PREWARM");
+    if (env && *env) {
+        return env[0] != '0';
+    }
+    return Common::IsGt7();
+}
+
+static std::string PrtBuiltIdentity(const Instance& instance) {
+    return fmt::format("PRT-SPLASHSKIP 1 {} shards {}", PrtUnbuildableIdentity(instance),
+                       PrtDriverShardCount());
+}
+
+static bool PrtAnyRecord() {
+    if (g_prt_prewarm_dir.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(g_prt_prewarm_dir, ec)) {
+        if (entry.path().extension() == ".pwk") {
+            return true;
+        }
+    }
+    return false;
+}
+
+namespace {
+class PrtSplashHold {
+public:
+    ~PrtSplashHold() {
+        Release("the pass ended");
+    }
+
+    void Take() {
+        if (!g_precompile_hold.exchange(true)) {
+            g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            Common::GuestClock::TakeHold();
+        }
+        g_prt_splash_hold.store(true, std::memory_order_release);
+        since = std::chrono::steady_clock::now();
+        held.store(true, std::memory_order_release);
+        LOG_WARNING(Render_Vulkan, "PRT-SPLASHHOLD: the game waits on the splash screen while the "
+                                   "recorded pipelines build on every core");
+    }
+
+    void Release(const char* why) {
+        if (!held.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        g_prt_splash_hold.store(false, std::memory_order_release);
+        ReleasePrecompileHold();
+        LOG_WARNING(Render_Vulkan, "PRT-SPLASHHOLD: the game continues after {:.1f} s ({})",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count(),
+                    why);
+    }
+
+    bool Held() const {
+        return held.load(std::memory_order_acquire);
+    }
+
+    std::chrono::steady_clock::duration HeldFor() const {
+        return std::chrono::steady_clock::now() - since;
+    }
+
+private:
+    std::atomic<bool> held{false};
+    std::chrono::steady_clock::time_point since{};
+};
+} // namespace
+
 void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:PrtPrewarm");
     // PRT-SPLASH: set by the constructor before this thread starts, cleared however it ends.
@@ -7717,7 +8001,11 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
         }
     } prewarm_done_guard;
     const bool prewarm_only = Common::PrewarmOnly(); // PRT-PREWARM-ONLY
-    if (!prewarm_only) {
+    PrtSplashHold splash_hold;
+    if (!prewarm_only && PrtSplashHoldOn() && PrtAnyRecord()) {
+        splash_hold.Take();
+    }
+    if (!prewarm_only && !splash_hold.Held()) {
         SleepUnlessStopped(stop, std::chrono::seconds{2});
     }
     // The pre-translation stores translations the pipelines are built from: after it.
@@ -7823,6 +8111,33 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
             return true;
         });
     }
+    if (!prewarm_only && PrtSplashSkipOn()) {
+        const char* clean = std::getenv("RYGT_LAUNCHER_PREWARM_CLEAN");
+        if (clean && clean[0] == '1') {
+            std::ifstream in{g_prt_prewarm_dir / "prewarm.built"};
+            std::string line;
+            if (in && std::getline(in, line) && line == PrtBuiltIdentity(instance)) {
+                std::unordered_set<u64> launcher_built;
+                while (std::getline(in, line)) {
+                    if (!line.empty()) {
+                        launcher_built.insert(std::strtoull(line.c_str(), nullptr, 16));
+                    }
+                }
+                const size_t before = keys.size();
+                std::erase_if(keys, [&](const GraphicsPipelineKey& key) {
+                    return launcher_built.contains(std::hash<GraphicsPipelineKey>{}(key));
+                });
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-SPLASHSKIP: {} records the launcher pass built are skipped, {} "
+                            "new ones to build",
+                            before - keys.size(), keys.size());
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-SPLASHSKIP: no launcher list for this renderer, driver and shard "
+                            "count; every record is built");
+            }
+        }
+    }
     std::mutex unbuildable_mutex;
     std::vector<u64> new_unbuildable;
     const auto mark_unbuildable = [&](u64 hash) {
@@ -7835,11 +8150,18 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
     BootProgress::prewarm_built.store(0, std::memory_order_relaxed);
     BootProgress::prewarm_total.store(static_cast<u32>(keys.size()), std::memory_order_relaxed);
     if (keys.empty()) {
-        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no recorded pipelines yet ({} unreadable); "
+        splash_hold.Release("nothing to build");
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no recorded pipelines to build ({} unreadable); "
                                    "the ones built while playing are prewarmed at the next start",
                     unreadable);
         return;
     }
+    const bool every_core = prewarm_only || splash_hold.Held();
+    const bool load_log = PrtDriverLoadLogOn();
+    const size_t shard_count = prt_driver_shards.size() + 1;
+    std::mutex timing_mutex;
+    std::vector<std::vector<float>> shard_ms(shard_count);
+    std::vector<u64> built_hashes;
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<u32> built{0}, game_first{0}, not_buildable{0}, failed{0};
@@ -7857,19 +8179,23 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
     };
     const auto work = [&](u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:PrtPrewarm{}", index).c_str());
-        if (prewarm_only) {
+        if (every_core) {
             Common::AllowAllCores(); // PRT-PREWARM-ONLY: no game, every core
         } else {
             Common::PreferCompileCores();
         }
         SCOPE_EXIT {
-            if (!prewarm_only) {
+            if (!every_core) {
                 Common::ReleaseCompileCores();
             }
         };
-        Common::SetCurrentThreadPriority(prewarm_only ? Common::ThreadPriority::Normal
-                                                      : Common::ThreadPriority::Low);
+        Common::SetCurrentThreadPriority(every_core ? Common::ThreadPriority::Normal
+                                                    : Common::ThreadPriority::Low);
         for (size_t i = next++; i < keys.size() && !stop.stop_requested(); i = next++) {
+            if (index == 0 && splash_hold.Held() &&
+                splash_hold.HeldFor() > std::chrono::minutes{45}) {
+                splash_hold.Release("45 minutes cap, the rest builds while the game runs");
+            }
             // Paused while the game is in play (a race): the cores and the driver are its.
             while (!prewarm_only && paused() && !stop.stop_requested()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
@@ -7931,15 +8257,26 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
                 continue;
             }
             PrtReady ready;
+            const auto build_start = std::chrono::steady_clock::now();
             try {
                 Common::RecoverableScope recoverable;
                 ready.pipeline = std::make_unique<GraphicsPipeline>(
-                    instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos,
+                    instance, scheduler, desc_heap, profile, key, DriverCacheFor(hash), infos,
                     runtime_infos, fetch, modules, ready.sdata, true);
             } catch (const Common::RecoverableFailure&) {
                 ready.pipeline.reset();
             } catch (...) {
                 ready.pipeline.reset();
+            }
+            if (ready.pipeline && (load_log || prewarm_only)) {
+                const float ms = std::chrono::duration<float, std::milli>(
+                                     std::chrono::steady_clock::now() - build_start)
+                                     .count();
+                std::scoped_lock lk{timing_mutex};
+                shard_ms[hash % shard_count].push_back(ms);
+                if (prewarm_only) {
+                    built_hashes.push_back(hash);
+                }
             }
             if (!ready.pipeline) {
                 ++failed;
@@ -7972,7 +8309,7 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
         }
     };
     // PRT-PREWARM-ONLY: every core at normal priority when no game runs.
-    const u32 count = prewarm_only
+    const u32 count = every_core
                           ? (std::max)(1u, std::thread::hardware_concurrency())
                           : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
     {
@@ -7983,6 +8320,28 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
     }
     // In the driver's cache too: the GPU thread's next MaybeSaveDriverCache writes it.
     driver_cache_save_requested.store(true, std::memory_order_release);
+    splash_hold.Release(stop.stop_requested() ? "stopped" : "every record built");
+    if (load_log) {
+        for (size_t shard = 0; shard < shard_count; ++shard) {
+            auto& times = shard_ms[shard];
+            std::ranges::sort(times);
+            const size_t fast = static_cast<size_t>(
+                std::ranges::count_if(times, [](float ms) { return ms < 2.0f; }));
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-DRVLOAD: {} pass, shard {} of {}: {} built, {} under 2 ms (driver "
+                        "cache hits, estimate), median {:.1f} ms, longest {:.0f} ms",
+                        prewarm_only ? "launcher" : "splash", shard, shard_count, times.size(),
+                        fast, times.empty() ? 0.0f : times[times.size() / 2],
+                        times.empty() ? 0.0f : times.back());
+        }
+    }
+    if (prewarm_only && !stop.stop_requested()) {
+        std::ofstream out{g_prt_prewarm_dir / "prewarm.built", std::ios::trunc};
+        out << PrtBuiltIdentity(instance) << '\n';
+        for (const u64 hash : built_hashes) {
+            out << fmt::format("{:016x}", hash) << '\n';
+        }
+    }
     LOG_WARNING(Render_Vulkan,
                 "PRT-PREWARM: {} recorded pipelines in {:.1f} s on {} threads: {} built, {} "
                 "skipped ({} built by the game first, {} not buildable from the store: {} "
@@ -8608,7 +8967,9 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
 
 void PipelineCache::IdlePrewarm(bool splash) {
     if (!prewarm_enabled) {
-        ReleasePrecompileHold();
+        if (!g_prt_splash_hold.load(std::memory_order_acquire)) {
+            ReleasePrecompileHold();
+        }
         return;
     }
     if (DiagPrecompile()) {
@@ -11846,12 +12207,25 @@ int PipelineCache::SaveDriverCacheMb() {
     std::unique_lock lock{lookup_mutex};
     driver_cache_save_requested.store(false, std::memory_order_release);
     SaveDriverCache(true);
-    if (driver_cache_path.empty() || rejected_driver_cache.load()) {
-        return -1;
+    u64 total = 0;
+    bool any = false;
+    if (!driver_cache_path.empty() && !rejected_driver_cache.load()) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(driver_cache_path, ec);
+        if (!ec) {
+            total += size;
+            any = true;
+        }
     }
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(driver_cache_path, ec);
-    return ec ? -1 : static_cast<int>(size >> 20);
+    for (const auto& shard : prt_driver_shards) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(shard.path, ec);
+        if (!ec && !shard.rejected) {
+            total += size;
+            any = true;
+        }
+    }
+    return any ? static_cast<int>(total >> 20) : -1;
 }
 
 // PRT-PREWARM-ONLY (pr-tests, RYGT_PREWARM_ONLY=1): the launcher's "Precompile graphics shaders"

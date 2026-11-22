@@ -637,6 +637,14 @@ private:
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::atomic<bool> driver_cache_writing{}; // PERF-036
     std::jthread driver_cache_writer;
+    struct PrtDriverShard {
+        vk::UniquePipelineCache cache;
+        std::filesystem::path path;
+        bool rejected = false;
+    };
+    std::vector<PrtDriverShard> prt_driver_shards;
+    void PrtCreateDriverShards(const std::filesystem::path& base);
+    vk::PipelineCache DriverCacheFor(u64 hash) const;
 
     std::unordered_set<u64> logged_swizzled_blends;
 
