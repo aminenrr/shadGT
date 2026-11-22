@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include "common/game_title.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
@@ -14,9 +17,31 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
                                    (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
                                     AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
-    const float max_anisotropy =
+    float max_anisotropy =
         anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
                           : 1.0f;
+    bool force_aniso = false;
+    {
+        // PRT-AF (pr-tests, RYGT_FORCE_ANISO, 16 on GT7; 0 = off): trilinear colour samplers the
+        // game left without anisotropic filtering get it, so road and ground textures stay sharp at
+        // a grazing angle. Point, bilinear-only, depth and already anisotropic samplers are left alone.
+        static const float forced = [] {
+            const char* env = std::getenv("RYGT_FORCE_ANISO");
+            const float value = env && *env ? static_cast<float>(std::strtod(env, nullptr)) : 16.0f;
+            const bool gt7 = Common::CurrentGameTitle() == Common::GameTitle::Gt7;
+            LOG_WARNING(Render_Vulkan, "PRT-AF: forced anisotropic filtering {}x{}", value,
+                        gt7 ? "" : " (not GT7: off)");
+            return gt7 ? value : 0.0f;
+        }();
+        if (forced > 1.0f && !anisotropy_enable && !is_depth &&
+            instance.IsAnisotropicFilteringSupported() &&
+            sampler.xy_min_filter == AmdGpu::Filter::Bilinear &&
+            sampler.xy_mag_filter == AmdGpu::Filter::Bilinear &&
+            sampler.mip_filter == AmdGpu::MipFilter::Linear) {
+            force_aniso = true;
+            max_anisotropy = std::min(forced, instance.MaxSamplerAnisotropy());
+        }
+    }
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
     if (border_color == vk::BorderColor::eFloatCustomEXT &&
         !instance.IsCustomBorderColorSupported()) {
@@ -52,7 +77,7 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
         .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
-        .anisotropyEnable = anisotropy_enable,
+        .anisotropyEnable = anisotropy_enable || force_aniso,
         .maxAnisotropy = max_anisotropy,
         // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.
         .compareEnable = is_depth,
