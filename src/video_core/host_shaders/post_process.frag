@@ -45,6 +45,8 @@ layout (push_constant) uniform settings {
     float side_x0;
     float side_x1;
     float side_dim;
+    float pro_downscale;
+    float pro_rcas;
 } pp;
 
 #define A_GPU 1
@@ -129,6 +131,23 @@ bool inside(vec2 p, vec4 rect) {
 
 void main() {
     vec4 color_linear = texture(texSampler, uv);
+    const vec2 out_texel = vec2(abs(dFdx(uv).x), abs(dFdy(uv).y));
+    const vec2 in_size = vec2(textureSize(texSampler, 0));
+    if (pp.pro_downscale > 0.0 && pp.dlss_sharpening <= 0.0 &&
+        (out_texel.x * in_size.x > 1.05 || out_texel.y * in_size.y > 1.05)) {
+        const vec2 q = out_texel * 0.25;
+        color_linear = 0.25 * (texture(texSampler, uv + vec2(-q.x, -q.y)) +
+                               texture(texSampler, uv + vec2(q.x, -q.y)) +
+                               texture(texSampler, uv + vec2(-q.x, q.y)) +
+                               texture(texSampler, uv + vec2(q.x, q.y)));
+        if (pp.pro_rcas > 0.0) {
+            ivec2 pixel = clamp(ivec2(uv * in_size), ivec2(0), ivec2(in_size) - 1);
+            vec3 sharpened;
+            FsrRcasF(sharpened.r, sharpened.g, sharpened.b, uvec2(pixel),
+                     uvec4(floatBitsToUint(pp.pro_rcas), 0u, 0u, 0u));
+            color_linear.rgb = max(color_linear.rgb + (sharpened - texelFetch(texSampler, pixel, 0).rgb), vec3(0.0));
+        }
+    }
     if (pp.dlss_sharpening > 0.0) {
         ivec2 pixel = clamp(ivec2(uv * textureSize(texSampler, 0)), ivec2(0),
                             textureSize(texSampler, 0) - 1);

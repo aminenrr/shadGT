@@ -1,6 +1,9 @@
 //  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/log.h"
+#include "common/game_title.h"
+#include <cstdlib>
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 
 #include "common/assert.h"
@@ -33,11 +36,15 @@ struct PostProcessingConstants {
     float side_x0 = 0.0f;
     float side_x1 = 1.0f;
     float side_dim = 1.0f;
+    // PRT-PRODOWN: 1 = a frame larger than the output is averaged over each output pixel, and the
+    // RCAS strength (0 = off) applied with it.
+    float pro_downscale = 0.0f;
+    float pro_rcas = 0.0f;
 };
 // Must match the push-constant block in post_process.frag.
 static_assert(sizeof(PostProcessingPass::Settings) == 56);
 static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 56);
-static_assert(sizeof(PostProcessingConstants) == 72);
+static_assert(sizeof(PostProcessingConstants) == 80);
 } // namespace
 
 void PostProcessingPass::Create(vk::Device device, vk::PhysicalDevice physical_device) {
@@ -459,7 +466,24 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         side_dim = brightness;
     }
 #endif
-    const PostProcessingConstants constants{settings, dlss_sharpening, side_x0, side_x1, side_dim};
+    // PRT-PRODOWN (pr-tests, RYGT_PRO_DOWNSCALE on GT7, 0 = off; RYGT_PRO_RCAS 0 to 1, off unless
+    // set): PS4 Pro mode's 3200x1800 frame on a smaller window was read with one bilinear tap.
+    static const float pro_downscale = [] {
+        const char* env = std::getenv("RYGT_PRO_DOWNSCALE");
+        return Common::CurrentGameTitle() == Common::GameTitle::Gt7 && !(env && env[0] == '0')
+                   ? 1.0f
+                   : 0.0f;
+    }();
+    static const float pro_rcas = [] {
+        const char* env = std::getenv("RYGT_PRO_RCAS");
+        const double value = env && *env ? std::strtod(env, nullptr) : 0.0;
+        const float rcas = std::isfinite(value) ? float(std::clamp(value, 0.0, 1.0)) : 0.0f;
+        LOG_WARNING(Render_Vulkan, "PRT-PRODOWN: downscale {}, RCAS {}",
+                    pro_downscale > 0.0f ? "on" : "off", rcas);
+        return rcas;
+    }();
+    const PostProcessingConstants constants{settings, dlss_sharpening, side_x0, side_x1, side_dim,
+                                            pro_downscale, pro_rcas};
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
                          sizeof(constants), &constants);
 
