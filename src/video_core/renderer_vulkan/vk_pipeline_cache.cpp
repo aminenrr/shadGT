@@ -3465,10 +3465,37 @@ static u64 DriverCacheMaxBytes() {
 // .old at start and the driver begins an empty one (title_defaults.h has why). Unset: 1024 for
 // GT7, 2048 for GT Sport; 0 turns it off. Separate from the limit above, which the launcher sets
 // from the disk budget (up to 100 GB): that one only stops a larger file being loaded.
+// PRT-DRVKEEP (pr-tests, RYGT_DRIVER_CACHE_KEEP, on; 0 = upstream): GT7 rotates the driver cache
+// at 2048 MB instead of 1024, and the .old file left by a rotation is deleted once a new cache was
+// saved, so it does not keep its size on disk.
+static bool PrtDriverCacheKeepOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_KEEP");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+static void PrtDeleteOldDriverCache(const std::filesystem::path& path) {
+    static std::atomic<bool> done{false};
+    if (!PrtDriverCacheKeepOn() || done.exchange(true)) return;
+    auto old = path;
+    old += ".old";
+    std::error_code error;
+    const auto size = std::filesystem::file_size(old, error);
+    if (error) return;
+    std::filesystem::remove(old, error);
+    LOG_WARNING(Render_Vulkan, "PRT-DRVKEEP: {} ({} MB) {}", old.filename().string(), size >> 20,
+                error ? "could not be deleted: " + error.message() : std::string{"deleted"});
+}
+
 static u64 DriverCacheRotateBytes() {
     static const u64 limit = [] {
         const char* env = std::getenv("SHADGT_DRIVER_CACHE_ROTATE_MB");
         if (!env || !*env) {
+            if (PrtDriverCacheKeepOn() && Common::CurrentGameTitle() == Common::GameTitle::Gt7) {
+                return u64{2048} << 20;
+            }
             return u64{VideoCore::CurrentTitleDefaults().driver_cache_rotate_mb} << 20;
         }
         const long long mb = std::strtoll(env, nullptr, 10);
@@ -3757,6 +3784,7 @@ void PipelineCache::SaveDriverCache(bool wait) {
         if (replaced) LOG_INFO(Render_Vulkan,
             "CACHE-SAVED: {} bytes, hash {:016x}, file {}", data.size(),
             XXH3_64bits(data.data(), data.size()), path.string());
+        if (replaced) PrtDeleteOldDriverCache(path);
         return replaced;
     };
     const vk::Device device = instance.GetDevice();

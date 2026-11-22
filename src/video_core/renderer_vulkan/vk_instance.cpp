@@ -1605,10 +1605,11 @@ void Instance::ApplyVideoMemorySetting() {
         // PRT-VRAMAUTO (pr-tests, RYGT_VRAM_AUTO_RESERVE_MB, 1024 unless set; 0 = old Auto): Auto
         // plans with the card's video memory less this reserve when that is more than the driver
         // budget. The owner's RTX 3070 Ti laptop (8 GB) got 6342 MB from the driver budget while a
-        // PS4 Pro mode race used 7.3 GB, so its textures were dropped and loaded again; now 7168.
+        // PS4 Pro mode race used 7.3 GB. Round 4b (2026-11-22): default 0, Auto = driver budget again,
+        // since going over it (8.6 GB peak) spilled to system memory and slowed menus.
         static const u64 reserve = [] {
             const char* env = std::getenv("RYGT_VRAM_AUTO_RESERVE_MB");
-            return (env && *env) ? u64{std::strtoull(env, nullptr, 10)} << 20 : u64{1024} << 20;
+            return (env && *env) ? u64{std::strtoull(env, nullptr, 10)} << 20 : u64{0};
         }();
         if (reserve != 0 && device_local_bytes > reserve + 1_GB) {
             const u64 wanted = device_local_bytes - reserve;
