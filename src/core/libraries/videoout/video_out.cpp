@@ -3,7 +3,10 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include "common/assert.h"
 #include "common/elf_info.h"
@@ -35,6 +38,47 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 namespace Libraries::VideoOut {
 
 static std::unique_ptr<VideoOutDriver> driver;
+
+// PRT-SYSPARAM (pr-tests, RYGT_SYSPARAM_LOG, GT7, on; 0 = off): each video output query or
+// setter with its arguments and our answer, once per distinct answer and again when it changes
+// (GT7 options that do not stick: audio mode, display calibration, opening movie).
+static bool SysParamLogOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SYSPARAM_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+
+static void SysParamNote(const char* call, const std::string& args, const std::string& answer) {
+    constexpr u32 MaxPerCall = 64;
+    static std::mutex mutex;
+    static std::map<std::string, std::string> answers;
+    static std::map<std::string, u32> lines;
+    const std::string key = fmt::format("{}({})", call, args);
+    std::scoped_lock lock{mutex};
+    const auto it = answers.find(key);
+    if (it != answers.end() && it->second == answer) {
+        return;
+    }
+    u32& count = lines[call];
+    if (count >= MaxPerCall) {
+        if (count == MaxPerCall) {
+            LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: {}: {} lines, later answers not logged", call,
+                        MaxPerCall);
+            ++count;
+        }
+        return;
+    }
+    ++count;
+    if (it == answers.end()) {
+        LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: {} -> {}", key, answer);
+        answers.emplace(key, answer);
+    } else {
+        LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: {} -> {} (was {})", key, answer, it->second);
+        it->second = answer;
+    }
+}
 
 static bool GameSupportsHdr() {
     const auto& game_info = Common::ElfInfo::Instance();
@@ -371,6 +415,13 @@ s32 PS4_SYSV_ABI sceVideoOutGetResolutionStatus(s32 handle, SceVideoOutResolutio
                  status->full_width, status->full_height, status->pane_width, status->pane_height);
     }
 #endif
+    if (SysParamLogOn()) {
+        SysParamNote("sceVideoOutGetResolutionStatus", fmt::format("handle {}", handle),
+                     fmt::format("ret 0, full {}x{}, pane {}x{}, refresh {}, {:.0f} inch, flags {:#x}",
+                                 status->full_width, status->full_height, status->pane_width,
+                                 status->pane_height, status->refresh_rate,
+                                 status->screen_size_in_inch, status->flags));
+    }
     return ORBIS_OK;
 }
 
@@ -479,6 +530,16 @@ s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
             pDeviceCapabilityInfo->capability |= ORBIS_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ;
         }
     }
+    if (SysParamLogOn()) {
+        // PRT-SYSPARAM: asked about 500 times a second; the lock only when the answer changes.
+        static std::atomic<u64> last_answer{~u64{0}};
+        const u64 answer = (u64(u32(handle)) << 32) | u32(pDeviceCapabilityInfo->capability);
+        if (last_answer.exchange(answer, std::memory_order_relaxed) != answer) {
+            SysParamNote("sceVideoOutGetDeviceCapabilityInfo", fmt::format("handle {}", handle),
+                         fmt::format("ret 0, capability {:#x} (swapchain HDR {})",
+                                     pDeviceCapabilityInfo->capability, hdr_available));
+        }
+    }
     return ORBIS_OK;
 }
 
@@ -496,9 +557,17 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
 
 s32 PS4_SYSV_ABI sceVideoOutColorSettingsSetGamma(SceVideoOutColorSettings* settings, float gamma) {
     if (gamma < 0.1f || gamma > 2.0f) {
+        if (SysParamLogOn()) {
+            SysParamNote("sceVideoOutColorSettingsSetGamma", fmt::format("gamma {:.3f}", gamma),
+                         "ret INVALID_VALUE, settings untouched");
+        }
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
     }
     settings->gamma = gamma;
+    if (SysParamLogOn()) {
+        SysParamNote("sceVideoOutColorSettingsSetGamma", fmt::format("gamma {:.3f}", gamma),
+                     "ret 0, written to the game's settings struct");
+    }
     return ORBIS_OK;
 }
 
@@ -513,6 +582,10 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
     }
 
     presenter->GetPPSettingsRef().gamma = settings->gamma;
+    if (SysParamLogOn()) {
+        SysParamNote("sceVideoOutAdjustColor", fmt::format("handle {}", handle),
+                     fmt::format("ret 0, presenter gamma set to {:.3f}", settings->gamma));
+    }
     return ORBIS_OK;
 }
 
@@ -574,9 +647,23 @@ s32 PS4_SYSV_ABI sceVideoOutConfigureOutputMode_(s32 handle, u32 reserved, const
 #endif
         break;
     default:
+        if (SysParamLogOn()) {
+            SysParamNote("sceVideoOutConfigureOutputMode_",
+                         fmt::format("handle {}, colorimetry {}", handle, u32(mode->colorimetry)),
+                         "ret INVALID_VALUE");
+        }
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
     }
 
+    if (SysParamLogOn()) {
+        SysParamNote("sceVideoOutConfigureOutputMode_",
+                     fmt::format("handle {}, encoding {}, range {}, colorimetry {}, depth {}, "
+                                 "refresh {:#x}, resolution {:#x}",
+                                 handle, u32(mode->encoding), u32(mode->range),
+                                 u32(mode->colorimetry), u32(mode->depth), mode->refresh_rate,
+                                 mode->resolution),
+                     fmt::format("ret 0, port HDR {}", port->is_hdr));
+    }
     return ORBIS_OK;
 }
 
@@ -592,6 +679,11 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitChangeBufferAttribute(s32 handle, s32 attribut
 
 s32 PS4_SYSV_ABI sceVideoOutSetWindowModeMargins(s32 handle, s32 top, s32 bottom) {
     LOG_ERROR(Lib_VideoOut, "(STUBBED) called top = {}, bottom = {}", top, bottom);
+    if (SysParamLogOn()) {
+        SysParamNote("sceVideoOutSetWindowModeMargins",
+                     fmt::format("handle {}, top {}, bottom {}", handle, top, bottom),
+                     "ret 0, ignored (stub)");
+    }
     return ORBIS_OK;
 }
 
