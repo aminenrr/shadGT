@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -50,7 +52,22 @@ static bool SysParamLogOn() {
     return on;
 }
 
-static void SysParamNote(const char* call, const std::string& args, const std::string& answer) {
+static std::string SysParamClock() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &seconds);
+#else
+    localtime_r(&seconds, &local);
+#endif
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+    return fmt::format("{:02}:{:02}:{:02}.{:03}", local.tm_hour, local.tm_min, local.tm_sec, ms);
+}
+
+static void SysParamNote(const char* call, const std::string& args, const std::string& answer,
+                         bool every_call = false) {
     constexpr u32 MaxPerCall = 64;
     static std::mutex mutex;
     static std::map<std::string, std::string> answers;
@@ -58,7 +75,7 @@ static void SysParamNote(const char* call, const std::string& args, const std::s
     const std::string key = fmt::format("{}({})", call, args);
     std::scoped_lock lock{mutex};
     const auto it = answers.find(key);
-    if (it != answers.end() && it->second == answer) {
+    if (!every_call && it != answers.end() && it->second == answer) {
         return;
     }
     u32& count = lines[call];
@@ -72,10 +89,14 @@ static void SysParamNote(const char* call, const std::string& args, const std::s
     }
     ++count;
     if (it == answers.end()) {
-        LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: {} -> {}", key, answer);
+        LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: [{}] {} -> {}", SysParamClock(), key, answer);
         answers.emplace(key, answer);
+    } else if (it->second == answer) {
+        LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: [{}] {} -> {} (again)", SysParamClock(), key,
+                    answer);
     } else {
-        LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: {} -> {} (was {})", key, answer, it->second);
+        LOG_WARNING(Lib_VideoOut, "PRT-SYSPARAM: [{}] {} -> {} (was {})", SysParamClock(), key,
+                    answer, it->second);
         it->second = answer;
     }
 }
@@ -559,32 +580,41 @@ s32 PS4_SYSV_ABI sceVideoOutColorSettingsSetGamma(SceVideoOutColorSettings* sett
     if (gamma < 0.1f || gamma > 2.0f) {
         if (SysParamLogOn()) {
             SysParamNote("sceVideoOutColorSettingsSetGamma", fmt::format("gamma {:.3f}", gamma),
-                         "ret INVALID_VALUE, settings untouched");
+                         "ret INVALID_VALUE, settings untouched", true);
         }
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
     }
     settings->gamma = gamma;
     if (SysParamLogOn()) {
         SysParamNote("sceVideoOutColorSettingsSetGamma", fmt::format("gamma {:.3f}", gamma),
-                     "ret 0, written to the game's settings struct");
+                     "ret 0, written to the game's settings struct", true);
     }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettings* settings) {
     if (settings == nullptr) {
+        if (SysParamLogOn()) {
+            SysParamNote("sceVideoOutAdjustColor", fmt::format("handle {}", handle),
+                         "ret INVALID_ADDRESS (no settings)", true);
+        }
         return ORBIS_VIDEO_OUT_ERROR_INVALID_ADDRESS;
     }
 
     auto* port = driver->GetPort(handle);
     if (!port) {
+        if (SysParamLogOn()) {
+            SysParamNote("sceVideoOutAdjustColor", fmt::format("handle {}", handle),
+                         fmt::format("ret INVALID_HANDLE, gamma {:.3f} not applied", settings->gamma),
+                         true);
+        }
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
     presenter->GetPPSettingsRef().gamma = settings->gamma;
     if (SysParamLogOn()) {
         SysParamNote("sceVideoOutAdjustColor", fmt::format("handle {}", handle),
-                     fmt::format("ret 0, presenter gamma set to {:.3f}", settings->gamma));
+                     fmt::format("ret 0, presenter gamma set to {:.3f}", settings->gamma), true);
     }
     return ORBIS_OK;
 }
