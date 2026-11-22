@@ -56,6 +56,63 @@ u64 FileTimeTo100ns(const FILETIME& time) {
     return (u64(time.dwHighDateTime) << 32) | time.dwLowDateTime;
 }
 
+bool PrtThreadModuleOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PERF_THREAD_MODULE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+std::unordered_map<DWORD, std::string>& PrtThreadModules() {
+    static std::unordered_map<DWORD, std::string> modules;
+    return modules;
+}
+
+std::string PrtThreadModule(DWORD tid) {
+    auto& modules = PrtThreadModules();
+    if (const auto it = modules.find(tid); it != modules.end()) {
+        return it->second;
+    }
+    using QueryThread = LONG(WINAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    static const QueryThread query = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll ? reinterpret_cast<QueryThread>(
+                           reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQueryInformationThread")))
+                     : nullptr;
+    }();
+    std::string module_name;
+    const HANDLE thread = query ? OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid) : nullptr;
+    if (thread) {
+        PVOID start = nullptr;
+        constexpr int ThreadQuerySetWin32StartAddress = 9;
+        if (query(thread, ThreadQuerySetWin32StartAddress, &start, sizeof(start), nullptr) >= 0 &&
+            start) {
+            HMODULE module = nullptr;
+            wchar_t path[MAX_PATH] = {};
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   static_cast<LPCWSTR>(start), &module) &&
+                GetModuleFileNameW(module, path, MAX_PATH) != 0) {
+                const wchar_t* file = path;
+                for (const wchar_t* c = path; *c; ++c) {
+                    if (*c == L'\\' || *c == L'/') {
+                        file = c + 1;
+                    }
+                }
+                for (const wchar_t* c = file; *c; ++c) {
+                    module_name.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
+                }
+            } else {
+                module_name = "no module";
+            }
+        }
+        CloseHandle(thread);
+    }
+    modules.emplace(tid, module_name);
+    return module_name;
+}
+
 std::string ThreadName(HANDLE handle, DWORD tid) {
     PWSTR description = nullptr;
     std::string name;
@@ -67,6 +124,12 @@ std::string ThreadName(HANDLE handle, DWORD tid) {
     }
     if (name.empty()) {
         name = fmt::format("tid{}", tid);
+        if (PrtThreadModuleOn()) {
+            const std::string module_name = PrtThreadModule(tid);
+            if (!module_name.empty()) {
+                name += "@" + module_name;
+            }
+        }
     }
     return name;
 }
@@ -147,6 +210,8 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
         }
         return !pair.second.seen;
     });
+    std::erase_if(PrtThreadModules(),
+                  [&](const auto& pair) { return !threads.contains(pair.first); });
 
     std::ranges::sort(usages, std::greater{}, &Usage::percent);
     std::string summary = fmt::format("process {:.0f}% of {}%;", total_percent,
