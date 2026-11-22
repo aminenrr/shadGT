@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <boost/container/flat_map.hpp>
 #include <queue>
 #include <xbyak/xbyak.h>
@@ -33,9 +37,86 @@
 
 using namespace Xbyak::util;
 
+// FIX-SGT-094: the walker storage's limit. It was a fixed 256 MiB, which GT7's walkers filled
+// once its 510 cars were loaded in one session (every stored permutation of a program publishes
+// its walker when the program is first looked up; a full store holds ~430 MiB of them). How much
+// a session needs comes from the game, not this PC: the 510-car tour and a race peaked at 256 to
+// 288 MiB, and a session at the limit skips the draws of every new shader it meets (094b, 11-21:
+// most of a race's draws). So the limit is 1/32 of the RAM, never under 512 MiB nor
+// over 1 GiB (32 GB and more). Segments are only made as walkers need them, so the floor costs a
+// smaller PC nothing until a session needs it. SHADGT_SRT_STORAGE_MB=<MiB> sets it (256: the
+// old size).
+static std::size_t SrtStorageLimit() {
+    constexpr std::size_t MiB = std::size_t{1} << 20;
+    if (const char* env = std::getenv("SHADGT_SRT_STORAGE_MB"); env && *env) {
+        if (const auto mib = std::strtoull(env, nullptr, 10); mib != 0) {
+            return static_cast<std::size_t>(std::min<unsigned long long>(mib, 4095)) * MiB;
+        }
+    }
+    unsigned long long ram = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (GlobalMemoryStatusEx(&memory)) ram = memory.ullTotalPhys;
+#else
+    if (const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE); pages > 0 && page > 0)
+        ram = static_cast<unsigned long long>(pages) * static_cast<unsigned long long>(page);
+#endif
+    return static_cast<std::size_t>(std::clamp<unsigned long long>(ram / 32, 512 * MiB, 1024 * MiB));
+}
+
 // Intentionally process-lifetime: the signal handler may inspect the segment table at any time.
-static auto* const g_srt_storage = new Shader::SrtWalkerStorage<>;
+static auto* const g_srt_storage = new Shader::SrtWalkerStorage<>{SrtStorageLimit()};
 static std::once_flag g_srt_handler_once;
+
+// FIX-SGT-094 (every build): how full the walker storage is, each time its made segments pass
+// another 32 MiB (the session's peak to within 32 MiB, at most 32 lines up to 1 GiB), and at its
+// 1st, 2nd, 4th, 8th... refused walker.
+static void ReportSrtStorage(const char* what) noexcept {
+    try {
+        const auto s = g_srt_storage->Stats();
+        LOG_WARNING(Render_Recompiler,
+                    "FIX-SGT-094: SRT walker storage {}: {} MiB made of {} MiB (limit), {} MiB live "
+                    "(peak {} MiB), {} walkers published, {} released, {} refused",
+                    what, s.reserved >> 20, s.limit >> 20, s.live >> 20, s.high_water >> 20,
+                    s.allocations, s.releases, s.failures);
+    } catch (...) {
+        // A report must never replace a translation's own result.
+    }
+}
+static std::shared_ptr<Shader::SrtWalkerStorage<>::WalkerLease> PublishWalker(const u8* code,
+                                                                               size_t size) {
+    constexpr size_t ReportStep = 32_MB;
+    static std::atomic<size_t> next_report{ReportStep};
+    try {
+        auto lease = g_srt_storage->Publish(code, size);
+        if (auto next = next_report.load(std::memory_order_relaxed);
+            g_srt_storage->Reserved() >= next &&
+            next_report.compare_exchange_strong(
+                next, (g_srt_storage->Reserved() / ReportStep + 1) * ReportStep,
+                std::memory_order_relaxed)) {
+            ReportSrtStorage("grows");
+        }
+        return lease;
+    } catch (const Shader::SrtStorageFull& full) {
+        static std::atomic<u64> refused{};
+        if (const auto n = ++refused; std::has_single_bit(n)) {
+            LOG_WARNING(Render_Recompiler, "FIX-SGT-094: a walker of {} bytes does not fit ({} refused)",
+                        full.bytes, n);
+            ReportSrtStorage("is full");
+        }
+        throw;
+    }
+}
+
+namespace Shader {
+bool SrtWalkerMayFit(size_t bytes) {
+    return g_srt_storage->MayFit(bytes);
+}
+bool SrtWalkerStorageAtWall() {
+    return g_srt_storage->AtWall();
+}
+} // namespace Shader
 #ifndef NDEBUG
 namespace Shader::SrtArenaTrace {
 void Report(std::uint64_t used, const char* reason) noexcept {
@@ -105,48 +186,6 @@ static void EnsureSrtWalkerSignalHandler() {
     std::call_once(g_srt_handler_once, [] {
         Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler, 1);
     });
-}
-
-// PRT-SRTUSE (pr-tests, RYGT_SRT_USE_LOG, on unless =0): logs SRT walker code use each time the
-// reserved or live bytes cross another 16 MB, and every refused walker, so a launcher prewarm
-// that stops (shadgt7 B5: abort after "SRT walker code uses 240 MB of 256 MB") shows how full
-// shadGT's walker storage was.
-static bool SrtUseLogOn() {
-    static const bool on = [] {
-        const char* env = std::getenv("RYGT_SRT_USE_LOG");
-        return !(env && env[0] == '0');
-    }();
-    return on;
-}
-static void ReportSrtWalkerUse(const char* refused = nullptr) {
-    if (!SrtUseLogOn()) return;
-    static std::atomic<size_t> next_report{16_MB};
-    static std::atomic<u32> refusals{};
-    const auto use = g_srt_storage->CurrentUsage();
-    if (refused) {
-        if (refusals.fetch_add(1) < 32)
-            LOG_WARNING(Render_Recompiler,
-                        "PRT-SRTUSE: SRT walker refused ({}): {} MB reserved, {} MB live of {} MB",
-                        refused, use.reserved >> 20, use.live >> 20, use.limit >> 20);
-        return;
-    }
-    const size_t used = (std::max)(use.reserved, use.live);
-    auto next = next_report.load();
-    if (used >= next && next_report.compare_exchange_strong(next, (used / 16_MB + 1) * 16_MB))
-        LOG_WARNING(Render_Recompiler,
-                    "PRT-SRTUSE: SRT walker code uses {} MB reserved, {} MB live of {} MB",
-                    use.reserved >> 20, use.live >> 20, use.limit >> 20);
-}
-static std::shared_ptr<Shader::SrtWalkerStorage<>::WalkerLease> PublishWalker(const u8* code,
-                                                                             size_t size) {
-    try {
-        auto owner = g_srt_storage->Publish(code, size);
-        ReportSrtWalkerUse();
-        return owner;
-    } catch (const Common::RecoverableFailure& e) {
-        ReportSrtWalkerUse(e.what());
-        throw;
-    }
 }
 
 namespace Shader {
@@ -1075,6 +1114,12 @@ namespace Shader {
 
 WalkerCode RegisterWalkerCode(const u8* ptr, size_t size, u64 key) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
+}
+bool SrtWalkerMayFit(size_t) {
+    return true;
+}
+bool SrtWalkerStorageAtWall() {
+    return false;
 }
 
 namespace Optimization {
