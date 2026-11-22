@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/log.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -65,6 +66,11 @@ private:
 
     std::atomic<u64> last_frames{~u64{0}};
     std::atomic<s64> changed_ns{0};
+
+public:
+    bool stall_logging = false;
+    u32 stall_jobs_max = 0;
+    s64 stall_from = 0;
 };
 
 CompileNoticeUI g_layer;
@@ -74,6 +80,33 @@ void CompileNoticeUI::Draw() {
     // PERF-GT7-108: the compile pack's start-up compile shows its progress while it runs.
     const bool pack = Enabled() && Vulkan::CompilePack::g_running.load(std::memory_order_acquire);
     const bool stalled = Stalled(now);
+    {
+        // PRT-STALLLOG (pr-tests, RYGT_STALL_LOG, on; 0 = off): one line per stall when it ends,
+        // its length and whether pipelines were building, to find what the menu waits on.
+        static const bool log_on = [] {
+            const char* env = std::getenv("RYGT_STALL_LOG");
+            return !(env && env[0] == '0');
+        }();
+        if (log_on) {
+            if (stalled) {
+                if (!stall_logging) {
+                    stall_logging = true;
+                    stall_jobs_max = 0;
+                    stall_from = changed_ns.load(std::memory_order_relaxed);
+                }
+                stall_jobs_max = std::max(stall_jobs_max,
+                                          Vulkan::g_build_jobs.load(std::memory_order_relaxed));
+            } else if (stall_logging) {
+                stall_logging = false;
+                const double ms = double(now.time_since_epoch().count() - stall_from) / 1e6;
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-STALLLOG: no new game frame for {:.0f} ms, {} (most build jobs "
+                            "{}), frame {}",
+                            ms, stall_jobs_max != 0 ? "pipelines building" : "nothing compiling",
+                            stall_jobs_max, Common::GetGameFrameTotals().frames);
+            }
+        }
+    }
     if (!stalled && !pack) {
         return;
     }
