@@ -8134,6 +8134,31 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             one_off_photo_output = true;
             return false;
         }
+        // PRT-PHOTOWAIT (pr-tests, RYGT_PHOTO_FIRST_WAIT, on; 0 = off): GT7 has no photo mode
+        // signal (RytyGtsPhotoMode is GT Sport's), so out of a race a draw into a 3840x2160 or
+        // larger colour target never drawn into waits for its pipeline. Skipped, the first Scapes
+        // photo of a session (0x102a160000 3840x2160, round 4b log) was saved black.
+        static const bool photo_first_wait = [] {
+            const char* env = std::getenv("RYGT_PHOTO_FIRST_WAIT");
+            return !(env && env[0] == '0');
+        }();
+        if (photo_first_wait && Common::IsGt7() && target_cb >= 0 && !RytyRaceRunning() &&
+            (!entry || entry->write_version.load(std::memory_order_relaxed) == 0)) {
+            const auto& extent = r.liverpool->DrawCbExtent(u32(target_cb));
+            const u32 width = layout ? layout->size.width : u32(extent.width);
+            const u32 height = layout ? layout->size.height : u32(extent.height);
+            if (width >= 3840 && height >= 2160) {
+                one_off_photo_output = true;
+                static std::atomic<u32> photo_logged{};
+                if (const u32 n = photo_logged++; n < 64 || n % 500 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-PHOTOWAIT: a draw into {:#x} {}x{}, never drawn, waits for its "
+                                "pipeline (frame {}, {} so far)",
+                                address, width, height, frame, n + 1);
+                }
+                return false;
+            }
+        }
         if (!entry) {
             note(0);
             if (OneOffTrackOn()) {
@@ -24099,7 +24124,39 @@ void NativeRenderer::EvictImages() {
         LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
                                    "released instead of kept");
     }
-    if (pressure || texture_budget == 0) {
+    // PRT-VRAMKEEP (pr-tests, RYGT_VRAM_OVER_RELEASE, on; 0 = off): over the video memory budget
+    // the idle textures are released too, checked every 30 frames. On an 8 GB card the driver
+    // never fails an allocation, it moves memory to system RAM: after a GT7 race up to 2 GB of the
+    // race's idle textures were kept while VRAM sat at 8.6 GB of 6.3, and menus ran at 10 fps.
+    static const bool over_release = [] {
+        const char* env = std::getenv("RYGT_VRAM_OVER_RELEASE");
+        return !(env && env[0] == '0');
+    }();
+    bool over_budget = false;
+    if (over_release && !pressure) {
+        static u64 over_checked = 0;
+        static bool over_was = false;
+        static u64 over_held = 0;
+        if (frame >= over_checked + 30) {
+            over_checked = frame;
+            const u64 vram_budget = r.instance.GetTotalMemoryBudget();
+            const u64 vram_used = vram_budget ? r.instance.GetDeviceMemoryUsage() : 0;
+            over_was = vram_budget && vram_used + vram_budget / 32 > vram_budget;
+            if (over_was) {
+                ++over_held;
+                static std::atomic<u32> over_logged{};
+                if (const u32 n = over_logged++; n < 32 || n % 200 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-VRAMKEEP: VRAM {} of {} MB, idle textures released ({:.0f} MB "
+                                "were kept; {} so far)",
+                                vram_used >> 20, vram_budget >> 20,
+                                kept_texture_bytes / 1048576.0, n + 1);
+                }
+            }
+        }
+        over_budget = over_was;
+    }
+    if (pressure || over_budget || texture_budget == 0) {
         kept_textures.clear();
         kept_texture_scan.clear();
         kept_texture_shard = 0;
