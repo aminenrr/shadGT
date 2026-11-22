@@ -8,6 +8,7 @@
 
 #include "common/guest_clock.h"
 #include "common/logging/log.h"
+#include "common/prt_stall_cause.h"
 #include "common/perf_monitor.h"
 #include "common/rdtsc.h"
 
@@ -93,31 +94,63 @@ void MarkGpuCommandThread() {
 
 void TakeHold() {
     if (Enabled()) {
+        if (StallCause::On() && !Counter().IsPaused()) {
+            StallCause::g_hold_start_ns.store(StallCause::NowNs(), std::memory_order_relaxed);
+        }
         Counter().Pause(FencedRDTSC());
     }
 }
 
 void ReleaseHold() {
     if (Enabled()) {
-        Counter().Resume(FencedRDTSC());
+        if (Counter().Resume(FencedRDTSC()) != 0 && StallCause::On()) {
+            // PRT-STALLCAUSE: the whole hold, from the first pause to the last resume.
+            const s64 from = StallCause::g_hold_start_ns.exchange(0, std::memory_order_relaxed);
+            if (from != 0) {
+                StallCause::Note(StallCause::Wait::ClockHold,
+                                 u64(std::max<s64>(StallCause::NowNs() - from, 0) / 1000));
+            }
+        }
     }
 }
 
-CompilePause::CompilePause(HoldSite site_) : active{is_gpu_command_thread && Enabled()}, site{site_} {
-    if (active) {
+CompilePause::CompilePause(HoldSite site_)
+    : active{is_gpu_command_thread && Enabled()},
+      timed{is_gpu_command_thread && StallCause::On()}, site{site_} {
+    if (active || timed) {
         start = std::chrono::steady_clock::now();
+    }
+    if (active) {
+        if (timed && !Counter().IsPaused()) {
+            StallCause::g_hold_start_ns.store(StallCause::NowNs(), std::memory_order_relaxed);
+        }
         Counter().Pause(FencedRDTSC());
     }
 }
 
 CompilePause::~CompilePause() {
-    if (!active) {
+    if (!active && !timed) {
         return;
     }
     const auto held = std::chrono::steady_clock::now() - start;
-    NoteSite(site, u64(std::chrono::duration_cast<std::chrono::microseconds>(held).count()));
+    const u64 held_us = u64(std::chrono::duration_cast<std::chrono::microseconds>(held).count());
+    if (timed) {
+        StallCause::NoteSite(size_t(site), held_us); // PRT-STALLCAUSE: compile waits by site
+    }
+    if (!active) {
+        return;
+    }
+    NoteSite(site, held_us);
     if (Counter().Resume(FencedRDTSC()) == 0) {
         return; // An outer hold continues.
+    }
+    if (timed) {
+        // PRT-STALLCAUSE: the whole hold, from the first pause to the last resume.
+        const s64 from = StallCause::g_hold_start_ns.exchange(0, std::memory_order_relaxed);
+        if (from != 0) {
+            StallCause::Note(StallCause::Wait::ClockHold,
+                             u64(std::max<s64>(StallCause::NowNs() - from, 0) / 1000));
+        }
     }
     // The longer holds are the ones the game would otherwise have seen as long frames.
     const double ms = std::chrono::duration<double, std::milli>(held).count();

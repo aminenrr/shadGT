@@ -8,10 +8,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
+#include <fmt/format.h>
 #include <imgui.h>
 
 #include "common/perf_monitor.h"
+#include "common/prt_stall_cause.h"
 #include "common/types.h"
 #include "imgui/compile_notice_layer.h"
 #include "imgui/imgui_layer.h"
@@ -71,9 +74,74 @@ public:
     bool stall_logging = false;
     u32 stall_jobs_max = 0;
     s64 stall_from = 0;
+    // PRT-STALLCAUSE: the wait totals at the last new game frame.
+    u64 cause_frames = ~u64{0};
+    std::array<u64, size_t(Common::StallCause::Wait::Count)> cause_us{};
+    std::array<u64, size_t(Common::StallCause::Wait::Count)> cause_count{};
+    std::array<u64, Common::StallCause::SiteCount> cause_site_us{};
+    void TakeCauseBaseline();
+    std::string CauseText();
 };
 
 CompileNoticeUI g_layer;
+
+void CompileNoticeUI::TakeCauseBaseline() {
+    namespace SC = Common::StallCause;
+    for (size_t i = 0; i < cause_us.size(); ++i) {
+        cause_us[i] = SC::g_wait_us[i].load(std::memory_order_relaxed);
+        cause_count[i] = SC::g_wait_count[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < cause_site_us.size(); ++i) {
+        cause_site_us[i] = SC::g_site_us[i].load(std::memory_order_relaxed);
+    }
+    std::scoped_lock lock{SC::g_fence_mutex};
+    SC::g_fence_longest_us = 0;
+    SC::g_fence_longest.clear();
+}
+
+std::string CompileNoticeUI::CauseText() {
+    namespace SC = Common::StallCause;
+    // Common::GuestClock::HoldSite order (DIAG-GTS-518 names).
+    static constexpr std::array<const char*, SC::SiteCount> site_names{
+        "other",   "lookup translations",  "required build",  "build wait",
+        "compute", "shader on GPU thread", "translation job", "retranslate"};
+    const auto delta = [&](SC::Wait wait) {
+        const size_t i = size_t(wait);
+        return std::pair<double, u64>{
+            double(SC::g_wait_us[i].load(std::memory_order_relaxed) - cause_us[i]) / 1000.0,
+            SC::g_wait_count[i].load(std::memory_order_relaxed) - cause_count[i]};
+    };
+    const auto [hold_ms, holds] = delta(SC::Wait::ClockHold);
+    const auto [fence_ms, fences] = delta(SC::Wait::Fence);
+    const auto [present_ms, presents] = delta(SC::Wait::Present);
+    const auto [acquire_ms, acquires] = delta(SC::Wait::Acquire);
+    double compile_ms = 0.0;
+    std::string sites;
+    for (size_t i = 0; i < SC::SiteCount; ++i) {
+        const double ms =
+            double(SC::g_site_us[i].load(std::memory_order_relaxed) - cause_site_us[i]) / 1000.0;
+        if (ms < 1.0) {
+            continue;
+        }
+        if (i != 0) {
+            compile_ms += ms;
+        }
+        sites += fmt::format("{}{} {:.0f}", sites.empty() ? "" : ", ", site_names[i], ms);
+    }
+    double longest_ms = 0.0;
+    std::string longest;
+    {
+        std::scoped_lock lock{SC::g_fence_mutex};
+        longest_ms = double(SC::g_fence_longest_us) / 1000.0;
+        longest = SC::g_fence_longest;
+    }
+    return fmt::format(
+        "PRT-STALLCAUSE: guest clock held {:.0f} ms ({}), fence waits {:.0f} ms ({}, longest "
+        "{:.0f} ms at {}), DIAG-GTS-518 sites ms [{}], present wait {:.0f} ms ({}), acquire wait "
+        "{:.0f} ms ({}), pipeline compile waits {:.0f} ms",
+        hold_ms, holds, fence_ms, fences, longest_ms, longest.empty() ? "-" : longest,
+        sites.empty() ? "none" : sites, present_ms, presents, acquire_ms, acquires, compile_ms);
+}
 
 void CompileNoticeUI::Draw() {
     const auto now = Clock::now();
@@ -88,6 +156,14 @@ void CompileNoticeUI::Draw() {
             return !(env && env[0] == '0');
         }();
         if (log_on) {
+            const bool cause_on = Common::StallCause::On();
+            if (cause_on && !stalled && !stall_logging) {
+                const u64 frames = Common::GetGameFrameTotals().frames;
+                if (frames != cause_frames) {
+                    cause_frames = frames;
+                    TakeCauseBaseline();
+                }
+            }
             if (stalled) {
                 if (!stall_logging) {
                     stall_logging = true;
@@ -101,9 +177,14 @@ void CompileNoticeUI::Draw() {
                 const double ms = double(now.time_since_epoch().count() - stall_from) / 1e6;
                 LOG_WARNING(Render_Vulkan,
                             "PRT-STALLLOG: no new game frame for {:.0f} ms, {} (most build jobs "
-                            "{}), frame {}",
+                            "{}), frame {}{}{}",
                             ms, stall_jobs_max != 0 ? "pipelines building" : "nothing compiling",
-                            stall_jobs_max, Common::GetGameFrameTotals().frames);
+                            stall_jobs_max, Common::GetGameFrameTotals().frames,
+                            cause_on ? "; " : "", cause_on ? CauseText() : std::string{});
+                if (cause_on) {
+                    cause_frames = Common::GetGameFrameTotals().frames;
+                    TakeCauseBaseline();
+                }
             }
         }
     }

@@ -15,6 +15,7 @@
 #include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
+#include "common/prt_stall_cause.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
@@ -486,6 +487,7 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
 #ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
 #endif
+    const Common::StallCause::FenceSite fence_site{loc.file_name(), u32(loc.line())}; // PRT-STALLCAUSE
     work_semaphore.Wait(tick);
 #ifndef NDEBUG
     RecordGpuWait(loc, std::chrono::steady_clock::now() - start);

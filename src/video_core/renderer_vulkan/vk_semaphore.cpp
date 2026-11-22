@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 #include "common/assert.h"
+#include "common/prt_stall_cause.h"
 
 namespace Vulkan {
 
@@ -65,7 +67,15 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
+    const bool timed = Common::StallCause::On(); // PRT-STALLCAUSE
+    const s64 wait_from = timed ? Common::StallCause::NowNs() : 0;
+    const u64 behind = timed ? tick - std::min(tick, KnownGpuTick()) : 0;
     while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    }
+    if (timed) {
+        Common::StallCause::NoteFence(
+            u64(std::max<s64>(Common::StallCause::NowNs() - wait_from, 0) / 1000),
+            (u64)static_cast<VkSemaphore>(semaphore.get()), behind);
     }
     Refresh();
 }

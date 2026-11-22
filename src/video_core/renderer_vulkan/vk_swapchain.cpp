@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/prt_stall_cause.h"
 #include "core/emulator_settings.h"
 #ifdef RYTY_GPU
 #include "core/libraries/system/systemservice.h"
@@ -194,6 +196,8 @@ bool Swapchain::AcquireNextImage() {
         return false;
     }
     vk::Device device = instance.GetDevice();
+    std::optional<Common::StallCause::Timer> acquire_timer{std::in_place,
+                                                           Common::StallCause::Wait::Acquire};
 #ifdef RYTY_GPU
     vk::Result result =
         framegen.Active()
@@ -206,6 +210,7 @@ bool Swapchain::AcquireNextImage() {
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                    image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
 #endif
+    acquire_timer.reset(); // PRT-STALLCAUSE
 
     if (RecoverSwapchainTimeout(result, "acquisition")) {
         needs_recreation = true;
@@ -245,6 +250,8 @@ bool Swapchain::Present(u64 anti_lag_frame) {
 
     instance.AntiLagPresent(anti_lag_frame); // PERF-210
     // The raw-result overload also returns provider-specific statuses in debug builds.
+    std::optional<Common::StallCause::Timer> present_timer{std::in_place,
+                                                           Common::StallCause::Wait::Present};
 #ifdef RYTY_GPU
     RytyDlssG::PresentStart();
     auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)
@@ -253,6 +260,7 @@ bool Swapchain::Present(u64 anti_lag_frame) {
 #else
     auto result = instance.GetPresentQueue().presentKHR(&present_info);
 #endif
+    present_timer.reset(); // PRT-STALLCAUSE
     // FIX-218: a lost surface or exclusive fullscreen (Alt+Tab) recreates the swapchain too,
     // instead of stopping the game; a lost surface is replaced as well.
     if (RecoverSwapchainTimeout(result, "presentation")) {

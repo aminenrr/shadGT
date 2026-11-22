@@ -8,6 +8,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
+#include "common/prt_stall_cause.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -930,6 +931,8 @@ Frame* Presenter::PrepareLastFrame() {
         reusing_frame = frame;
     }
 
+    std::optional<Common::StallCause::Timer> present_done_timer{std::in_place,
+                                                                Common::StallCause::Wait::Present};
     while (true) {
         vk::Result result = instance.GetDevice().waitForFences(frame->present_done, false,
                                                                std::numeric_limits<u64>::max());
@@ -945,6 +948,7 @@ Frame* Presenter::PrepareLastFrame() {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
     }
+    present_done_timer.reset(); // PRT-STALLCAUSE
 
     auto& scheduler = flip_scheduler;
     scheduler.EndRendering();
@@ -1737,6 +1741,7 @@ void Presenter::WaitFrameDrawn(const Frame* frame) {
     if (!enabled || !frame || !frame->ready_scheduler || !rasterizer->Native()) {
         return;
     }
+    const Common::StallCause::FenceSite fence_site{"flip wait (frame ready)", 0}; // PRT-STALLCAUSE
     frame->ready_scheduler->GetWorkSemaphore()->Wait(frame->ready_tick);
 #else
     (void)frame;
@@ -2372,6 +2377,8 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    std::optional<Common::StallCause::Timer> present_done_timer{std::in_place,
+                                                                Common::StallCause::Wait::Present};
     while (wait() != vk::Result::eSuccess) {
         if (result == vk::Result::eErrorDeviceLost) {
             instance.LogDeviceFault();
@@ -2383,6 +2390,7 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+    present_done_timer.reset(); // PRT-STALLCAUSE
 #ifndef NDEBUG
     record_wait();
 #endif

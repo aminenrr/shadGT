@@ -135,6 +135,7 @@ public:
 
 private:
     bool active{};
+    bool timed{}; ///< PRT-STALLCAUSE: on the GPU command thread with RYGT_STALL_CAUSE on
     HoldSite site{};
     std::chrono::steady_clock::time_point start{};
 };
