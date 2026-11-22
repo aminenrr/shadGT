@@ -1524,6 +1524,15 @@ private:
     u64 kept_texture_bytes = 0;
     /// FIX-GT7-153: bytes of circuit shadow maps kept past their idle time (a budget of their own).
     u64 kept_shadow_bytes = 0;
+    struct PrtRelease2 {
+        Native::ImageEntry* entry;
+        u64 version;
+        u64 frame;
+        u64 bytes;
+    };
+    std::vector<PrtRelease2> prt_release2_pending;
+    std::unordered_set<const Native::ImageEntry*> prt_release2_done;
+    void PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames);
     std::vector<Native::ImageEntry*> writebacks;
     struct PendingLinearDownload;
     std::unordered_map<const Native::ImageEntry*, std::shared_ptr<PendingLinearDownload>> pending_linear_downloads;

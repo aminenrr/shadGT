@@ -93,6 +93,8 @@
 
 #include <fstream>
 #include <numeric>
+#include "video_core/renderer_vulkan/vk_common.h"
+#include <vk_mem_alloc.h>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -23844,6 +23846,94 @@ void NativeRenderer::ProbeWatchedPictures() {
 #endif
 }
 
+void NativeRenderer::PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames) {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_VRAM_OVER_RELEASE2");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    if (!on || frame % 30 != 0) {
+        return;
+    }
+    const auto mb = [](u64 bytes) { return double(bytes) / 1048576.0; };
+    u64 freed = 0;
+    u32 released = 0;
+    u32 written_again = 0;
+    std::erase_if(prt_release2_pending, [&](const PrtRelease2& item) {
+        if (frame < item.frame + 4) {
+            return false;
+        }
+        Native::ImageEntry& entry = *item.entry;
+        if (entry.write_version.load(std::memory_order_relaxed) != item.version ||
+            entry.reused.load(std::memory_order_relaxed) ||
+            entry.last_use.load(std::memory_order_relaxed) > item.frame) {
+            ++written_again;
+            return true;
+        }
+        if (entry.kept.exchange(false, std::memory_order_relaxed)) {
+            kept_bytes -= std::min(kept_bytes, item.bytes);
+        }
+        prt_release2_done.insert(&entry);
+        freed += item.bytes;
+        ++released;
+        return true;
+    });
+    if (released != 0 || written_again != 0) {
+        static std::atomic<u32> released_logged{};
+        if (const u32 n = released_logged++; n < 32 || n % 200 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-VRAMREL2: {} kept GPU pictures released after their write-back "
+                        "({:.1f} MB freed at their eviction), {} used again and kept (frame {})",
+                        released, mb(freed), written_again, frame);
+        }
+    }
+    const u64 vram_budget = r.instance.GetTotalMemoryBudget();
+    const u64 vram_used = vram_budget ? r.instance.GetDeviceMemoryUsage() : 0;
+    if (!vram_budget || vram_used + vram_budget / 32 <= vram_budget || frame <= keep_frames) {
+        return;
+    }
+    constexpr u64 QueueCap = u64{64} << 20;
+    std::vector<PrtRelease2> picked;
+    u64 picked_bytes = 0;
+    registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
+        if (picked_bytes >= QueueCap || !entry.kept.load(std::memory_order_relaxed) ||
+            entry.from_cpu || !entry.image || entry.reused.load(std::memory_order_relaxed) ||
+            entry.info.props.is_depth || entry.info.type != AmdGpu::ImageType::Color2D ||
+            entry.info.resources.levels != 1 || entry.info.resources.layers != 1 ||
+            entry.info.num_samples > 1 || KeptShadowMapImage(entry.info) ||
+            entry.last_use.load(std::memory_order_relaxed) + keep_frames > frame) {
+            return;
+        }
+        const u64 bytes = std::max<u64>(entry.info.guest_size, 1);
+        if (bytes > (u64{256} << 20) || prt_release2_done.contains(&entry) ||
+            std::ranges::any_of(prt_release2_pending,
+                                [&](const PrtRelease2& item) { return item.entry == &entry; })) {
+            return;
+        }
+        picked.push_back({&entry, entry.write_version.load(std::memory_order_relaxed), frame,
+                          bytes});
+        picked_bytes += bytes;
+    });
+    for (const auto& item : picked) {
+        if (std::ranges::find(writebacks, item.entry) == writebacks.end()) {
+            writebacks.push_back(item.entry);
+        }
+        prt_release2_pending.push_back(item);
+    }
+    if (!picked.empty()) {
+        static std::atomic<u32> queued_logged{};
+        if (const u32 n = queued_logged++; n < 32 || n % 200 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-VRAMREL2: VRAM {} of {} MB, {} idle kept GPU pictures ({:.1f} MB) "
+                        "written back to guest memory, released at the next check (frame {})",
+                        vram_used >> 20, vram_budget >> 20, picked.size(), mb(picked_bytes),
+                        frame);
+        }
+    }
+}
+
 void NativeRenderer::EvictImages() {
     DrainBinder(); // FEAT-SGT-022: no set the binder keeps names a view dropped here
     Native::SlowCallTrace<4> trace{true, "frame-retirement",
@@ -23917,6 +24007,9 @@ void NativeRenderer::EvictImages() {
     u32 newly_kept = 0;
     const auto keep = [&](Native::ImageEntry& entry) {
         if (entry.from_cpu || !entry.image || entry.reused.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (!prt_release2_done.empty() && prt_release2_done.contains(&entry)) {
             return false;
         }
         const u64 version = entry.write_version.load(std::memory_order_relaxed);
@@ -24130,7 +24223,10 @@ void NativeRenderer::EvictImages() {
     // race's idle textures were kept while VRAM sat at 8.6 GB of 6.3, and menus ran at 10 fps.
     static const bool over_release = [] {
         const char* env = std::getenv("RYGT_VRAM_OVER_RELEASE");
-        return !(env && env[0] == '0');
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return !Common::IsGt7();
     }();
     bool over_budget = false;
     if (over_release && !pressure) {
@@ -24156,6 +24252,7 @@ void NativeRenderer::EvictImages() {
         }
         over_budget = over_was;
     }
+    PrtReleaseKeptOverBudget(frame, KeepFrames);
     // PRT-VRAMREG (pr-tests, RYGT_VRAM_REGISTRY_LOG, GT7, on; 0 = off): over the VRAM budget
     // (the PRT-VRAMKEEP check, every 30 frames), at most once every 10 s, what holds video memory
     // by kind and the 5 largest resources, before the kept textures are let go. Sizes are guest
@@ -24263,6 +24360,40 @@ void NativeRenderer::EvictImages() {
                         vram_used > known ? mb(vram_used - known) : 0.0, mb(imported),
                         mb(kept_bytes + kept_shadow_bytes), mb(kept_texture_bytes),
                         mb(texture_budget), top);
+            if (const VmaAllocator allocator = r.instance.GetAllocator()) {
+                const VkPhysicalDeviceMemoryProperties* memory_props = nullptr;
+                vmaGetMemoryProperties(allocator, &memory_props);
+                VmaTotalStatistics vma_stats{};
+                vmaCalculateStatistics(allocator, &vma_stats);
+                u64 block_bytes = 0;
+                u64 allocation_bytes = 0;
+                u64 allocation_count = 0;
+                u64 block_count = 0;
+                u64 host_block_bytes = 0;
+                for (u32 heap = 0; memory_props && heap < memory_props->memoryHeapCount; ++heap) {
+                    const auto& heap_stats = vma_stats.memoryHeap[heap].statistics;
+                    if ((memory_props->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+                        host_block_bytes += heap_stats.blockBytes;
+                        continue;
+                    }
+                    block_bytes += heap_stats.blockBytes;
+                    allocation_bytes += heap_stats.allocationBytes;
+                    allocation_count += heap_stats.allocationCount;
+                    block_count += heap_stats.blockCount;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-VRAMREG: other split: VMA device-local blocks {:.0f} MB ({} "
+                            "blocks), in them {:.0f} MB allocated ({} allocations) and {:.0f} MB "
+                            "free; VMA allocations the registry does not know {:.0f} MB (buffer "
+                            "cache arena, staging and stream buffers, shadGT textures); outside "
+                            "VMA {:.0f} MB (driver: pipelines, descriptor pools, swapchain, "
+                            "dedicated and imported memory); VMA host heaps {:.0f} MB",
+                            mb(block_bytes), block_count, mb(allocation_bytes), allocation_count,
+                            mb(block_bytes > allocation_bytes ? block_bytes - allocation_bytes : 0),
+                            mb(allocation_bytes > known ? allocation_bytes - known : 0),
+                            mb(vram_used > block_bytes ? vram_used - block_bytes : 0),
+                            mb(host_block_bytes));
+            }
         }
     }
     if (pressure || over_budget || texture_budget == 0) {
@@ -24405,6 +24536,9 @@ void NativeRenderer::EvictImages() {
             }
         }
         held_versions.erase(&entry);
+        prt_release2_done.erase(&entry);
+        std::erase_if(prt_release2_pending,
+                      [&](const PrtRelease2& item) { return item.entry == &entry; });
         std::erase(Ctx().stream.written, &entry);
         std::erase(writebacks, &entry);
         pending_linear_downloads.erase(&entry);
