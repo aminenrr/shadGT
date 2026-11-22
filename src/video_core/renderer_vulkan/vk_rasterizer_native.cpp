@@ -8140,23 +8140,39 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         // signal (RytyGtsPhotoMode is GT Sport's), so out of a race a draw into a 3840x2160 or
         // larger colour target never drawn into waits for its pipeline. Skipped, the first Scapes
         // photo of a session (0x102a160000 3840x2160, round 4b log) was saved black.
-        static const bool photo_first_wait = [] {
+        static const int photo_first_wait = [] {
             const char* env = std::getenv("RYGT_PHOTO_FIRST_WAIT");
-            return !(env && env[0] == '0');
+            if (env && *env) {
+                return std::clamp(std::atoi(env), 0, 2);
+            }
+            return 2;
         }();
-        if (photo_first_wait && Common::IsGt7() && target_cb >= 0 && !RytyRaceRunning() &&
-            (!entry || entry->write_version.load(std::memory_order_relaxed) == 0)) {
+        const bool never_drawn =
+            !entry || entry->write_version.load(std::memory_order_relaxed) == 0;
+        if (photo_first_wait != 0 && Common::IsGt7() && target_cb >= 0 && !RytyRaceRunning() &&
+            (photo_first_wait == 2 || never_drawn)) {
             const auto& extent = r.liverpool->DrawCbExtent(u32(target_cb));
             const u32 width = layout ? layout->size.width : u32(extent.width);
             const u32 height = layout ? layout->size.height : u32(extent.height);
             if (width >= 3840 && height >= 2160) {
                 one_off_photo_output = true;
                 static std::atomic<u32> photo_logged{};
-                if (const u32 n = photo_logged++; n < 64 || n % 500 == 0) {
-                    LOG_WARNING(Render_Vulkan,
-                                "PRT-PHOTOWAIT: a draw into {:#x} {}x{}, never drawn, waits for its "
-                                "pipeline (frame {}, {} so far)",
-                                address, width, height, frame, n + 1);
+                if (never_drawn) {
+                    if (const u32 n = photo_logged++; n < 64 || n % 500 == 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRT-PHOTOWAIT: a draw into {:#x} {}x{}, never drawn, waits for "
+                                    "its pipeline (frame {}, {} so far)",
+                                    address, width, height, frame, n + 1);
+                    }
+                } else {
+                    static std::atomic<u32> drawn_logged{};
+                    if (const u32 n = drawn_logged++; n < 64 || n % 500 == 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRT-PHOTOWAIT: a draw into {:#x} {}x{}, drawn before, would "
+                                    "have been skipped (one-off rule); waits for its pipeline "
+                                    "(mode 2, frame {}, {} so far)",
+                                    address, width, height, frame, n + 1);
+                    }
                 }
                 return false;
             }
