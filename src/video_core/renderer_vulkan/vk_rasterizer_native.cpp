@@ -4734,6 +4734,28 @@ static VAddr InplaceFrom() {
     return from;
 }
 
+// PRT-PHOTOWB (pr-tests, RYGT_PHOTO_WRITEBACK, on; 0 = off): pictures in the memory the CPU reads
+// go back even over the VRAM budget, and ones a dispatch stores go back too (up to 64 MB). GT7
+// photos (Scapes and replay) were saved black while VRAM sat over the budget.
+static bool PrtPhotoWritebackOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PHOTO_WRITEBACK");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+static void PrtPhotoWritebackLog(const char* what, const Native::ImageEntry* entry, u64 budget,
+                                 u64 usage) {
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged.fetch_add(1, std::memory_order_relaxed); n < 64 || n % 1000 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-PHOTOWB: picture {:#x} {}x{} {} bytes, {}: {} (VRAM {} of {} MB, {} so far)",
+                    entry->info.guest_address, entry->info.size.width, entry->info.size.height,
+                    entry->info.guest_size, entry->info.props.is_tiled ? "tiled" : "linear", what, usage >> 20, budget >> 20, n + 1);
+    }
+}
+
 // FIX-GT7-041: a picture larger than NAT-112's drawn in the memory the CPU reads goes back in this
 // submission, before the fence the CPU waits for. GT7 saves a car's thumbnail this way: it copies
 // the finished 1920x1080 picture into two 1920x540 targets there, waits for the GPU and encodes
@@ -15504,7 +15526,10 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
                            std::ranges::find(writebacks, entry) == writebacks.end()) {
                     auto* direct = r.buffer_cache.GetDirectMemory();
                     if (!direct || !direct->EnsureImported(entry->info.guest_address, size) ||
-                        !direct->PlanLeasedParts(entry->info.guest_address, size, 4, 4)) continue;
+                        !direct->PlanLeasedParts(entry->info.guest_address, size, 4, 4)) {
+                        PrtPhotoWritebackLog("import failed, not written back", entry, 0, 0);
+                        continue;
+                    }
                     const u64 budget = r.instance.GetTotalMemoryBudget();
                     u64 usage = budget ? r.instance.GetDeviceMemoryUsage() : 0;
                     // Pending downloads have not allocated their scatter/batch
@@ -15517,9 +15542,18 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
                         }
                         usage += bytes * 3;
                     }
-                    if (Native::ClassifyHighCpuWriteback(entry->info.guest_address, size,
-                            NativeInplaceFrom(), budget, usage, true) == Native::HighCpuWriteback::Admit) {
+                    const auto decision = Native::ClassifyHighCpuWriteback(entry->info.guest_address, size,
+                            NativeInplaceFrom(), budget, usage, true);
+                    if (decision == Native::HighCpuWriteback::Admit) {
                         QueueWriteback(entry);
+                    } else if (decision == Native::HighCpuWriteback::InsufficientBudget &&
+                               PrtPhotoWritebackOn() && size <= 64_MB) {
+                        // PRT-PHOTOWB: over the VRAM budget the picture was left in VRAM and the
+                        // CPU read old memory (GT7 photos and thumbnails saved black).
+                        QueueWriteback(entry);
+                        PrtPhotoWritebackLog("over budget, written back anyway", entry, budget, usage);
+                    } else {
+                        PrtPhotoWritebackLog("refused", entry, budget, usage);
                     }
                 } else if (initial == Native::HighCpuWriteback::OverLimit &&
                            size <= ~u64{0} - entry->info.guest_address &&
@@ -15555,6 +15589,21 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             entry->info.num_samples == 1 &&
             !entry->info.props.is_depth) {
             QueueWriteback(entry);
+        } else if (PrtPhotoWritebackOn() && !RytyRaceRunning() && entry->info.num_samples == 1 &&
+                   !entry->info.props.is_depth && entry->info.guest_size <= 64_MB &&
+                   entry->info.guest_address >= NativeInplaceFrom() &&
+                   std::ranges::find(writebacks, entry) == writebacks.end()) {
+            // PRT-PHOTOWB: a picture a compute shader stores into the memory the CPU reads goes
+            // back too, as drawn ones do (a photo finished by a dispatch was saved black).
+            auto* direct = r.buffer_cache.GetDirectMemory();
+            const u64 size = entry->info.guest_size;
+            if (direct && direct->EnsureImported(entry->info.guest_address, size) &&
+                direct->PlanLeasedParts(entry->info.guest_address, size, 4, 4)) {
+                QueueWriteback(entry);
+                PrtPhotoWritebackLog("stored by a dispatch, written back", entry, 0, 0);
+            } else {
+                PrtPhotoWritebackLog("stored by a dispatch, import failed", entry, 0, 0);
+            }
         }
     }
     s.buffers_written |= b.writes_buffers;
