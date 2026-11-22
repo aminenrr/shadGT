@@ -24156,6 +24156,115 @@ void NativeRenderer::EvictImages() {
         }
         over_budget = over_was;
     }
+    // PRT-VRAMREG (pr-tests, RYGT_VRAM_REGISTRY_LOG, GT7, on; 0 = off): over the VRAM budget
+    // (the PRT-VRAMKEEP check, every 30 frames), at most once every 10 s, what holds video memory
+    // by kind and the 5 largest resources, before the kept textures are let go. Sizes are guest
+    // sizes for pictures (the host image can differ). No behaviour change.
+    static const bool registry_log = [] {
+        const char* env = std::getenv("RYGT_VRAM_REGISTRY_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    if (registry_log && frame % 30 == 0) {
+        static std::chrono::steady_clock::time_point registry_logged{};
+        const auto registry_now = std::chrono::steady_clock::now();
+        const u64 vram_budget = r.instance.GetTotalMemoryBudget();
+        const u64 vram_used = vram_budget ? r.instance.GetDeviceMemoryUsage() : 0;
+        if (vram_budget && vram_used + vram_budget / 32 > vram_budget &&
+            (registry_logged == std::chrono::steady_clock::time_point{} ||
+             registry_now - registry_logged >= std::chrono::seconds{10})) {
+            registry_logged = registry_now;
+            enum class Kind : u32 { Targets, Textures, KeptTextures, KeptPictures, Mirrors, Regions };
+            constexpr size_t KindCount = 6;
+            static constexpr std::array<const char*, KindCount> kind_names{
+                "render target", "texture", "kept texture", "kept GPU picture", "CPU mirror",
+                "region"};
+            std::array<u64, KindCount> kind_bytes{};
+            std::array<u32, KindCount> kind_count{};
+            struct Largest {
+                u64 bytes;
+                Kind kind;
+                u32 width;
+                u32 height;
+                VAddr address;
+            };
+            std::vector<Largest> largest;
+            const auto note_largest = [&](const Largest& item) {
+                largest.push_back(item);
+                std::ranges::sort(largest, std::greater{}, &Largest::bytes);
+                if (largest.size() > 5) {
+                    largest.pop_back();
+                }
+            };
+            registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
+                if (!entry.image) {
+                    return;
+                }
+                const u64 bytes = std::max<u64>(entry.info.guest_size, 1);
+                Kind kind = Kind::Textures;
+                if (kept_textures.contains(&entry)) {
+                    kind = Kind::KeptTextures;
+                } else if (!entry.from_cpu && entry.kept.load(std::memory_order_relaxed)) {
+                    kind = Kind::KeptPictures;
+                } else if (!entry.from_cpu) {
+                    kind = Kind::Targets;
+                }
+                kind_bytes[size_t(kind)] += bytes;
+                ++kind_count[size_t(kind)];
+                if (largest.size() < 5 || bytes > largest.back().bytes) {
+                    note_largest({bytes, kind, entry.info.size.width, entry.info.size.height,
+                                  entry.info.guest_address});
+                }
+            });
+            {
+                std::shared_lock map_lock{buffer_map_mutex};
+                for (const auto& [base, mirror] : mirrors) {
+                    const u64 bytes = mirror.buffer ? mirror.buffer->Size() : 0;
+                    kind_bytes[size_t(Kind::Mirrors)] += bytes;
+                    ++kind_count[size_t(Kind::Mirrors)];
+                    if (bytes != 0 && (largest.size() < 5 || bytes > largest.back().bytes)) {
+                        note_largest({bytes, Kind::Mirrors, 0, 0, mirror.begin});
+                    }
+                }
+                for (const auto& [base, region] : regions) {
+                    const u64 bytes = region.buffer ? region.buffer->Size() : 0;
+                    kind_bytes[size_t(Kind::Regions)] += bytes;
+                    ++kind_count[size_t(Kind::Regions)];
+                    if (bytes != 0 && (largest.size() < 5 || bytes > largest.back().bytes)) {
+                        note_largest({bytes, Kind::Regions, 0, 0, region.begin});
+                    }
+                }
+            }
+            u64 known = pattern_bytes;
+            for (const u64 bytes : kind_bytes) {
+                known += bytes;
+            }
+            const auto* direct = r.buffer_cache.GetDirectMemory();
+            const u64 imported = direct ? direct->ImportedHostBytes() : 0;
+            const auto mb = [](u64 bytes) { return double(bytes) / 1048576.0; };
+            std::string kinds;
+            for (size_t k = 0; k < KindCount; ++k) {
+                kinds += fmt::format("{}{} {:.0f} MB ({})", k ? ", " : "", kind_names[k],
+                                     mb(kind_bytes[k]), kind_count[k]);
+            }
+            std::string top;
+            for (const auto& item : largest) {
+                top += fmt::format("{}{} {:.1f} MB", top.empty() ? "" : "; ",
+                                   kind_names[size_t(item.kind)], mb(item.bytes));
+                if (item.width != 0) {
+                    top += fmt::format(" {}x{}", item.width, item.height);
+                }
+                top += fmt::format(" at {:#x}", item.address);
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-VRAMREG: VRAM {} of {} MB (frame {}): {}, fill patterns {:.0f} MB, "
+                        "other {:.0f} MB; imported views {:.0f} MB (host memory, not VRAM); FIX-157 "
+                        "kept {:.0f} MB, kept textures {:.0f} MB of {:.0f} MB; largest: {}",
+                        vram_used >> 20, vram_budget >> 20, frame, kinds, mb(pattern_bytes),
+                        vram_used > known ? mb(vram_used - known) : 0.0, mb(imported),
+                        mb(kept_bytes + kept_shadow_bytes), mb(kept_texture_bytes),
+                        mb(texture_budget), top);
+        }
+    }
     if (pressure || over_budget || texture_budget == 0) {
         kept_textures.clear();
         kept_texture_scan.clear();
