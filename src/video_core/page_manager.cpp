@@ -18,6 +18,7 @@
 #endif
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
+#include "common/game_title.h"
 #include "common/prt_quiet_logs.h"
 #include "common/debug.h"
 #include "common/decoder.h"
@@ -1149,6 +1150,74 @@ struct SignalImpl : public PageManager::Impl {
         LOG_INFO(Render, "DIAG-190: faults by thread:{}", BusiestFaultThreads());
     }
 
+    // PRT-PHOTOCRASH (pr-tests, Round 12, RYGT_PHOTO_CRASH_GUARD, GT7 on; 0 = off; log only):
+    // Round 11 crashed after photos with a stack overflow (0xc00000fd) on the guest thread 'PDI'
+    // while an access violation was being handled (0xc0000005 in r12/r13): either this handler
+    // faulted again inside itself (a write back of the photo target into still protected pages)
+    // and nested, or it ran out of the guest thread's small stack. Each tracked fault counts its
+    // nesting on the thread and, on Windows, the stack left; a nested fault, or one with less than
+    // 96 KB of stack left, logs the depth, the stack left, both fault addresses and the code that
+    // faulted (at most 8 lines, then one per 1000). Nothing is changed in how faults are handled.
+    static bool PhotoCrashGuardOn() {
+        static const bool on = [] {
+            const char* env = std::getenv("RYGT_PHOTO_CRASH_GUARD");
+            return !(env && env[0] == '0') && Common::IsGt7();
+        }();
+        return on;
+    }
+    struct PhotoCrashGuard {
+        static inline thread_local u32 depth = 0;
+        static inline thread_local VAddr outer_addr = 0;
+        static inline thread_local u64 outer_rip = 0;
+        static inline std::atomic<u64> events{};
+        static inline std::atomic<u32> max_depth{};
+        bool on;
+        PhotoCrashGuard(void* context, VAddr addr) : on{PhotoCrashGuardOn()} {
+            if (!on) {
+                return;
+            }
+            ++depth;
+            const u64 rip = reinterpret_cast<u64>(Common::GetRip(context));
+            u64 left = ~u64{0};
+#ifdef _WIN32
+            ULONG_PTR low = 0, high = 0;
+            GetCurrentThreadStackLimits(&low, &high);
+            const auto sp = reinterpret_cast<ULONG_PTR>(&low);
+            left = sp > low ? u64(sp - low) : 0;
+#endif
+            if (depth == 1) {
+                outer_addr = addr;
+                outer_rip = rip;
+            }
+            u32 seen = max_depth.load(std::memory_order_relaxed);
+            while (depth > seen && !max_depth.compare_exchange_weak(seen, depth)) {
+            }
+            if (depth < 2 && left >= (96u << 10)) {
+                return;
+            }
+            const u64 n = ++events;
+            if ((n > 8 && n % 1000 != 0) || left < (12u << 10)) {
+                return; // too little stack to format a line safely
+            }
+            LOG_WARNING(Render,
+                        "PRT-PHOTOCRASH: fault handler depth {} (max {}), {} KB of stack left, "
+                        "{} at {:#x} from {}; outer fault at {:#x} from {} ({} events)",
+                        depth, max_depth.load(), left == ~u64{0} ? 0 : left >> 10,
+                        Common::IsWriteError(context) ? "write" : "read", addr,
+                        Common::SamplingProfiler::DescribeCode(rip), outer_addr,
+                        depth > 1 ? Common::SamplingProfiler::DescribeCode(outer_rip)
+                                  : std::string{"(same)"},
+                        n);
+        }
+        ~PhotoCrashGuard() {
+            if (on && depth != 0) {
+                --depth;
+            }
+        }
+        PhotoCrashGuard(const PhotoCrashGuard&) = delete;
+        PhotoCrashGuard& operator=(const PhotoCrashGuard&) = delete;
+    };
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const bool timed = FaultCostDiag();
         const auto handler_start =
@@ -1173,6 +1242,7 @@ struct SignalImpl : public PageManager::Impl {
         // needless GPU drains, indexing the 40-bit guest table with a host
         // address can fault recursively and hide the original exception.
         if (!IsTrackedGuestAddress(addr)) return false;
+        PhotoCrashGuard crash_guard{context, addr}; // PRT-PHOTOCRASH (pr-tests, Round 12)
         if (ProtectMapOn()) {
             NoteProtectMap(addr, 0, 2); // PERF-GT7-051
         }
