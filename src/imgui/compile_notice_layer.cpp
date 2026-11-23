@@ -262,6 +262,9 @@ void Unregister() {
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <dbghelp.h>
+#include <mutex>
+#pragma comment(lib, "dbghelp.lib")
 #endif
 
 namespace Common::PrtStallSample {
@@ -365,15 +368,68 @@ static Sample TakeSample(std::uint32_t tid) {
     return sample;
 }
 
+// PRT-STALLSYM (pr-tests, Round 9, RYGT_STALL_SAMPLE_SYMBOLS, on; 0 = off): the sampled IP and
+// the first stack addresses also get a function name from libSceVideoOut.pdb, which the pr-tests
+// package now ships next to libSceVideoOut.prx. R8: 9 of 13 stalls sat in libSceVideoOut.prx+0xd8e6xx.
+static bool StallSymbolsOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_STALL_SAMPLE_SYMBOLS");
+        return !(env && env[0] == '0' && env[1] == '\0');
+    }();
+    return on;
+}
+
+static std::string SymbolName(std::uint64_t address) {
+    static std::once_flag once;
+    static bool ready = false;
+    static std::mutex lock;
+    std::call_once(once, [] {
+        wchar_t path[MAX_PATH] = {};
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&StallSymbolsOn), &self)) {
+            const DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
+            for (DWORD i = n; i > 0; --i) {
+                if (path[i - 1] == L'\\' || path[i - 1] == L'/') {
+                    path[i - 1] = L'\0';
+                    break;
+                }
+            }
+        }
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS);
+        ready = SymInitializeW(GetCurrentProcess(), path[0] ? path : nullptr, TRUE) != FALSE;
+        LOG_WARNING(Render_Vulkan, "PRT-STALLSYM: symbol lookup {}", ready ? "ready" : "unavailable");
+    });
+    if (!ready) {
+        return {};
+    }
+    std::lock_guard guard(lock);
+    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+    auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = 255;
+    DWORD64 displacement = 0;
+    if (!SymFromAddr(GetCurrentProcess(), address, &displacement, symbol)) {
+        return {};
+    }
+    return fmt::format(" [{}+{:#x}]", symbol->Name, displacement);
+}
+
 static std::string Describe(const Sample& sample, const char* role) {
     if (!sample.ok) {
         return fmt::format("{} tid {}: not sampled", role, sample.tid);
     }
-    std::string out = fmt::format("{} tid {}: at {}; stack", role, sample.tid,
-                                  Common::SamplingProfiler::DescribeCode(sample.rip));
+    const bool symbols = StallSymbolsOn();
+    std::string out = fmt::format("{} tid {}: at {}{}; stack", role, sample.tid,
+                                  Common::SamplingProfiler::DescribeCode(sample.rip),
+                                  symbols ? SymbolName(sample.rip) : std::string{});
     for (std::uint32_t i = 0; i < sample.count; ++i) {
         out += ' ';
         out += Common::SamplingProfiler::DescribeCode(sample.code[i]);
+        if (symbols && i < 6) {
+            out += SymbolName(sample.code[i]);
+        }
     }
     return out;
 }

@@ -8,10 +8,11 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Native::GpuCheckpoints {
-#ifndef NDEBUG
+#if !defined(NDEBUG) || !defined(RYGT_NO_RELEASE_CHECKPOINTS)
 inline bool Requested() {
     static const bool requested = [] {
         const char* value = std::getenv("SHADGT_GPU_CHECKPOINTS");
+        if (!value) value = std::getenv("RYGT_GPU_CHECKPOINTS");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     return requested;
