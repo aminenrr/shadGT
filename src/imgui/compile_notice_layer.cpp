@@ -15,6 +15,8 @@
 
 #include "common/perf_monitor.h"
 #include "common/prt_stall_cause.h"
+#include "common/prt_stall_sample.h"
+#include "common/sampling_profiler.h"
 #include "common/types.h"
 #include "imgui/compile_notice_layer.h"
 #include "imgui/imgui_layer.h"
@@ -72,6 +74,7 @@ private:
 
 public:
     bool stall_logging = false;
+    bool stall_sampled = false; // PRT-STALLSAMPLE (Round 8)
     u32 stall_jobs_max = 0;
     s64 stall_from = 0;
     // PRT-STALLCAUSE: the wait totals at the last new game frame.
@@ -172,8 +175,12 @@ void CompileNoticeUI::Draw() {
                 }
                 stall_jobs_max = std::max(stall_jobs_max,
                                           Vulkan::g_build_jobs.load(std::memory_order_relaxed));
+                // PRT-STALLSAMPLE (Round 8): where the game's threads are, once per stall.
+                Common::PrtStallSample::MaybeSample(
+                    double(now.time_since_epoch().count() - stall_from) / 1e6, stall_sampled);
             } else if (stall_logging) {
                 stall_logging = false;
+                stall_sampled = false;
                 const double ms = double(now.time_since_epoch().count() - stall_from) / 1e6;
                 LOG_WARNING(Render_Vulkan,
                             "PRT-STALLLOG: no new game frame for {:.0f} ms, {} (most build jobs "
@@ -245,3 +252,157 @@ void Unregister() {
 }
 
 } // namespace ImGui::CompileNotice
+
+// PRT-STALLSAMPLE (Round 8): see common/prt_stall_sample.h.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+namespace Common::PrtStallSample {
+
+static std::atomic<std::uint32_t> g_submit_tid{0};
+static std::atomic<std::uint32_t> g_flip_tid{0};
+
+static bool On() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_STALL_SAMPLE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+static std::uint32_t AfterMs() {
+    static const std::uint32_t ms = [] {
+        const char* env = std::getenv("RYGT_STALL_SAMPLE_MS");
+        const long value = env && *env ? std::strtol(env, nullptr, 10) : 400;
+        return value < 50 ? std::uint32_t{50} : static_cast<std::uint32_t>(value);
+    }();
+    return ms;
+}
+
+void NoteSubmitThread() {
+#ifdef _WIN32
+    g_submit_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#endif
+}
+
+void NoteFlipThread() {
+#ifdef _WIN32
+    g_flip_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#endif
+}
+
+#ifdef _WIN32
+struct Sample {
+    std::uint32_t tid = 0;
+    bool ok = false;
+    std::uint64_t rip = 0;
+    std::uint32_t count = 0;
+    std::uint64_t code[16]{};
+};
+
+// Is the page executable? VirtualQuery takes no loader lock.
+static bool IsCode(std::uint64_t value) {
+    if (value < 0x10000) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(value), &info, sizeof(info)) != sizeof(info)) {
+        return false;
+    }
+    if (info.State != MEM_COMMIT) {
+        return false;
+    }
+    const DWORD protect = info.Protect & 0xff;
+    return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
+           protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static Sample TakeSample(std::uint32_t tid) {
+    Sample sample;
+    sample.tid = tid;
+    if (tid == 0 || tid == GetCurrentThreadId()) {
+        return sample;
+    }
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
+    if (thread == nullptr) {
+        return sample;
+    }
+    if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (GetThreadContext(thread, &context)) {
+            sample.ok = true;
+            sample.rip = context.Rip;
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<const void*>(context.Rsp), &info, sizeof(info)) ==
+                    sizeof(info) &&
+                info.State == MEM_COMMIT && (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) {
+                const std::uint64_t region_end =
+                    reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+                std::uint64_t end = context.Rsp + 2048;
+                if (end > region_end) {
+                    end = region_end;
+                }
+                for (std::uint64_t at = context.Rsp & ~7ull; at + 8 <= end && sample.count < 16;
+                     at += 8) {
+                    const std::uint64_t value = *reinterpret_cast<const std::uint64_t*>(at);
+                    if (IsCode(value)) {
+                        sample.code[sample.count++] = value;
+                    }
+                }
+            }
+        }
+        ResumeThread(thread);
+    }
+    CloseHandle(thread);
+    return sample;
+}
+
+static std::string Describe(const Sample& sample, const char* role) {
+    if (!sample.ok) {
+        return fmt::format("{} tid {}: not sampled", role, sample.tid);
+    }
+    std::string out = fmt::format("{} tid {}: at {}; stack", role, sample.tid,
+                                  Common::SamplingProfiler::DescribeCode(sample.rip));
+    for (std::uint32_t i = 0; i < sample.count; ++i) {
+        out += ' ';
+        out += Common::SamplingProfiler::DescribeCode(sample.code[i]);
+    }
+    return out;
+}
+#endif
+
+// Called by the stall logger while a stall goes on; samples once per stall.
+void MaybeSample(double stalled_ms, bool& sampled_this_stall) {
+#ifdef _WIN32
+    if (sampled_this_stall || !On() || stalled_ms < static_cast<double>(AfterMs())) {
+        return;
+    }
+    sampled_this_stall = true;
+    static std::atomic<std::uint32_t> logged{0};
+    const std::uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 60) {
+        return;
+    }
+    const std::uint32_t submit_tid = g_submit_tid.load(std::memory_order_relaxed);
+    const std::uint32_t flip_tid = g_flip_tid.load(std::memory_order_relaxed);
+    const Sample submit = TakeSample(submit_tid);
+    const Sample flip = flip_tid != submit_tid ? TakeSample(flip_tid) : Sample{};
+    LOG_WARNING(Render_Vulkan, "PRT-STALLSAMPLE: stalled {:.0f} ms ({} so far): {}{}{}",
+                stalled_ms, n + 1, Describe(submit, "GPU submit thread"),
+                flip_tid != submit_tid ? "; " : "",
+                flip_tid != submit_tid ? Describe(flip, "flip thread") : std::string{});
+#else
+    (void)stalled_ms;
+    (void)sampled_this_stall;
+#endif
+}
+
+} // namespace Common::PrtStallSample

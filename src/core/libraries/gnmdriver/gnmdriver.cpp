@@ -4,6 +4,7 @@
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
+#include "common/prt_stall_sample.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -2270,6 +2271,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    Common::PrtStallSample::NoteFlipThread(); // PRT-STALLSAMPLE
+    Common::PrtStallSample::NoteSubmitThread();
 
     if (count != 0) {
         if (!dcb_gpu_addrs) {
@@ -2367,6 +2370,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
                                             u32* dcb_sizes_in_bytes, const u32* ccb_gpu_addrs[],
                                             u32* ccb_sizes_in_bytes) {
     RyDiag::Mark(RyDiag::Zone::GameSubmit, count);
+    Common::PrtStallSample::NoteSubmitThread(); // PRT-STALLSAMPLE
     return sceGnmSubmitCommandBuffersForWorkload(count, count, dcb_gpu_addrs, dcb_sizes_in_bytes,
                                                  ccb_gpu_addrs, ccb_sizes_in_bytes);
 }

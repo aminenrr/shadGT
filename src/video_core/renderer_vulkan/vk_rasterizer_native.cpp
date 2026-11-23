@@ -24715,6 +24715,47 @@ void NativeRenderer::EvictImages() {
     registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
         return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
     }, trim_now ? 64u : 16u);
+    // PRT-VRAMIDLE (Round 8, RYGT_VRAM_TRIM_IDLE_FRAMES, GT7 30; 0 = off; only with PRT-VRAMTRIM
+    // over budget): textures loaded from guest memory (a reload is an upload, their bytes are
+    // still there) go after this many idle frames instead of 120, up to 64 a frame. Pictures the
+    // GPU wrote and the kept textures are left alone. Round 7 GT7 races still reached 6.7 to 7.5 GB
+    // of a 6.3 GB budget from 2.1 to 2.9 GB of live textures, the kept ones already cut.
+    static const u64 trim_idle_frames = [] {
+        const char* env = std::getenv("RYGT_VRAM_TRIM_IDLE_FRAMES");
+        if (env && *env) {
+            return u64(std::strtoull(env, nullptr, 10));
+        }
+        return Common::IsGt7() ? u64{30} : u64{0};
+    }();
+    if (trim_now && trim_idle_frames != 0 && trim_idle_frames < KeepFrames &&
+        frame > trim_idle_frames) {
+        static u64 idle_count = 0;
+        static u64 idle_bytes = 0;
+        const auto on_idle_evict = [&](Native::ImageEntry& entry) {
+            ++idle_count;
+            idle_bytes += std::max<u64>(entry.info.guest_size, 1);
+            on_evict(entry);
+        };
+        registry->Evict(frame - trim_idle_frames, on_idle_evict, [&](Native::ImageEntry& entry) {
+            return !entry.from_cpu || !entry.image || kept_textures.contains(&entry) ||
+                   keep(entry);
+        }, 64u);
+        static std::chrono::steady_clock::time_point idle_logged{};
+        const auto idle_now = std::chrono::steady_clock::now();
+        if (idle_count != 0 && (idle_logged == std::chrono::steady_clock::time_point{} ||
+                                idle_now - idle_logged >= std::chrono::seconds{10})) {
+            idle_logged = idle_now;
+            static std::atomic<u32> idle_logged_n{};
+            if (const u32 n = idle_logged_n++; n < 64) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-VRAMIDLE: over budget, {} textures idle {} frames or more let go "
+                            "early ({:.0f} MB) since the last line (frame {})",
+                            idle_count, trim_idle_frames, idle_bytes / 1048576.0, frame);
+            }
+            idle_count = 0;
+            idle_bytes = 0;
+        }
+    }
     if (RecycleFrameTextures()) {
         // PERF-SGT-021: per-frame textures go after a few idle frames, so a handful of
         // images of each shape go round (not one for each of the last 120 frames).

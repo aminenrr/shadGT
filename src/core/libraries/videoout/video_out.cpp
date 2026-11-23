@@ -13,6 +13,7 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/game_title.h"
+#include "common/prt_stall_sample.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -286,6 +287,7 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
 }
 
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
+    Common::PrtStallSample::NoteFlipThread(); // PRT-STALLSAMPLE
     auto* port = driver->GetPort(handle);
     if (!port) {
         LOG_ERROR(Lib_VideoOut, "Invalid handle = {}", handle);

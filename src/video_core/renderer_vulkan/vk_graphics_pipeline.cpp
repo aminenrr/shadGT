@@ -1649,11 +1649,15 @@ GraphicsPipeline::GraphicsPipeline(
     }); // FIX-GT7-101
     whole_watch.reset();
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
+    // PRT-QUIETLOG (Round 8): the driver create line only for creates of 20 ms or more.
     if (!preloading) {
-        LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                              create_start)
-                        .count());
+        const double create_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - create_start)
+                                     .count();
+        if (create_ms >= 20.0 || !Common::PrtQuietLogs()) {
+            LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms",
+                        debug_str, create_ms);
+        }
     }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
