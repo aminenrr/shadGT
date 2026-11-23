@@ -294,6 +294,10 @@ private:
         u64 max_groups = 0, max_groups_cs = 0; ///< the largest direct dispatch and its program
         u64 max_prims = 0, max_prims_ps = 0;   ///< the largest draw (indices x instances), its PS
         u32 target_width = 0, target_height = 0; ///< PRT-PASSTIME: its largest render area
+        // PRT-SHADOWLOG (pr-tests, Round 12): draws into a render area of 16384 or more.
+        u32 big_draws = 0;
+        u32 big_vp_w = 0, big_vp_h = 0, big_sc_w = 0, big_sc_h = 0;
+        u32 big_img_w = 0, big_img_h = 0, big_fmt = 0, big_depth = 0, big_colors = 0;
     };
     /// DIAG-GT7-001: a list's timestamps (at its start, after each global barrier, at its end).
     struct GpuTiming {
@@ -1177,6 +1181,15 @@ private:
     static bool GpuTimeOn();
     static bool GpuTimeDiagOn(); ///< DIAG-GT7-001's own lines (SHADGT_DIAG_GPU_TIME=1)
     static bool PassTimeOn();    ///< PRT-PASSTIME (RYGT_PASS_TIME_LOG)
+    static bool ShadowLogOn();   ///< PRT-SHADOWLOG (RYGT_SHADOW_LOG)
+    /// PRT-SHADOWLOG (pr-tests, Round 12): passes into a render area of 16384 or more, 10 s.
+    struct ShadowLogStats {
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+        u64 frame_at = 0, passes = 0, draws = 0;
+        double gpu_ms = 0.0, max_pass_ms = 0.0;
+        u32 vp_w = 0, vp_h = 0, sc_w = 0, sc_h = 0, img_w = 0, img_h = 0, fmt = 0, depth = 0;
+        u32 colors = 0, area_w = 0, area_h = 0;
+    } shadow_log_stats;
     void GpuTimeBegin(Stream& s);
     void GpuTimeMark(Stream& s);
     void GpuTimeEnd(Stream& s, u64 tick);

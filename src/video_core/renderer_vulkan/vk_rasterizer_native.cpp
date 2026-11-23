@@ -3933,8 +3933,21 @@ bool NativeRenderer::PassTimeOn() {
     return on;
 }
 
+// PRT-SHADOWLOG (pr-tests, Round 12, RYGT_SHADOW_LOG, GT7 on; 0 = off; log only): the passes
+// with a render area of 16384 or more (Round 11: 32768x32768 shadow passes, 1.2-1.5 ms in the
+// cockpit view vs 0.3 ms in chase). Every 10 s: passes and draws per frame, GPU ms per frame and
+// the slowest pass, the largest viewport and scissor actually set, and the depth / color image
+// (format and size). Uses the PRT-PASSTIME timestamps (turns them on).
+bool NativeRenderer::ShadowLogOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SHADOW_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+
 bool NativeRenderer::GpuTimeOn() {
-    return GpuTimeDiagOn() || PassTimeOn();
+    return GpuTimeDiagOn() || PassTimeOn() || ShadowLogOn();
 }
 
 void NativeRenderer::GpuTimeBegin(Stream& s) {
@@ -4044,6 +4057,32 @@ void NativeRenderer::GpuTimeCollect() {
             for (u32 i = 0; i + 1 < t.used && i < t.segments.size(); ++i) {
                 segs.emplace_back(double(stamps[i + 1] - stamps[i]) * period_ms, i);
             }
+            if (ShadowLogOn()) { // PRT-SHADOWLOG
+                auto& sh = shadow_log_stats;
+                for (const auto& [ms, i] : segs) {
+                    const GpuSegment& g = t.segments[i];
+                    if (g.big_draws == 0) {
+                        continue;
+                    }
+                    ++sh.passes;
+                    sh.draws += g.big_draws;
+                    sh.gpu_ms += ms;
+                    sh.max_pass_ms = std::max(sh.max_pass_ms, ms);
+                    sh.vp_w = std::max(sh.vp_w, g.big_vp_w);
+                    sh.vp_h = std::max(sh.vp_h, g.big_vp_h);
+                    sh.sc_w = std::max(sh.sc_w, g.big_sc_w);
+                    sh.sc_h = std::max(sh.sc_h, g.big_sc_h);
+                    sh.area_w = std::max(sh.area_w, g.target_width);
+                    sh.area_h = std::max(sh.area_h, g.target_height);
+                    if (g.big_img_w * g.big_img_h >= sh.img_w * sh.img_h) {
+                        sh.img_w = g.big_img_w;
+                        sh.img_h = g.big_img_h;
+                        sh.fmt = g.big_fmt;
+                        sh.depth = g.big_depth;
+                        sh.colors = g.big_colors;
+                    }
+                }
+            }
             if (PassTimeOn()) { // PRT-PASSTIME
                 auto& pt = pass_time_stats;
                 ++pt.lists;
@@ -4106,6 +4145,25 @@ void NativeRenderer::GpuTimeCollect() {
         }
         st = {};
         gpu_timing_report = now;
+    }
+    if (ShadowLogOn() && now - shadow_log_stats.since >= std::chrono::seconds{10}) {
+        auto& sh = shadow_log_stats;
+        const u64 frames = frame > sh.frame_at ? frame - sh.frame_at : 0;
+        const double per = frames ? double(frames) : 1.0;
+        if (sh.passes != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "PRT-SHADOWLOG [{}] 10 s, {} frames: passes into a render area of 16384+ "
+                     "(largest {}x{}): {:.1f} passes and {:.0f} draws per frame, {:.2f} GPU ms per "
+                     "frame, slowest pass {:.2f} ms; largest viewport {}x{}, scissor {}x{}; "
+                     "{} image {}x{} format {} ({} color targets)",
+                     Common::PrtHitch::LocalClock(), frames, sh.area_w, sh.area_h,
+                     double(sh.passes) / per, double(sh.draws) / per, sh.gpu_ms / per,
+                     sh.max_pass_ms, sh.vp_w, sh.vp_h, sh.sc_w, sh.sc_h,
+                     sh.depth ? "depth" : "color", sh.img_w, sh.img_h, sh.fmt, sh.colors);
+        }
+        sh = {};
+        sh.frame_at = frame;
+        sh.since = now;
     }
     if (PassTimeOn() && now - pass_time_stats.since >= std::chrono::seconds{10}) {
         auto& pt = pass_time_stats;
@@ -19559,6 +19617,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             u64(seg->target_width) * seg->target_height) { // PRT-PASSTIME
             seg->target_width = targets.state.width;
             seg->target_height = targets.state.height;
+        }
+        if (ShadowLogOn() &&
+            (targets.state.width >= 16384 || targets.state.height >= 16384)) { // PRT-SHADOWLOG
+            ++seg->big_draws;
+            const auto& vp = regs.viewports[0];
+            seg->big_vp_w = std::max(seg->big_vp_w, u32(std::abs(vp.xscale) * 2.0f));
+            seg->big_vp_h = std::max(seg->big_vp_h, u32(std::abs(vp.yscale) * 2.0f));
+            const auto& sc = regs.screen_scissor;
+            seg->big_sc_w = std::max(seg->big_sc_w, sc.GetWidth());
+            seg->big_sc_h = std::max(seg->big_sc_h, sc.GetHeight());
+            const Native::ImageEntry* img = targets.depth ? targets.depth : targets.colors[0];
+            if (img) {
+                seg->big_img_w = img->info.size.width;
+                seg->big_img_h = img->info.size.height;
+                seg->big_fmt = u32(img->info.pixel_format);
+                seg->big_depth = targets.depth ? 1 : 0;
+            }
+            seg->big_colors = targets.state.num_color_attachments;
         }
         const u64 prims = u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1);
         if (prims > seg->max_prims) {
