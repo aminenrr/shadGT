@@ -44,6 +44,7 @@
 #endif
 
 #include "common/diagnostics.h"
+#include "common/prt_quiet_logs.h"
 #include "common/elf_info.h"
 #include "common/guest_clock.h"
 #include "common/nvtx.h"
@@ -3695,7 +3696,21 @@ static void PrtLogDriverLoad(vk::Device device, vk::PipelineCache cache,
                                                             : "");
 }
 
-void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& base) {
+static bool PrtDriverSingleDeleteOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_SINGLE_DELETE");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& single_path) {
+    // PRT-DRVSHARDNAME (Round 7): single_path may be driver_cache_path itself, which shard 0
+    // replaces below; Round 6 named shard 1 <cache>.shard0.shard1 that way.
+    const std::filesystem::path base = single_path;
     const u32 count = PrtDriverShardCount();
     const auto props = instance.GetPhysicalDevice().getProperties();
     const vk::Device device = instance.GetDevice();
@@ -3703,9 +3718,23 @@ void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& base) {
     const u64 old_bytes = std::filesystem::exists(base, old_error)
                               ? std::filesystem::file_size(base, old_error)
                               : 0;
+    bool shards_loaded = false;
     for (u32 index = 0; index < count; ++index) {
         auto path = base;
         path += fmt::format(".shard{}", index);
+        if (index != 0) {
+            auto round6 = base;
+            round6 += fmt::format(".shard0.shard{}", index);
+            std::error_code rename_error;
+            if (!std::filesystem::exists(path, rename_error) &&
+                std::filesystem::is_regular_file(round6, rename_error)) {
+                std::filesystem::rename(round6, path, rename_error);
+                LOG_WARNING(Render_Vulkan, "PRT-DRVSHARDNAME: {} renamed to {}{}",
+                            round6.filename().string(), path.filename().string(),
+                            rename_error ? fmt::format(" failed ({})", rename_error.message())
+                                         : std::string{});
+            }
+        }
         RotateOversizedDriverCache(path, PrtShardRotateBytes());
         bool rejected = false;
         u64 file_bytes = 0;
@@ -3754,6 +3783,9 @@ void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& base) {
         ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create pipeline cache shard: {}",
                    vk::to_string(result));
         PrtLogDriverLoad(device, *cache, path, file_bytes, data.size());
+        if (!data.empty()) {
+            shards_loaded = true;
+        }
         if (index == 0) {
             pipeline_cache = std::move(cache);
             driver_cache_path = path;
@@ -3764,13 +3796,27 @@ void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& base) {
             prt_driver_shards.push_back(PrtDriverShard{std::move(cache), path, rejected});
         }
     }
+    // PRT-DRVSINGLE (Round 7, RYGT_DRIVER_CACHE_SINGLE_DELETE, GT7 on; 0 = keep): the single
+    // file is never read with shards on (Round 6: 1390 MB left in the shader folder). It goes
+    // once a shard loaded data, so a first sharded run that failed keeps it.
+    bool single_deleted = false;
+    if (old_bytes != 0 && shards_loaded && PrtDriverSingleDeleteOn()) {
+        std::error_code remove_error;
+        single_deleted = std::filesystem::remove(base, remove_error) && !remove_error;
+        if (!single_deleted) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVSINGLE: could not delete {} ({})",
+                        base.filename().string(), remove_error.message());
+        }
+    }
     LOG_WARNING(Render_Vulkan,
                 "PRT-DRVSHARD: driver cache in {} shards ({}.shard0 to .shard{}), picked by "
                 "pipeline hash; {}",
                 count, base.filename().string(), count - 1,
-                old_bytes != 0 ? fmt::format("the single file ({} MB) is not read and left as it is",
-                                             old_bytes >> 20)
-                               : std::string{"no single file"});
+                old_bytes == 0     ? std::string{"no single file"}
+                : single_deleted ? fmt::format("PRT-DRVSINGLE: the single file ({} MB) was deleted",
+                                               old_bytes >> 20)
+                                 : fmt::format("the single file ({} MB) is not read and left as it is",
+                                               old_bytes >> 20));
 }
 
 vk::PipelineCache PipelineCache::DriverCacheFor(u64 hash) const {
@@ -6754,8 +6800,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline(bool select_ahead) {
             const u64 skipped = pending->second.skipped;
             pending_computes.erase(pending);
             static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
-                const auto now = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if ((!Common::PrtQuietLogs() || skipped != 0 ||
+                 now - build_start >= std::chrono::milliseconds{50}) &&
+                logged.fetch_add(1, std::memory_order_relaxed) < 200) {
                 const auto built = completion.wait_for(std::chrono::seconds{0}) ==
                                            std::future_status::ready
                                        ? take_built()

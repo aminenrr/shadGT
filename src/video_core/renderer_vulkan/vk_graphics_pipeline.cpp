@@ -25,6 +25,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/prt_quiet_logs.h"
 #include "video_core/title_defaults.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
@@ -1554,7 +1555,7 @@ GraphicsPipeline::GraphicsPipeline(
         SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
         const double library_ms =
             std::chrono::duration<double, std::milli>(libraries_done - create_start).count();
-        if (!preloading || library_ms >= 20.0) {
+        if (library_ms >= 20.0 || (!preloading && !Common::PrtQuietLogs())) {
             LOG_WARNING(
                 Render_Vulkan,
                 "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "

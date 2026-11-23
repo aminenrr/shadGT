@@ -41,13 +41,13 @@ namespace Libraries::VideoOut {
 
 static std::unique_ptr<VideoOutDriver> driver;
 
-// PRT-SYSPARAM (pr-tests, RYGT_SYSPARAM_LOG, GT7, on; 0 = off): each video output query or
+// PRT-SYSPARAM (pr-tests, RYGT_SYSPARAM_LOG, GT7, off since Round 7 (Opening Movie parked); 1 = on): each video output query or
 // setter with its arguments and our answer, once per distinct answer and again when it changes
 // (GT7 options that do not stick: audio mode, display calibration, opening movie).
 static bool SysParamLogOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_SYSPARAM_LOG");
-        return !(env && env[0] == '0') && Common::IsGt7();
+        return env && env[0] == '1' && Common::IsGt7();
     }();
     return on;
 }

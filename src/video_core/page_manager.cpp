@@ -18,6 +18,7 @@
 #endif
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
+#include "common/prt_quiet_logs.h"
 #include "common/debug.h"
 #include "common/decoder.h"
 #include "common/diagnostics.h"
@@ -1184,7 +1185,7 @@ struct SignalImpl : public PageManager::Impl {
             // command thread drains the recorder and may wait for the GPU.
             // Per thread, so the recorder's faults do not hide the command thread's.
             static thread_local u32 logged = 0;
-            if (logged++ < 48) {
+            if (logged++ < (Common::PrtQuietLogs() ? 2u : 48u)) {
                 LOG_WARNING(Render, "DIAG-049 GPU-thread {} fault at {:#x} from {}; stack:{}",
                             Common::IsWriteError(context) ? "write" : "read", addr,
                             Common::SamplingProfiler::DescribeCode(

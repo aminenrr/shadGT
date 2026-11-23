@@ -5,6 +5,7 @@
 #include <utility>
 #include "common/assert.h"
 #include "common/number_utils.h"
+#include "common/prt_quiet_logs.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
@@ -437,15 +438,23 @@ vk::SamplerAddressMode ClampMode(AmdGpu::ClampMode mode) {
     case AmdGpu::ClampMode::ClampLastTexel:
         return vk::SamplerAddressMode::eClampToEdge;
     case AmdGpu::ClampMode::MirrorOnceHalfBorder:
-    case AmdGpu::ClampMode::MirrorOnceBorder:
-        LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
-                    static_cast<u32>(mode));
+    case AmdGpu::ClampMode::MirrorOnceBorder: {
+        static std::atomic<bool> logged{false};
+        if (Common::PrtLogOnce(logged)) {
+            LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
+                        static_cast<u32>(mode));
+        }
+    }
         [[fallthrough]];
     case AmdGpu::ClampMode::MirrorOnceLastTexel:
         return vk::SamplerAddressMode::eMirrorClampToEdge;
-    case AmdGpu::ClampMode::ClampHalfBorder:
-        LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
-                    static_cast<u32>(mode));
+    case AmdGpu::ClampMode::ClampHalfBorder: {
+        static std::atomic<bool> logged{false};
+        if (Common::PrtLogOnce(logged)) {
+            LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
+                        static_cast<u32>(mode));
+        }
+    }
         [[fallthrough]];
     case AmdGpu::ClampMode::ClampBorder:
         return vk::SamplerAddressMode::eClampToBorder;
