@@ -1522,6 +1522,9 @@ private:
     std::vector<KeptTextureCandidate> kept_texture_scan;
     u32 kept_texture_shard = 0;
     u64 kept_texture_bytes = 0;
+    /// PRT-VRAMTRIM (Round 7): over the VRAM budget, checked every 30 frames.
+    bool prt_trim_over = false;
+    u64 prt_trim_checked = 0;
     /// FIX-GT7-153: bytes of circuit shadow maps kept past their idle time (a budget of their own).
     u64 kept_shadow_bytes = 0;
     struct PrtRelease2 {

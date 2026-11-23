@@ -24269,6 +24269,56 @@ void NativeRenderer::EvictImages() {
         over_budget = over_was;
     }
     PrtReleaseKeptOverBudget(frame, KeepFrames);
+    // PRT-VRAMTRIM (Round 7, RYGT_VRAM_TRIM, GT7 on; 0 = off): over the VRAM budget the idle
+    // textures kept for a retry (up to 2 GB in GT7) are cut to RYGT_VRAM_TRIM_KEEP_MB (256), the
+    // newest kept first, and up to 64 idle pictures go a frame instead of 16. Round 6: kept
+    // textures reached 1041 MB while VRAM sat at 8.2 to 9.2 GB of a 6.3 GB budget, and track
+    // loads stalled 3 s. Back under the budget by an eighth, the full set is kept again.
+    static const bool trim_on = [] {
+        const char* env = std::getenv("RYGT_VRAM_TRIM");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    static const u64 trim_keep = [] {
+        const char* env = std::getenv("RYGT_VRAM_TRIM_KEEP_MB");
+        const u64 value = env && *env ? std::strtoull(env, nullptr, 10) : 256;
+        return std::min<u64>(value, 2048) << 20;
+    }();
+    if (trim_on && !pressure && frame >= prt_trim_checked + 30) {
+        prt_trim_checked = frame;
+        const u64 vram_budget = r.instance.GetTotalMemoryBudget();
+        const u64 vram_used = vram_budget ? r.instance.GetDeviceMemoryUsage() : 0;
+        const bool now_over = vram_budget && vram_used + vram_budget / 32 > vram_budget;
+        const bool was_over = prt_trim_over;
+        prt_trim_over = now_over || (was_over && vram_budget && vram_used + vram_budget / 8 > vram_budget);
+        if (prt_trim_over != was_over) {
+            const u64 cut_from = kept_texture_bytes;
+            if (prt_trim_over && kept_texture_bytes > std::min(texture_budget, trim_keep)) {
+                kept_textures.clear();
+                kept_texture_scan.clear();
+                kept_texture_shard = 0;
+                kept_texture_bytes = 0;
+            }
+            static std::atomic<u32> trim_logged{};
+            if (const u32 n = trim_logged++; n < 32 || n % 200 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-VRAMTRIM: VRAM {} of {} MB, {} (kept textures {:.0f} MB, now up "
+                            "to {:.0f} MB; {} so far)",
+                            vram_used >> 20, vram_budget >> 20,
+                            prt_trim_over ? "over budget, kept textures cut and 64 idle pictures "
+                                            "a frame go"
+                                          : "back under budget, kept textures as before",
+                            cut_from / 1048576.0,
+                            (prt_trim_over ? std::min(texture_budget, trim_keep) : texture_budget) /
+                                1048576.0,
+                            n + 1);
+            }
+        }
+    }
+    const bool trim_now = trim_on && prt_trim_over;
+    const u64 kept_budget = trim_now ? std::min(texture_budget, trim_keep) : texture_budget;
     // PRT-VRAMREG (pr-tests, RYGT_VRAM_REGISTRY_LOG, GT7, on; 0 = off): over the VRAM budget
     // (the PRT-VRAMKEEP check, every 30 frames), at most once every 10 s, what holds video memory
     // by kind and the 5 largest resources, before the kept textures are let go. Sizes are guest
@@ -24301,6 +24351,7 @@ void NativeRenderer::EvictImages() {
                 VAddr address;
             };
             std::vector<Largest> largest;
+            std::string big_regions;
             const auto note_largest = [&](const Largest& item) {
                 largest.push_back(item);
                 std::ranges::sort(largest, std::greater{}, &Largest::bytes);
@@ -24340,6 +24391,12 @@ void NativeRenderer::EvictImages() {
                 }
                 for (const auto& [base, region] : regions) {
                     const u64 bytes = region.buffer ? region.buffer->Size() : 0;
+                    if (bytes >= (u64{64} << 20) && big_regions.size() < 512) {
+                        big_regions += fmt::format("{}{:#x}-{:#x} {} MB ({} CPU-written pages)",
+                                                   big_regions.empty() ? "" : "; ", region.begin,
+                                                   region.end, bytes >> 20,
+                                                   region.cpu_pages ? region.cpu_pages->size() : 0);
+                    }
                     kind_bytes[size_t(Kind::Regions)] += bytes;
                     ++kind_count[size_t(Kind::Regions)];
                     if (bytes != 0 && (largest.size() < 5 || bytes > largest.back().bytes)) {
@@ -24410,6 +24467,13 @@ void NativeRenderer::EvictImages() {
                             mb(vram_used > block_bytes ? vram_used - block_bytes : 0),
                             mb(host_block_bytes));
             }
+            // PRT-VRAMREG2 (Round 7, same switch): what the 1.2 to 1.4 GB of VMA memory the
+            // registry does not know and the largest regions are.
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-VRAMREG2: buffer cache sparse arena resident {:.0f} MB; regions of "
+                        "64 MB or more: {}",
+                        mb(r.buffer_cache.SparseResidentBytes()),
+                        big_regions.empty() ? std::string{"none"} : big_regions);
         }
     }
     if (pressure || over_budget || texture_budget == 0) {
@@ -24440,7 +24504,7 @@ void NativeRenderer::EvictImages() {
                 if (kept_at[candidate.address] >= 4) {
                     continue;
                 }
-                if (bytes + candidate.size > texture_budget) {
+                if (bytes + candidate.size > kept_budget) {
                     break;
                 }
                 bytes += candidate.size;
@@ -24462,7 +24526,7 @@ void NativeRenderer::EvictImages() {
             return false;
         }
         const u64 size = std::max<u64>(entry.info.guest_size, 1);
-        if (kept_texture_bytes + size > texture_budget || !loaded_texture(entry)) {
+        if (kept_texture_bytes + size > kept_budget || !loaded_texture(entry)) {
             return false;
         }
         kept_texture_bytes += size;
@@ -24569,7 +24633,7 @@ void NativeRenderer::EvictImages() {
     };
     registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
         return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
-    }, 16);
+    }, trim_now ? 64u : 16u);
     if (RecycleFrameTextures()) {
         // PERF-SGT-021: per-frame textures go after a few idle frames, so a handful of
         // images of each shape go round (not one for each of the last 120 frames).
