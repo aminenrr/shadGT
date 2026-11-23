@@ -1899,6 +1899,8 @@ static void PrtHitchFrame(const Instance& instance) {
     Totals now{};
     now.Take();
     const s64 frame_us = last_us != 0 ? now_us - last_us : 0;
+    // HITCHLOG v2: taken every frame, so it covers this frame only.
+    const s64 frame_gap_us = PH::g_max_submit_gap_us.exchange(0, std::memory_order_relaxed);
     last_us = now_us;
     const Totals before = last;
     last = now;
@@ -1932,6 +1934,15 @@ static void PrtHitchFrame(const Instance& instance) {
     const double hold_ms = ms(now.hold_us - before.hold_us);
     // The cause: the largest of the waits the frame had, if it is a fifth of the frame or more.
     const char* cause = "not seen (GPU-bound, or game CPU work)";
+    // HITCHLOG v2 (Round 12): the frame's GPU ms (PRT-PASSTIME lists resolved in it) and the
+    // largest gap between guest submits split "not seen" into GPU-bound, game CPU or other.
+    const double gpu_ms = ms(d(PH::Count::GpuUs));
+    const u64 guest_submits = d(PH::Count::GuestSubmits);
+    const double submit_gap_ms =
+        ms(u64(std::max<s64>(frame_gap_us, 0)));
+    const s64 last_submit = PH::g_last_submit_us.load(std::memory_order_relaxed);
+    const double since_submit_ms =
+        last_submit != 0 && now_us > last_submit ? double(now_us - last_submit) / 1000.0 : 0.0;
     double cause_ms = frame_ms / 5.0;
     const auto pick = [&](double value, const char* name) {
         if (value >= cause_ms) {
@@ -1949,6 +1960,19 @@ static void PrtHitchFrame(const Instance& instance) {
     if (cause_ms == frame_ms / 5.0 && d(PH::Count::TessBuilds) != 0) {
         cause = "tessellated pipeline built on a worker (driver CPU)";
     }
+    std::string cause_v2;
+    if (cause_ms == frame_ms / 5.0 && d(PH::Count::TessBuilds) == 0) {
+        if (gpu_ms >= frame_ms * 0.7) {
+            cause_v2 = fmt::format("GPU-bound (GPU {:.0f} ms)", gpu_ms);
+        } else if (submit_gap_ms >= frame_ms * 0.5) {
+            cause_v2 = fmt::format("game CPU (no guest submit for {:.0f} ms, GPU {:.0f} ms)",
+                                   submit_gap_ms, gpu_ms);
+        } else {
+            cause_v2 = fmt::format("other (GPU {:.0f} ms, largest submit gap {:.0f} ms)", gpu_ms,
+                                   submit_gap_ms);
+        }
+        cause = cause_v2.c_str();
+    }
     std::string fence_top;
     if (SC::FenceSiteOn()) {
         fence_top = SC::FenceSiteText(SC::SiteSlot::Hitch, 3, true);
@@ -1963,14 +1987,15 @@ static void PrtHitchFrame(const Instance& instance) {
                 "pipeline compile waits {:.0f} ms, tess pipelines: waits {} ({:.0f} ms), skips {}, "
                 "built {} ({:.0f} ms driver); imported views {} ({:.1f} ms), dropped {}; unmaps {} "
                 "({:.1f} ms); region creates {}; upload {:.1f} MB; present/acquire wait {:.0f} ms; "
-                "VRAM {} MB ({} hitches so far{})",
+                "VRAM {} MB; GPU {:.1f} ms, guest submits {}, largest submit gap {:.1f} ms, "
+                "last submit {:.1f} ms before flip ({} hitches so far{})",
                 PH::LocalClock(), frame_ms, in_race ? " in a race" : "", cause, fence_ms,
                 now.fences - before.fences, fence_top.empty() ? "" : "; top: ", fence_top,
                 compile_ms, d(PH::Count::TessWaits), tess_wait_ms, d(PH::Count::TessSkips),
                 d(PH::Count::TessBuilds), tess_build_ms, d(PH::Count::ViewImports), import_ms,
                 d(PH::Count::ViewDrops), d(PH::Count::Unmaps), unmap_ms,
                 d(PH::Count::RegionCreates), double(d(PH::Count::UploadBytes)) / 1048576.0,
-                present_ms, vram, hitches,
+                present_ms, vram, gpu_ms, guest_submits, submit_gap_ms, since_submit_ms, hitches,
                 not_logged ? fmt::format(", {} not logged (one line per 250 ms)", not_logged)
                            : std::string{});
     not_logged = 0;

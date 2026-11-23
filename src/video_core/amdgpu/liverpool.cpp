@@ -1,3 +1,4 @@
+#include "common/prt_hitch.h"
 #include "common/debug_environment.h"
 #include "common/geometry_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
@@ -4300,6 +4301,7 @@ std::optional<Liverpool::TessSubmitRecord> Liverpool::FindTessSubmit(VAddr base)
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    Common::PrtHitch::NoteGuestSubmit(); // HITCHLOG v2 (pr-tests, Round 12)
     const auto original_dcb = dcb;
     if (!dcb.empty()) {
         const u64 submit = submitted_count.fetch_add(1, std::memory_order_relaxed) + 1;

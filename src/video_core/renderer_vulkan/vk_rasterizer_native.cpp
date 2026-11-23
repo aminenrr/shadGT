@@ -4048,6 +4048,8 @@ void NativeRenderer::GpuTimeCollect() {
                 auto& pt = pass_time_stats;
                 ++pt.lists;
                 pt.gpu_ms += list_ms;
+                Common::PrtHitch::Add(Common::PrtHitch::Count::GpuUs,
+                                      u64(list_ms * 1000.0)); // HITCHLOG v2
                 pt.open_ms += (t.cpu_end_s - t.cpu_s) * 1000.0;
                 for (const auto& [ms, i] : segs) {
                     const GpuSegment& g = t.segments[i];

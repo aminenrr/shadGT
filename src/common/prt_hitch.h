@@ -70,6 +70,8 @@ enum class Count : u32 {
     TessBuilds,     ///< tessellated pipelines the driver compiled (whole create)
     TessBuildUs,    ///< driver time on them (worker threads)
     UploadBytes,    ///< native renderer uploads (registry upload bytes, published each frame)
+    GpuUs,          ///< HITCHLOG v2: GPU time of main lists resolved (PRT-PASSTIME timestamps)
+    GuestSubmits,   ///< HITCHLOG v2: guest graphics submits (Liverpool::SubmitGfx)
     Count,
 };
 
@@ -91,6 +93,28 @@ inline s64 NowUs() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// HITCHLOG v2 (pr-tests, Round 12): the largest gap between two guest graphics submits since the
+// last game frame (the presenter takes it), and the time of the last one. A long gap with little
+// GPU time means the game's CPU (or a guest wait) held the frame.
+inline std::atomic<s64> g_last_submit_us{};
+inline std::atomic<s64> g_max_submit_gap_us{};
+
+inline void NoteGuestSubmit() {
+    if (!On()) {
+        return;
+    }
+    const s64 now = NowUs();
+    const s64 last = g_last_submit_us.exchange(now, std::memory_order_relaxed);
+    Add(Count::GuestSubmits, 1);
+    if (last != 0 && now > last) {
+        const s64 gap = now - last;
+        s64 max = g_max_submit_gap_us.load(std::memory_order_relaxed);
+        while (gap > max &&
+               !g_max_submit_gap_us.compare_exchange_weak(max, gap, std::memory_order_relaxed)) {
+        }
+    }
 }
 
 /// Adds its lifetime in microseconds to a count, when `on`.
