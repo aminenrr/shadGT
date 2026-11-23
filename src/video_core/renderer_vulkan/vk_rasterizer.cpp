@@ -3294,9 +3294,60 @@ static s64 NativeFenceBatchInterval() {
 }
 #endif
 
+// PRT-FENCEBATCH (pr-tests, Round 12): see DeferFenceSignal. 0 = off.
+static u32 PrtFenceBatchUs() {
+    static const u32 us = [] {
+        const char* env = std::getenv("RYGT_FENCE_BATCH");
+        if (!(env && *env) || !Common::IsGt7()) {
+            return 0u;
+        }
+        const unsigned long value = std::strtoul(env, nullptr, 10);
+        if (value == 0) {
+            return 0u;
+        }
+        const u32 result = value == 1 ? 500u : u32(std::min<unsigned long>(value, 20000));
+        LOG_INFO(Render_Vulkan, "PRT-FENCEBATCH: on, fences ride a submit made less than {} us ago",
+                 result);
+        return result;
+    }();
+    return us;
+}
+
+// GT7's two spun labels (FIX-419-GTS addresses), for builds with and without RYTY_GPU.
+static bool Gt7SpunLabelAny(VAddr address) {
+    static const bool gt7 = Common::IsGt7();
+    return gt7 && ((address >= 0x102046a3f0 && address < 0x102046a400) ||
+                   (address >= 0x10200004e0 && address < 0x1020000500));
+}
+
+void Rasterizer::PrtFenceBatchReport(s64 now_us) {
+    s64 last = prt_fence_batch_report_us.load(std::memory_order_relaxed);
+    if (last == 0) {
+        prt_fence_batch_report_us.compare_exchange_strong(last, now_us);
+        return;
+    }
+    if (now_us - last < 10'000'000 ||
+        !prt_fence_batch_report_us.compare_exchange_strong(last, now_us)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "PRT-FENCEBATCH: last {:.1f} s: {} fences rode a recent submit, {} fence submits, {} "
+             "idle flushes (window {} us)",
+             double(now_us - last) / 1e6, prt_fence_batch_held.exchange(0),
+             prt_fence_batch_submits.exchange(0), prt_fence_batch_idle_flushes.exchange(0),
+             PrtFenceBatchUs());
+}
+
 void Rasterizer::FlushDeferredFences() {
     if (deferred_unflushed.exchange(false, std::memory_order_acq_rel)) {
         scheduler.Flush();
+        if (PrtFenceBatchUs() != 0) {
+            ++prt_fence_batch_idle_flushes;
+            prt_fence_batch_last_us.store(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
+        }
 #ifdef RYTY_GPU
         if (native && NativeFenceBatchInterval() > 0) last_native_fence_submit_ns.store(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3521,9 +3572,36 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         // spun-label addresses apply to GT7 only (Gt7SpunLabel), never to GT Sport.
     }
 #endif
+    // PRT-FENCEBATCH (pr-tests, Round 12, RYGT_FENCE_BATCH, default 0 = off; n = us, 1 = 500 us,
+    // GT7 only): a deferred fence that would submit at once only because readbacks are pending,
+    // its address has an earlier deferred write or it is not held, rides the next submit when
+    // the last submit was less than n us ago. Its signal still runs on the priority thread only
+    // after the GPU reaches its tick (labels land after the GPU work, in order), and the
+    // recorder's idle hook (FlushDeferredFences) or the next fence after n us submits it. Never
+    // for EOP flushes, SHADGT_DIRECT_HOLD_FLUSH or GT7's two spun labels. Risk: a guest that
+    // spins on such a label while the recorder stays busy sees it up to n us later.
+    if (submit_now && !flush && !hold_flush && PrtFenceBatchUs() != 0 && liverpool &&
+        liverpool->Pipelined()) { // the idle hook only runs with the recorder
+        const s64 now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const s64 last_us = prt_fence_batch_last_us.load(std::memory_order_relaxed);
+        if (last_us > 0 && now_us >= last_us && now_us - last_us < s64(PrtFenceBatchUs()) &&
+            !Gt7SpunLabelAny(address)) {
+            submit_now = false;
+            ++prt_fence_batch_held;
+        }
+        PrtFenceBatchReport(now_us);
+    }
     if (submit_now) {
         scheduler.Flush();
         deferred_unflushed.store(false, std::memory_order_relaxed);
+        if (PrtFenceBatchUs() != 0) {
+            ++prt_fence_batch_submits;
+            prt_fence_batch_last_us.store(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
+        }
     } else {
         deferred_unflushed.store(true, std::memory_order_release);
         ++g_defer_unflushed;

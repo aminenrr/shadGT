@@ -320,6 +320,7 @@ public:
                           bool flush = true);
     /// D5: submits fences deferred without a submit of their own (recorder out of work).
     void FlushDeferredFences();
+    void PrtFenceBatchReport(s64 now_us); // PRT-FENCEBATCH
     /// PERF-GT7-008: the recorder ran out of work (the native renderer begins its next list).
     void OnRecorderIdle();
     /// D6: the imported guest memory holding a range read in place, when direct mode can.
@@ -694,6 +695,12 @@ private:
     u32 invalid_texture_context_count{};
     std::unordered_set<u64> logged_gpu_constant_shaders;
     std::atomic<u32> deferred_fences{};
+    // PRT-FENCEBATCH (pr-tests, Round 12)
+    std::atomic<s64> prt_fence_batch_last_us{};
+    std::atomic<s64> prt_fence_batch_report_us{};
+    std::atomic<u64> prt_fence_batch_held{};
+    std::atomic<u64> prt_fence_batch_submits{};
+    std::atomic<u64> prt_fence_batch_idle_flushes{};
     std::atomic<u64> background_readbacks{}; // FIX-070
     std::atomic<s64> last_readback_fence_ns{}; // PERF-063
     std::atomic<s64> last_native_fence_submit_ns{}; // per renderer, never shared across devices
