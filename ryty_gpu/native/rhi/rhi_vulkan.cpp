@@ -280,6 +280,11 @@ public:
     u32 recycle_usage = 0;
     MemoryKind recycle_memory = MemoryKind::DeviceLocal;
     bool recycle_reserved = false; // PERF-GTS-367: allocated in the upload copy reserve
+    bool recycle_vram = false;     // PRT-VRAMREG3: device local memory
+    // PRT-VRAMREG3: what this (not recycled) buffer counts in vram_buffer_bytes.
+    bool vram = false;
+    u64 vram_bytes = 0;
+    MemoryKind vram_kind = MemoryKind::DeviceLocal;
 };
 
 class VulkanImage final : public Image {
@@ -566,6 +571,7 @@ public:
         u32 usage;
         MemoryKind memory;
         bool reserved = false; ///< PERF-GTS-367: its memory is in the upload copy reserve
+        bool vram = false;     ///< PRT-VRAMREG3: its memory is device local
     };
     /// PERF-GTS-367: takes a kept buffer whose memory is in the reserve, to free it for another.
     bool TakeReservedRecycled(RecycledBuffer& out);
@@ -605,6 +611,19 @@ public:
     std::mutex recycle_mutex;
     std::vector<RecycledBuffer> recycled;
     u64 recycled_bytes = 0;
+    u64 recycled_vram_bytes = 0; ///< PRT-VRAMREG3: kept copies in device local memory
+    u64 upload_reserve_bytes = 0;
+    /// PRT-VRAMREG3: live device local buffer bytes by MemoryKind (VMA allocations).
+    std::array<std::atomic<u64>, 3> vram_buffer_bytes{};
+    void NoteVramBuffer(MemoryKind kind, bool vram, u64 bytes, bool add) {
+        if (!vram || bytes == 0) return;
+        auto& slot = vram_buffer_bytes[std::min<size_t>(size_t(kind), 2)];
+        if (add) slot.fetch_add(bytes, std::memory_order_relaxed);
+        else slot.fetch_sub(std::min(bytes, slot.load(std::memory_order_relaxed)),
+                            std::memory_order_relaxed);
+    }
+    VideoMemoryBuffers VideoMemoryBufferBytes() const override;
+    u64 TrimKeptCopies(u64 keep) override;
     u64 recycle_reused = 0, recycle_allocated = 0, recycle_allocated_reserved = 0,
         recycle_dropped = 0, recycle_evicted = 0;
     std::chrono::steady_clock::time_point recycle_report{};
@@ -679,10 +698,11 @@ void VulkanBuffer::ReleaseCompleted() {
     }
     if (recycle_bytes) {
         device.Recycle({buffer, allocation, mapped, address, recycle_bytes, recycle_usage,
-                        recycle_memory, recycle_reserved}); // PERF-GTS-362
+                        recycle_memory, recycle_reserved, recycle_vram}); // PERF-GTS-362
     } else if (allocation) {
         Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
         vmaDestroyBuffer(device.allocator, static_cast<VkBuffer>(buffer), allocation);
+        device.NoteVramBuffer(vram_kind, vram, vram_bytes, false); // PRT-VRAMREG3
     } else {
         Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
         device.device.destroyBuffer(buffer);
@@ -705,11 +725,13 @@ VulkanBuffer::~VulkanBuffer() {
         // PERF-GTS-362: kept for the next upload copy once the GPU is done with it.
         device.Retire([owner = &device, kept = VulkanDevice::RecycledBuffer{
                            buffer, allocation, mapped, address, recycle_bytes, recycle_usage,
-                           recycle_memory, recycle_reserved}] { owner->Recycle(kept); });
+                           recycle_memory, recycle_reserved, recycle_vram}] { owner->Recycle(kept); });
         return;
     }
     device.Retire([dev = device.device, alloc = device.allocator, buffer = buffer,
-                   allocation = allocation, memory = memory] {
+                   allocation = allocation, memory = memory, owner = &device,
+                   vram_kind = vram_kind, vram = vram, vram_bytes = vram_bytes] {
+        owner->NoteVramBuffer(vram_kind, vram, allocation ? vram_bytes : 0, false); // PRT-VRAMREG3
 #ifndef NDEBUG
         const auto destroy_start = std::chrono::steady_clock::now();
 #endif
@@ -1004,6 +1026,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
             reused->recycle_usage = kept.usage;
             reused->recycle_memory = kept.memory;
             reused->recycle_reserved = kept.reserved;
+            reused->recycle_vram = kept.vram;
             return reused;
         }
     }
@@ -1069,6 +1092,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
                   if (evicted == 16 || !TakeReservedRecycled(idle)) break;
                   Native::DeadHandles::Note(static_cast<VkBuffer>(idle.buffer)); // PERF-GTS-375
                   vmaDestroyBuffer(allocator, static_cast<VkBuffer>(idle.buffer), idle.allocation);
+                  NoteVramBuffer(idle.memory, idle.vram, idle.bytes, false); // PRT-VRAMREG3
               }
               // Still no room (or unsuitable): allocate as before.
           }
@@ -1103,11 +1127,20 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     auto made = std::make_unique<VulkanBuffer>(*this, buffer, allocation, vk::DeviceMemory{},
                                                desc.size, address,
                                                static_cast<u8*>(info.pMappedData));
+    // PRT-VRAMREG3: counted while it lives (and while kept for reuse) when in video memory.
+    VkMemoryPropertyFlags memory_flags = 0;
+    vmaGetAllocationMemoryProperties(allocator, allocation, &memory_flags);
+    const bool in_vram = (memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    NoteVramBuffer(desc.memory, in_vram, buffer_ci.size, true);
+    made->vram = in_vram;
+    made->vram_bytes = buffer_ci.size;
+    made->vram_kind = desc.memory;
     if (recycle_bytes) {
         made->recycle_bytes = recycle_bytes;
         made->recycle_usage = desc.usage;
         made->recycle_memory = desc.memory;
         made->recycle_reserved = from_reserve;
+        made->recycle_vram = in_vram;
         std::scoped_lock lock{recycle_mutex};
         ++recycle_allocated;
         recycle_allocated_reserved += from_reserve;
@@ -1142,6 +1175,10 @@ VmaPool VulkanDevice::UploadReserve(const VkBufferCreateInfo& buffer_ci,
             LOG_WARNING(Render_Vulkan, "PERF-GTS-364: could not reserve {} MB for upload copies", mb);
             return;
         }
+        {
+            std::scoped_lock lock{recycle_mutex};
+            upload_reserve_bytes = blocks * BlockBytes; // PRT-VRAMREG3
+        }
         LOG_INFO(Render_Vulkan, "PERF-GTS-364: reserved {} MB for upload copies in memory type {} ({} ms)",
                  blocks * (BlockBytes >> 20), type,
                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
@@ -1155,6 +1192,7 @@ bool VulkanDevice::TakeReservedRecycled(RecycledBuffer& out) {
         if (it->reserved) {
             out = *it;
             recycled_bytes -= it->bytes;
+            recycled_vram_bytes -= it->vram ? std::min(it->bytes, recycled_vram_bytes) : 0;
             recycled.erase(it); // keeps the rest in the order they came back: oldest first
             ++recycle_evicted;
             return true;
@@ -1169,6 +1207,7 @@ bool VulkanDevice::TakeRecycled(u64 bytes, u32 usage, MemoryKind memory, Recycle
         if (it->bytes == bytes && it->usage == usage && it->memory == memory) {
             out = *it;
             recycled_bytes -= it->bytes;
+            recycled_vram_bytes -= it->vram ? std::min(it->bytes, recycled_vram_bytes) : 0;
             *it = recycled.back();
             recycled.pop_back();
             ++recycle_reused;
@@ -1185,6 +1224,7 @@ void VulkanDevice::Recycle(const RecycledBuffer& buffer) {
         if (recycled_bytes + buffer.bytes <= RecycleLimit()) {
             recycled.push_back(buffer);
             recycled_bytes += buffer.bytes;
+            recycled_vram_bytes += buffer.vram ? buffer.bytes : 0; // PRT-VRAMREG3
             keep = true;
         } else {
             ++recycle_dropped;
@@ -1207,6 +1247,7 @@ void VulkanDevice::Recycle(const RecycledBuffer& buffer) {
     if (!keep) {
         Native::DeadHandles::Note(static_cast<VkBuffer>(buffer.buffer)); // PERF-GTS-375
         vmaDestroyBuffer(allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
+        NoteVramBuffer(buffer.memory, buffer.vram, buffer.bytes, false); // PRT-VRAMREG3
     }
 }
 
@@ -1216,11 +1257,53 @@ void VulkanDevice::DropRecycled() {
         std::scoped_lock lock{recycle_mutex};
         dropped.swap(recycled);
         recycled_bytes = 0;
+        recycled_vram_bytes = 0;
     }
     for (const auto& buffer : dropped) {
         Native::DeadHandles::Note(static_cast<VkBuffer>(buffer.buffer)); // PERF-GTS-375
         vmaDestroyBuffer(allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
+        NoteVramBuffer(buffer.memory, buffer.vram, buffer.bytes, false); // PRT-VRAMREG3
     }
+}
+
+Device::VideoMemoryBuffers VulkanDevice::VideoMemoryBufferBytes() const {
+    VideoMemoryBuffers out;
+    out.device_local = vram_buffer_bytes[0].load(std::memory_order_relaxed);
+    out.upload = vram_buffer_bytes[1].load(std::memory_order_relaxed);
+    out.readback = vram_buffer_bytes[2].load(std::memory_order_relaxed);
+    std::scoped_lock lock{const_cast<std::mutex&>(recycle_mutex)};
+    out.kept_copies = recycled_bytes;
+    out.kept_copies_vram = recycled_vram_bytes;
+    out.reserve = upload_reserve_bytes;
+    return out;
+}
+
+u64 VulkanDevice::TrimKeptCopies(u64 keep) {
+    // PRT-STAGESHRINK: oldest first (recycled keeps the order they came back in, roughly).
+    std::vector<RecycledBuffer> dropped;
+    {
+        std::scoped_lock lock{recycle_mutex};
+        size_t i = 0;
+        while (recycled_bytes > keep && i < recycled.size()) {
+            const RecycledBuffer& buffer = recycled[i];
+            if (buffer.reserved) { // in the reserve: freeing it returns nothing to the driver
+                ++i;
+                continue;
+            }
+            recycled_bytes -= buffer.bytes;
+            recycled_vram_bytes -= buffer.vram ? std::min(buffer.bytes, recycled_vram_bytes) : 0;
+            dropped.push_back(buffer);
+            recycled.erase(recycled.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+    }
+    u64 freed = 0;
+    for (const auto& buffer : dropped) {
+        freed += buffer.bytes;
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer.buffer)); // PERF-GTS-375
+        vmaDestroyBuffer(allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
+        NoteVramBuffer(buffer.memory, buffer.vram, buffer.bytes, false);
+    }
+    return freed;
 }
 
 std::unique_ptr<Buffer> VulkanDevice::ImportHostMemory(void* memory, u64 size, u32 usage,

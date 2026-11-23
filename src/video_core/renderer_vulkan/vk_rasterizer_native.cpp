@@ -5629,12 +5629,25 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
         }
         return false;
     };
+    // PRT-REGIONCAP (pr-tests, Round 10, RYGT_REGION_MAX_MB, off; n = MB): while PRT-VRAMTRIM
+    // finds VRAM over the budget, a region (merged or grown) spans at most n MB and gets no
+    // PERF-GTS-369 grow room; a larger one is refused as one over 1 GB always was (binds there
+    // use guest memory). Round 9: one merged region reached 1012 MB (0 CPU-written pages) and
+    // regions in all went from 976 to 2067 MB after photos, 1.2 to 2.5 GB over the budget.
+    static const u64 region_cap = [] {
+        const char* env = std::getenv("RYGT_REGION_MAX_MB");
+        const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 0;
+        return std::min<u64>(mb, 1024) << 20;
+    }();
+    const bool region_capped = region_cap != 0 && Common::IsGt7() && prt_trim_over;
+    const u64 region_max = region_capped ? region_cap : 1_GB;
+    const VAddr asked_begin = begin, asked_end = end;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         const auto action = Native::ReplaceOverlappingRegions(
-            regions, begin, end, write, size, 1_GB,
+            regions, begin, end, write, size, region_max,
             [&](VAddr from, VAddr to) {
-                return direct && to - from <= 1_GB && r.IsMappedStart(from) &&
+                return direct && to - from <= region_max && r.IsMappedStart(from) &&
                        r.memory->IsValidGpuMapping(from, to - from) &&
                        !takes_listed(from, to); // FIX-SGT-012
             }, [&](VAddr from, VAddr to) {
@@ -5654,10 +5667,22 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 retired_watch_ranges.emplace_back(old.begin, old.end);
                 merged.push_back(std::move(old));
                 ++regions_taken_in;
-        }, RegionGrowSlack());
+        }, region_capped ? u64{0} : RegionGrowSlack());
         NoteOwnedMapChange(); // PERF-GT7-133: regions may have been taken out
         RebuildRegionIndex(); // PERF-SGT-046
-        if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
+        if (action == Native::RegionMergeDisposition::Preserve) {
+            if (region_capped && end - begin > region_max && end - begin <= 1_GB) {
+                static std::atomic<u32> cap_logged{};
+                if (const u32 n = cap_logged++; n < 32 || n % 200 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-REGIONCAP: region {:#x}-{:#x} ({} MB, asked {:#x}+{:#x}) "
+                                "refused over the VRAM budget, cap {} MB (frame {}, {} so far)",
+                                begin, end, (end - begin) >> 20, asked_begin,
+                                asked_end - asked_begin, region_max >> 20, frame, n + 1);
+                }
+            }
+            return nullptr;
+        }
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
     buffer_log.Note(begin, end); // OPT-010
@@ -8149,12 +8174,57 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         }();
         const bool never_drawn =
             !entry || entry->write_version.load(std::memory_order_relaxed) == 0;
-        if (photo_first_wait != 0 && Common::IsGt7() && target_cb >= 0 && !RytyRaceRunning() &&
-            (photo_first_wait == 2 || never_drawn)) {
+        // PRT-PHOTOWIN (pr-tests, Round 10, RYGT_PHOTO_WINDOW_FRAMES, GT7 3600; 0 = off): a draw
+        // into a 3840x2160 or larger colour target out of a race that is not a display buffer
+        // (a Scapes or replay photo) opens a window of that many frames; in it, out of a race,
+        // a draw into a colour target never drawn into (any size) waits for its pipeline instead
+        // of being skipped. Round 9: the photo's 3840x2160 draw waited, but its 800x900,
+        // 720x1080 and 1920x540 pictures (frame 42736, 1800 frames later) were skipped by
+        // FIX-GT7-131 ("target starts empty") and read empty: black or partial photos. Mode 2 of
+        // PRT-PHOTOWAIT also leaves display buffers alone now (64 waits at the menus, R9).
+        static const u64 photo_window = [] {
+            const char* env = std::getenv("RYGT_PHOTO_WINDOW_FRAMES");
+            if (env && *env) {
+                return u64(std::strtoull(env, nullptr, 10));
+            }
+            return u64{3600};
+        }();
+        static u64 photo_window_from = 0;
+        const bool out_of_race_gt7 = Common::IsGt7() && target_cb >= 0 && !RytyRaceRunning();
+        if (photo_window != 0 && out_of_race_gt7 && never_drawn && photo_window_from != 0 &&
+            frame >= photo_window_from && frame - photo_window_from <= photo_window &&
+            !IsDisplayAddress(address)) {
+            const auto& extent = r.liverpool->DrawCbExtent(u32(target_cb));
+            const u32 width = layout ? layout->size.width : u32(extent.width);
+            const u32 height = layout ? layout->size.height : u32(extent.height);
+            if (width < 3840 || height < 2160) {
+                one_off_photo_output = true;
+                static std::atomic<u32> window_logged{};
+                if (const u32 n = window_logged++; n < 64 || n % 500 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-PHOTOWIN: a draw into {:#x} {}x{}, never drawn, waits for its "
+                                "pipeline ({} frames after a photo draw, frame {}, {} so far)",
+                                address, width, height, frame - photo_window_from, frame, n + 1);
+                }
+                return false;
+            }
+        }
+        if (photo_first_wait != 0 && out_of_race_gt7 &&
+            (photo_first_wait == 2 || never_drawn) &&
+            !(photo_first_wait == 2 && !never_drawn && IsDisplayAddress(address))) {
             const auto& extent = r.liverpool->DrawCbExtent(u32(target_cb));
             const u32 width = layout ? layout->size.width : u32(extent.width);
             const u32 height = layout ? layout->size.height : u32(extent.height);
             if (width >= 3840 && height >= 2160) {
+                if (photo_window != 0 && !IsDisplayAddress(address)) {
+                    if (photo_window_from == 0 || frame - photo_window_from > photo_window) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRT-PHOTOWIN: photo draw into {:#x} {}x{} out of a race, "
+                                    "never-drawn targets wait for {} frames (frame {})",
+                                    address, width, height, photo_window, frame);
+                    }
+                    photo_window_from = frame;
+                }
                 one_off_photo_output = true;
                 static std::atomic<u32> photo_logged{};
                 if (never_drawn) {
@@ -23520,9 +23590,29 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     ++unmap_generation;         // OPT-002
 }
 
+// PRT-DROPFAST (pr-tests, Round 10, RYGT_DROP_REGIONS_FAST, GT7 on; 0 = off): DropRegionsOver
+// visits only the regions and mirrors over the range (one index rebuild each, not one per mirror)
+// and erases the page tables by key when the range has fewer pages than the table has entries,
+// instead of walking every region and all 6 tables (cpu_recent_pages holds up to 1M entries).
+// Same result. Round 9: 18 of 34 stall samples (606 to 1876 ms, GPU submit thread) were in
+// DropRegionsOver under OnUnmap while GT7 unmapped memory.
+static bool DropRegionsFast() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DROP_REGIONS_FAST");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
 u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) {
     // NAT-146, FIX-GT7-086: regions over the range go (the device frees their buffers once the
     // GPU is done with them), and the mirrors over it. With `mutex` held. Returns how many.
+    if (DropRegionsFast()) {
+        return DropRegionsOverFast(address, size, mirror_reason);
+    }
     u32 dropped = 0;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
@@ -23563,6 +23653,89 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
         });
         std::erase_if(downloaded_ranges, [&](const auto& entry) {
             return entry.first < address + size && entry.first + 4096 > address;
+        });
+    }
+    return dropped;
+}
+
+u32 NativeRenderer::DropRegionsOverFast(VAddr address, u64 size, u32 mirror_reason) {
+    // PRT-DROPFAST: as DropRegionsOver, through the ordered maps and by key.
+    u32 dropped = 0;
+    if (size == 0) {
+        return 0;
+    }
+    const VAddr end = address + size < address ? ~VAddr{0} : address + size;
+    {
+        std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+        for (auto it = FirstRegion(address); it != regions.end() && it->second.begin < end;) {
+            if (it->second.end > address) {
+                buffer_log.Note(it->second.begin, it->second.end);
+                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                NoteHistory(it->second.begin, it->second.end - it->second.begin, 11,
+                            0); // DIAG-187 (diagnosis)
+                NoteOwnedMapChange(); // PERF-GT7-133
+                it = regions.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        if (dropped != 0) RebuildRegionIndex(); // PERF-SGT-046
+    }
+    {
+        Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DropMirrors};
+        u32 mirrors_dropped = 0;
+        std::unique_lock map_lock{buffer_map_mutex};
+        for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < end;) {
+            if (mirror_reason != ~u32{0} && MirrorDiagnosticEnabled())
+                NoteMirrorDiagnostic(mirror_reason, address, end, it->second.begin,
+                                     it->second.end, unmap_generation.load());
+            mirror_bytes -= it->second.end - it->second.begin;
+            ++buffer_generation; // OPT-003
+            buffer_log.Note(it->second.begin, it->second.end, true); // OPT-010
+            retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+            NoteOwnedMapChange(); // PERF-GT7-133
+            it = mirrors.erase(it); // freed once the GPU is done with it
+            ++mirrors_dropped;
+        }
+        if (mirrors_dropped != 0) RebuildMirrorIndex(); // PERF-SGT-046, once
+        dropped += mirrors_dropped;
+    }
+    // Every key in these tables is page aligned (fault_chunks: 64 KB aligned).
+    const VAddr first_page = Common::AlignDown(address, u64{4096});
+    const auto erase_pages = [&](auto& table, VAddr from, u64 step, auto&& overlaps) {
+        if (table.empty()) {
+            return;
+        }
+        const u64 steps = from >= end ? 0 : (end - from + step - 1) / step;
+        if (steps < table.size()) {
+            for (VAddr key = from; key < end && key >= from; key += step) {
+                table.erase(key);
+            }
+        } else {
+            std::erase_if(table, overlaps);
+        }
+    };
+    {
+        std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
+        erase_pages(page_snapshots, Common::AlignUp(address, u64{4096}), 4096,
+                    [&](const auto& snapshot) {
+                        return snapshot.first >= address && snapshot.first < end;
+                    });
+        erase_pages(cpu_recent_pages, first_page, 4096, [&](const auto& entry) {
+            return entry.first < end && entry.first + 4096 > address;
+        });
+        erase_pages(ahead_pages, first_page, 4096, [&](VAddr page) {
+            return page < end && page + 4096 > address;
+        });
+        erase_pages(remapped_pages, first_page, 4096, [&](VAddr page) {
+            return page < end && page + 4096 > address;
+        });
+        erase_pages(fault_chunks, address & ~VAddr{0xffff}, 64_KB, [&](const auto& entry) {
+            return entry.first < end && entry.first + 64_KB > address;
+        });
+        erase_pages(downloaded_ranges, first_page, 4096, [&](const auto& entry) {
+            return entry.first < end && entry.first + 4096 > address;
         });
     }
     return dropped;
@@ -24400,6 +24573,30 @@ void NativeRenderer::EvictImages() {
     }
     const bool trim_now = trim_on && prt_trim_over;
     const u64 kept_budget = trim_now ? std::min(texture_budget, trim_keep) : texture_budget;
+    // PRT-STAGESHRINK (pr-tests, Round 10, RYGT_STAGING_SHRINK, GT7 on; 0 = off): over the VRAM
+    // budget (PRT-VRAMTRIM, checked every 30 frames) the upload copies kept for reuse
+    // (PERF-GTS-362, up to 512 MB, in VRAM through Resizable BAR) are cut to 64 MB, oldest first;
+    // copies in the 256 MB reserve stay. Round 9: VMA memory the registry does not know went
+    // from 147 to 1280 MB after photos, while textures were only about 1 GB.
+    static const bool stage_shrink = [] {
+        const char* env = std::getenv("RYGT_STAGING_SHRINK");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    if (stage_shrink && trim_now && device && frame == prt_trim_checked) {
+        if (const u64 freed = device->TrimKeptCopies(64_MB); freed != 0) {
+            static std::atomic<u32> shrink_logged{};
+            if (const u32 n = shrink_logged++; n < 32 || n % 200 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-STAGESHRINK: over the VRAM budget, {:.0f} MB of kept upload copies "
+                            "freed (64 MB stay; frame {}, {} so far)",
+                            freed / 1048576.0, frame, n + 1);
+            }
+        }
+    }
+    static u64 prt_idle_texture_bytes = 0; // PRT-VRAMIDLE backoff: textures at the last PRT-VRAMREG
     // PRT-VRAMREG (pr-tests, RYGT_VRAM_REGISTRY_LOG, GT7, on; 0 = off): over the VRAM budget
     // (the PRT-VRAMKEEP check, every 30 frames), at most once every 10 s, what holds video memory
     // by kind and the 5 largest resources, before the kept textures are let go. Sizes are guest
@@ -24489,6 +24686,8 @@ void NativeRenderer::EvictImages() {
             for (const u64 bytes : kind_bytes) {
                 known += bytes;
             }
+            prt_idle_texture_bytes = kind_bytes[size_t(Kind::Textures)] +
+                                     kind_bytes[size_t(Kind::KeptTextures)]; // PRT-VRAMIDLE
             const auto* direct = r.buffer_cache.GetDirectMemory();
             const u64 imported = direct ? direct->ImportedHostBytes() : 0;
             const auto mb = [](u64 bytes) { return double(bytes) / 1048576.0; };
@@ -24547,6 +24746,28 @@ void NativeRenderer::EvictImages() {
                             mb(allocation_bytes > known ? allocation_bytes - known : 0),
                             mb(vram_used > block_bytes ? vram_used - block_bytes : 0),
                             mb(host_block_bytes));
+                // PRT-VRAMREG3 (pr-tests, Round 10, same switch): which native buffers make up
+                // the VMA memory the registry does not know (Round 9: 147 to 1280 MB).
+                if (device) {
+                    const auto buffers = device->VideoMemoryBufferBytes();
+                    const u64 owned = kind_bytes[size_t(Kind::Regions)] +
+                                      kind_bytes[size_t(Kind::Mirrors)];
+                    const u64 other_native =
+                        (buffers.device_local > owned ? buffers.device_local - owned : 0);
+                    const u64 unknown = allocation_bytes > known ? allocation_bytes - known : 0;
+                    const u64 named = other_native + buffers.upload + buffers.readback;
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-VRAMREG3: native buffers in VRAM: GPU-only {:.0f} MB ({:.0f} MB "
+                                "not regions or mirrors), upload {:.0f} MB (Resizable BAR), "
+                                "readback {:.0f} MB; upload copies kept for reuse {:.0f} MB ({:.0f} "
+                                "MB in VRAM), upload copy reserve {:.0f} MB; of the {:.0f} MB the "
+                                "registry does not know, {:.0f} MB not named (shadGT textures, "
+                                "stream buffers, buffer cache)",
+                                mb(buffers.device_local), mb(other_native), mb(buffers.upload),
+                                mb(buffers.readback), mb(buffers.kept_copies),
+                                mb(buffers.kept_copies_vram), mb(buffers.reserve), mb(unknown),
+                                mb(unknown > named ? unknown - named : 0));
+                }
             }
             // PRT-VRAMREG2 (Round 7, same switch): what the 1.2 to 1.4 GB of VMA memory the
             // registry does not know and the largest regions are.
@@ -24727,7 +24948,58 @@ void NativeRenderer::EvictImages() {
         }
         return Common::IsGt7() ? u64{30} : u64{0};
     }();
-    if (trim_now && trim_idle_frames != 0 && trim_idle_frames < KeepFrames &&
+    // PRT-VRAMIDLE backoff (pr-tests, Round 10, RYGT_VRAM_IDLE_BACKOFF, GT7 on; 0 = off): every
+    // 300 frames of early letting go, VRAM is compared with where it started; not lower by 32 MB,
+    // the early letting go pauses for 600 frames (the textures come straight back). It also
+    // pauses while textures (the last PRT-VRAMREG count) are under a quarter of the VRAM used:
+    // the memory over the budget is not theirs. Round 9: 42 GB of textures let go in 64 lines,
+    // never back under the budget.
+    static const bool idle_backoff = [] {
+        const char* env = std::getenv("RYGT_VRAM_IDLE_BACKOFF");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    static u64 idle_window_from = 0;
+    static u64 idle_window_vram = 0;
+    static u64 idle_paused_until = 0;
+    bool idle_paused = false;
+    if (idle_backoff && trim_now && trim_idle_frames != 0) {
+        if (frame < idle_paused_until) {
+            idle_paused = true;
+        } else if (frame % 30 == 0) {
+            const u64 vram_now = r.instance.GetDeviceMemoryUsage();
+            const char* why = nullptr;
+            if (prt_idle_texture_bytes != 0 && prt_idle_texture_bytes < vram_now / 4) {
+                why = "textures are under a quarter of the VRAM used";
+            } else if (idle_window_from == 0 || frame < idle_window_from) {
+                idle_window_from = frame;
+                idle_window_vram = vram_now;
+            } else if (frame - idle_window_from >= 300) {
+                if (vram_now + 32_MB > idle_window_vram) {
+                    why = "VRAM did not go down in 300 frames";
+                }
+                idle_window_from = frame;
+                idle_window_vram = vram_now;
+            }
+            if (why) {
+                idle_paused_until = frame + 600;
+                idle_window_from = 0;
+                idle_paused = true;
+                static std::atomic<u32> pause_logged{};
+                if (const u32 n = pause_logged++; n < 32 || n % 200 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-VRAMIDLE: early letting go paused for 600 frames: {} (VRAM {} "
+                                "MB, textures {} MB; frame {}, {} so far)",
+                                why, vram_now >> 20, prt_idle_texture_bytes >> 20, frame, n + 1);
+                }
+            }
+        }
+    } else if (!trim_now) {
+        idle_window_from = 0;
+    }
+    if (trim_now && !idle_paused && trim_idle_frames != 0 && trim_idle_frames < KeepFrames &&
         frame > trim_idle_frames) {
         static u64 idle_count = 0;
         static u64 idle_bytes = 0;

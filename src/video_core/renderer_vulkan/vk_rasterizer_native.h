@@ -1021,6 +1021,7 @@ private:
                               u64 granule = ~u64{0},u64 age = ~u64{0});
     /// NAT-146, FIX-GT7-086: regions and mirrors over the range go (with `mutex` held); how many.
     u32 DropRegionsOver(VAddr address, u64 size, u32 mirror_reason = ~u32{0});
+    u32 DropRegionsOverFast(VAddr address, u64 size, u32 mirror_reason); // PRT-DROPFAST
     /// FIX-GT7-122: a range starting in GT7's per-frame memory and ending past its known end
     /// moves the end there (at most 64 MB past the listed end, through mapped memory).
     void NotePerFrameRange(VAddr address, u64 size);

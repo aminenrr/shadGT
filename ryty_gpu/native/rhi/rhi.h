@@ -579,6 +579,22 @@ public:
     virtual void RecordPendingImageInit(CommandList& list) = 0;
     /// Whether images were created since the last RecordPendingImageInit.
     virtual bool PendingImageInit() = 0;
+
+    /// PRT-VRAMREG3 (pr-tests): live bytes of buffers this device allocated in video memory, by
+    /// MemoryKind (DeviceLocal, Upload, Readback), kept upload copies included; and the bytes of
+    /// upload copies kept for reuse (PERF-GTS-362) and of the upload copy reserve (PERF-GTS-364).
+    struct VideoMemoryBuffers {
+        u64 device_local = 0;
+        u64 upload = 0;
+        u64 readback = 0;
+        u64 kept_copies = 0;
+        u64 kept_copies_vram = 0;
+        u64 reserve = 0;
+    };
+    virtual VideoMemoryBuffers VideoMemoryBufferBytes() const { return {}; }
+    /// PRT-STAGESHRINK (pr-tests): frees kept upload copies (oldest first) until at most `keep`
+    /// bytes stay kept; returns the bytes freed.
+    virtual u64 TrimKeptCopies(u64 keep) { return 0; }
 };
 
 } // namespace Native::Rhi
