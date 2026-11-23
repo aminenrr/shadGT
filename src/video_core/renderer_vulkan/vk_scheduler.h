@@ -518,13 +518,17 @@ public:
     void StartPerfMonitor();
 
     /// Runs as soon as possible in another thread.
-    void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
-        DeferPriorityOperationAt(CurrentTick(), std::move(func));
+    /// PRT-FENCESITE (pr-tests): the caller is kept, to name the runner's wait for the GPU.
+    void DeferPriorityOperation(Common::UniqueFunction<void>&& func,
+                                std::source_location loc = std::source_location::current()) {
+        DeferPriorityOperationAt(CurrentTick(), std::move(func), loc);
     }
-    void DeferPriorityOperationAt(u64 tick, Common::UniqueFunction<void>&& func) {
+    void DeferPriorityOperationAt(u64 tick, Common::UniqueFunction<void>&& func,
+                                  std::source_location loc = std::source_location::current()) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), tick);
+            priority_pending_ops.emplace(std::move(func), tick, loc.file_name(), u32(loc.line()),
+                                         loc.function_name());
         }
         priority_pending_ops_cv.notify_one();
     }
@@ -584,6 +588,9 @@ private:
     struct PendingOp {
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
+        const char* file = nullptr; ///< PRT-FENCESITE: priority ops only
+        u32 line = 0;
+        const char* function = nullptr;
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;

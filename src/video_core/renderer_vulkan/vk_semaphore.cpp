@@ -67,7 +67,8 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    const bool timed = Common::StallCause::On(); // PRT-STALLCAUSE
+    const bool timed = Common::StallCause::On() ||
+                       Common::StallCause::FenceSiteOn(); // PRT-STALLCAUSE, PRT-FENCESITE
     const s64 wait_from = timed ? Common::StallCause::NowNs() : 0;
     const u64 behind = timed ? tick - std::min(tick, KnownGpuTick()) : 0;
     while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {

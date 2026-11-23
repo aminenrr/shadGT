@@ -52,6 +52,7 @@
 #include "video_core/renderer_vulkan/snapshot_protection_receipt.h"
 #include "common/mapping_writeback_gate.h"
 #include "common/scope_exit.h"
+#include "common/prt_hitch.h" // PRT-HITCHLOG (pr-tests, Round 11)
 #include "video_core/renderer_vulkan/snapshot_source_hints.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
@@ -3911,12 +3912,29 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     return s;
 }
 
-bool NativeRenderer::GpuTimeOn() {
+bool NativeRenderer::GpuTimeDiagOn() {
     static const bool on = [] {
         const char* env = Common::DiagEnv("SHADGT_DIAG_GPU_TIME");
         return env && env[0] == '1';
     }();
     return on;
+}
+
+// PRT-PASSTIME (pr-tests, Round 11, RYGT_PASS_TIME_LOG, GT7 on; 0 = off): the main stream's
+// lists get DIAG-GT7-001's GPU timestamps (one at each global barrier) and every 10 s one line
+// gives draws per frame, the time a list is open on the recorder per frame, and the GPU ms per
+// frame of the 8 largest render areas (a pass = the work between two barriers, keyed by the
+// largest area it drew into). For the cockpit view test (5 to 10 fps lower, GPU busy 80 to 88%).
+bool NativeRenderer::PassTimeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PASS_TIME_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+
+bool NativeRenderer::GpuTimeOn() {
+    return GpuTimeDiagOn() || PassTimeOn();
 }
 
 void NativeRenderer::GpuTimeBegin(Stream& s) {
@@ -4026,9 +4044,25 @@ void NativeRenderer::GpuTimeCollect() {
             for (u32 i = 0; i + 1 < t.used && i < t.segments.size(); ++i) {
                 segs.emplace_back(double(stamps[i + 1] - stamps[i]) * period_ms, i);
             }
+            if (PassTimeOn()) { // PRT-PASSTIME
+                auto& pt = pass_time_stats;
+                ++pt.lists;
+                pt.gpu_ms += list_ms;
+                pt.open_ms += (t.cpu_end_s - t.cpu_s) * 1000.0;
+                for (const auto& [ms, i] : segs) {
+                    const GpuSegment& g = t.segments[i];
+                    auto& pass = pt.by_target[g.draws ? (g.target_width << 16) | g.target_height
+                                                      : 0u];
+                    pass.gpu_ms += ms;
+                    ++pass.passes;
+                    pass.draws += g.draws;
+                    pt.draws += g.draws;
+                    pt.dispatches += g.dispatches;
+                }
+            }
             std::ranges::sort(segs, std::greater{});
-            const bool slow = list_ms >= 20.0 || gap_ms >= 20.0 ||
-                              (!segs.empty() && segs.front().first >= 10.0);
+            const bool slow = GpuTimeDiagOn() && (list_ms >= 20.0 || gap_ms >= 20.0 ||
+                                                  (!segs.empty() && segs.front().first >= 10.0));
             if (slow) {
                 ++st.slow;
                 std::string text;
@@ -4062,12 +4096,59 @@ void NativeRenderer::GpuTimeCollect() {
     const auto now = std::chrono::steady_clock::now();
     if (now - gpu_timing_report >= std::chrono::seconds{10}) {
         auto& st = gpu_time_stats;
-        LOG_WARNING(Render_Vulkan,
-                    "DIAG-GT7-001 (10 s): {} lists, {:.0f} ms on the GPU in them, longest list "
-                    "{:.2f} ms, longest gap between lists {:.2f} ms, {} slow lists logged",
-                    st.lists, st.busy_ms, st.max_list_ms, st.max_gap_ms, st.slow);
+        if (GpuTimeDiagOn()) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-001 (10 s): {} lists, {:.0f} ms on the GPU in them, longest "
+                        "list {:.2f} ms, longest gap between lists {:.2f} ms, {} slow lists logged",
+                        st.lists, st.busy_ms, st.max_list_ms, st.max_gap_ms, st.slow);
+        }
         st = {};
         gpu_timing_report = now;
+    }
+    if (PassTimeOn() && now - pass_time_stats.since >= std::chrono::seconds{10}) {
+        auto& pt = pass_time_stats;
+        const u64 frames = frame > pt.frame_at ? frame - pt.frame_at : 0;
+        if (frames != 0 && pt.lists != 0) {
+            const double per = 1.0 / double(frames);
+            std::vector<std::pair<u32, PassTimeStats::Pass>> passes(pt.by_target.begin(),
+                                                                    pt.by_target.end());
+            std::ranges::sort(passes, [](const auto& a, const auto& b) {
+                const u64 area_a = u64(a.first >> 16) * (a.first & 0xffff);
+                const u64 area_b = u64(b.first >> 16) * (b.first & 0xffff);
+                return area_a != area_b ? area_a > area_b : a.second.gpu_ms > b.second.gpu_ms;
+            });
+            std::string top;
+            u32 shown = 0;
+            double no_draw_ms = 0.0;
+            for (const auto& [key, pass] : passes) {
+                if (key == 0) {
+                    no_draw_ms = pass.gpu_ms;
+                    continue;
+                }
+                if (shown++ == 8) {
+                    break;
+                }
+                top += fmt::format("{}{}x{} {:.2f} ms ({:.1f} passes, {:.0f} draws)",
+                                   top.empty() ? "" : "; ", key >> 16, key & 0xffff,
+                                   pass.gpu_ms * per, double(pass.passes) * per,
+                                   double(pass.draws) * per);
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-PASSTIME [{}] 10 s, {} frames{}: per frame {:.0f} draws, {:.1f} "
+                        "dispatches, {:.1f} lists, list open on the recorder {:.2f} ms, GPU "
+                        "{:.2f} ms in lists; by render area (GPU ms a frame): {}; no-draw "
+                        "segments (compute, copies) {:.2f} ms",
+                        Common::PrtHitch::LocalClock(), frames,
+                        RytyRaceRunning() ? " in a race" : "", double(pt.draws) * per,
+                        double(pt.dispatches) * per, double(pt.lists) * per, pt.open_ms * per,
+                        pt.gpu_ms * per, top.empty() ? std::string{"none"} : top,
+                        no_draw_ms * per);
+        }
+        pt.by_target.clear();
+        pt.lists = pt.draws = pt.dispatches = 0;
+        pt.gpu_ms = pt.open_ms = 0.0;
+        pt.frame_at = frame;
+        pt.since = now;
     }
 }
 
@@ -5685,6 +5766,9 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
         }
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
+    if (Common::PrtHitch::On()) {
+        Common::PrtHitch::Add(Common::PrtHitch::Count::RegionCreates, 1); // PRT-HITCHLOG
+    }
     buffer_log.Note(begin, end); // OPT-010
     // DIAG-SGT-013: a region that covers part of a listed in-place range, and what asked for it.
     static std::atomic<u32> listed_regions_logged{0};
@@ -16183,6 +16267,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                        .instance_sgpr_offset = 0,
                        .tessellate_quads = quad_list && !quad_triangles,
                    };
+    // PRT-TESSWAIT (pr-tests, Round 11, RYGT_TESS_WAIT_LOG, GT7 on; 0 = off): a tessellated
+    // draw that waited for its pipeline (in the lookup or as a one-off), or was skipped because
+    // it was not built, is counted (PRT-HITCHLOG) and logged (rate limited, every 10 s a sum).
+    // Round 10: tessellated pipelines were built mid race (driver create 707 and 709 ms near the
+    // owner's 19:40 hitch). RYGT_TESS_SKIP_IN_RACE (default off) makes such a draw in a race skip
+    // instead of waiting (one-off waits only; the lookup itself is unchanged).
+    static const bool tess_wait_log = [] {
+        const char* env = std::getenv("RYGT_TESS_WAIT_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    static const bool tess_skip_in_race = [] {
+        const char* env = std::getenv("RYGT_TESS_SKIP_IN_RACE");
+        return env && env[0] == '1' && Common::IsGt7();
+    }();
+    const bool tess_draw = (tess_wait_log || tess_skip_in_race) && regs.stage_enable.hs_en != 0;
+    const auto tess_lookup_from = tess_draw && tess_wait_log
+                                      ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     const GraphicsPipeline* pipeline = [&]() -> const GraphicsPipeline* {
         PhaseClock clock{stats.phase_ns[0]};
         if (prepared && !quad_list && r.Rec().selected_pipeline == nullptr && prepared->pipeline &&
@@ -16201,8 +16303,64 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
 #endif
     // PERF-GTS-493: in a race (from its countdown with GAME-006) no one-off draw waits (FIX-198,
     // FIX-GT7-121/135/153): looked up again without waiting, skipped if not ready, and watched.
+    // PRT-TESSWAIT: the event lines and the 10 s sum (any recording thread, under a lock).
+    const auto tess_note = [&](const char* what, u64 waited_us) {
+        struct TessSum {
+            u64 waits = 0, wait_us = 0, skips = 0, lookups = 0, lookup_us = 0;
+            std::chrono::steady_clock::time_point since{};
+        };
+        static std::mutex sum_mutex;
+        static TessSum sum{};
+        static std::atomic<u32> tess_logged{};
+        std::scoped_lock sum_lock{sum_mutex};
+        const bool skip = waited_us == ~u64{0};
+        if (skip) {
+            ++sum.skips;
+            Common::PrtHitch::Add(Common::PrtHitch::Count::TessSkips, 1);
+        } else {
+            (what[0] == 'l' ? sum.lookups : sum.waits) += 1;
+            (what[0] == 'l' ? sum.lookup_us : sum.wait_us) += waited_us;
+            Common::PrtHitch::Add(Common::PrtHitch::Count::TessWaits, 1);
+            Common::PrtHitch::Add(Common::PrtHitch::Count::TessWaitUs, waited_us);
+            if (waited_us >= 1000) {
+                if (const u32 n = tess_logged++; n < 64 || n % 200 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-TESSWAIT [{}]: a tessellated draw waited {:.1f} ms for its "
+                                "pipeline ({}, {}; frame {}, {} so far)",
+                                Common::PrtHitch::LocalClock(), double(waited_us) / 1000.0, what,
+                                RytyRaceRunning() ? "in a race" : "out of a race", frame, n + 1);
+                }
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (sum.since == std::chrono::steady_clock::time_point{}) {
+            sum.since = now;
+        } else if (now - sum.since >= std::chrono::seconds{10}) {
+            if (sum.waits + sum.skips + sum.lookups != 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-TESSWAIT [{}] 10 s: tessellated draws: {} waited as one-offs "
+                            "({:.1f} ms), {} waited in the lookup ({:.1f} ms), {} skipped "
+                            "(pipeline not built){}",
+                            Common::PrtHitch::LocalClock(), sum.waits, sum.wait_us / 1000.0,
+                            sum.lookups, sum.lookup_us / 1000.0, sum.skips,
+                            tess_skip_in_race ? "; RYGT_TESS_SKIP_IN_RACE on" : "");
+            }
+            sum = {};
+            sum.since = now;
+        }
+    };
+    if (tess_draw && tess_wait_log && pipeline) {
+        const u64 lookup_us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - tess_lookup_from)
+                                      .count());
+        if (lookup_us >= 2000) {
+            tess_note("lookup", lookup_us); // built while the draw waited
+        }
+    }
     const bool one_off = !pipeline && DrawMustNotSkip(regs);
-    const bool must_wait = one_off && !PipelineCache::RaceNeverWaits();
+    // PRT-TESSWAIT: RYGT_TESS_SKIP_IN_RACE=1, a tessellated one-off draw in a race does not wait.
+    const bool tess_race_skip = tess_skip_in_race && tess_draw && one_off && RytyRaceRunning();
+    const bool must_wait = one_off && !PipelineCache::RaceNeverWaits() && !tess_race_skip;
     // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
     // FIX-GT7-135: so does a never-drawn level of a texture, out of play.
     // FIX-GT7-153: and a draw into a circuit's shadow map at its first drawing, or out of play.
@@ -16223,6 +16381,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         one_off_wait_ns_frame += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - wait_start)
                                          .count()); // FIX-GT7-102
+        if (tess_draw && tess_wait_log) { // PRT-TESSWAIT
+            tess_note(harmful_wait ? "one-off, no deadline" : "one-off, frame budget",
+                      u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - wait_start)
+                              .count()));
+        }
         if (pipeline) {
             ++stats.one_off_waits;
             stats.one_off_harmful_waits += harmful_wait && !one_off_kept_shadow ? 1 : 0;
@@ -16282,6 +16446,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         WatchOneOffs(regs, true);
     } else if (pipeline && OneOffDiagAll() && DrawMustNotSkip(regs)) {
         WatchOneOffs(regs, false); // DIAG-GT7-008: it would have waited
+    }
+    if (!pipeline && tess_draw && tess_wait_log) {
+        tess_note("skip", ~u64{0}); // PRT-TESSWAIT
     }
     if (!pipeline) {
         if (one_off_observer) {
@@ -19386,6 +19553,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     StripDraw(targets);       // DIAG-173 (diagnosis)
     if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001
         ++seg->draws;
+        if (u64(targets.state.width) * targets.state.height >
+            u64(seg->target_width) * seg->target_height) { // PRT-PASSTIME
+            seg->target_width = targets.state.width;
+            seg->target_height = targets.state.height;
+        }
         const u64 prims = u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1);
         if (prims > seg->max_prims) {
             const Shader::Info* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -23532,6 +23704,12 @@ void NativeRenderer::CancelLinearDownloads(VAddr address, u64 size) {
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Mapping}; // DIAG-SGT-023
+    // PRT-HITCHLOG (Round 11): guest unmaps and their time, for the hitch line.
+    const Common::PrtHitch::ScopeUs prt_unmap_time{Common::PrtHitch::Count::UnmapUs,
+                                                   Common::PrtHitch::On()};
+    if (Common::PrtHitch::On()) {
+        Common::PrtHitch::Add(Common::PrtHitch::Count::Unmaps, 1);
+    }
     // PERF-GTS-368: which part of an unmap waits (the guest-unmap trace has it as one phase).
     Native::SlowCallTrace<5> trace{true, "native-unmap",
         {"ui", "unwatch", "registry", "renderer-lock", "drop"}};
@@ -24540,6 +24718,17 @@ void NativeRenderer::EvictImages() {
         const u64 value = env && *env ? std::strtoull(env, nullptr, 10) : 256;
         return std::min<u64>(value, 2048) << 20;
     }();
+    // PRT-VRAMTRIM step (pr-tests, Round 11, RYGT_VRAMTRIM_STEP, off; 1 = on in GT7): the kept
+    // texture cap moves in steps instead of flipping between 256 MB (over the budget) and 2048
+    // MB (back under): at each check over the budget it halves (down to RYGT_VRAM_TRIM_KEEP_MB,
+    // 256), and goes up by 256 MB only when VRAM is 512 MB or more under the budget (up to the
+    // full kept budget). Round 10: the cap flipped 256 / 2048 / 256 ... (8 PRT-VRAMTRIM lines);
+    // each return to 2048 let kept textures grow back until the next cut. Logs PRT-VRAMTRIM step.
+    static const bool trim_step = [] {
+        const char* env = std::getenv("RYGT_VRAMTRIM_STEP");
+        return env && env[0] == '1' && Common::IsGt7();
+    }();
+    static u64 trim_step_cap = 0; // 0 = the full kept budget, not stepped yet
     if (trim_on && !pressure && frame >= prt_trim_checked + 30) {
         prt_trim_checked = frame;
         const u64 vram_budget = r.instance.GetTotalMemoryBudget();
@@ -24547,9 +24736,46 @@ void NativeRenderer::EvictImages() {
         const bool now_over = vram_budget && vram_used + vram_budget / 32 > vram_budget;
         const bool was_over = prt_trim_over;
         prt_trim_over = now_over || (was_over && vram_budget && vram_used + vram_budget / 8 > vram_budget);
+        if (trim_step && vram_budget && texture_budget != 0) {
+            const u64 floor_cap = std::min(texture_budget, trim_keep);
+            const u64 old_cap = trim_step_cap != 0 ? trim_step_cap : texture_budget;
+            u64 new_cap = old_cap;
+            if (now_over) {
+                new_cap = std::max(old_cap / 2, floor_cap);
+            } else if (vram_used + 512_MB <= vram_budget) {
+                new_cap = std::min(old_cap + 256_MB, texture_budget);
+            }
+            if (new_cap != old_cap) {
+                const u64 cut_from = kept_texture_bytes;
+                if (new_cap < old_cap && kept_texture_bytes > new_cap) {
+                    kept_textures.clear(); // chosen again within the new cap
+                    kept_texture_scan.clear();
+                    kept_texture_shard = 0;
+                    kept_texture_bytes = 0;
+                }
+                trim_step_cap = new_cap;
+                static std::atomic<u32> step_logged{};
+                static auto step_logged_at = std::chrono::steady_clock::time_point{};
+                static u32 step_unlogged = 0;
+                const auto now = std::chrono::steady_clock::now();
+                const u32 n = step_logged++;
+                if (n < 16 || now - step_logged_at >= std::chrono::seconds{10}) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-VRAMTRIM step: VRAM {} of {} MB, kept texture cap {} -> {} "
+                                "MB (kept textures {:.0f} MB; {} changes so far, {} not logged)",
+                                vram_used >> 20, vram_budget >> 20, old_cap >> 20, new_cap >> 20,
+                                cut_from / 1048576.0, n + 1, step_unlogged);
+                    step_logged_at = now;
+                    step_unlogged = 0;
+                } else {
+                    ++step_unlogged;
+                }
+            }
+        }
         if (prt_trim_over != was_over) {
             const u64 cut_from = kept_texture_bytes;
-            if (prt_trim_over && kept_texture_bytes > std::min(texture_budget, trim_keep)) {
+            if (!trim_step && prt_trim_over &&
+                kept_texture_bytes > std::min(texture_budget, trim_keep)) {
                 kept_textures.clear();
                 kept_texture_scan.clear();
                 kept_texture_shard = 0;
@@ -24565,14 +24791,19 @@ void NativeRenderer::EvictImages() {
                                             "a frame go"
                                           : "back under budget, kept textures as before",
                             cut_from / 1048576.0,
-                            (prt_trim_over ? std::min(texture_budget, trim_keep) : texture_budget) /
+                            (trim_step ? (trim_step_cap != 0 ? trim_step_cap : texture_budget)
+                             : prt_trim_over ? std::min(texture_budget, trim_keep)
+                                             : texture_budget) /
                                 1048576.0,
                             n + 1);
             }
         }
     }
     const bool trim_now = trim_on && prt_trim_over;
-    const u64 kept_budget = trim_now ? std::min(texture_budget, trim_keep) : texture_budget;
+    const u64 kept_budget =
+        trim_step && trim_on && trim_step_cap != 0
+            ? std::min(texture_budget, trim_step_cap) // PRT-VRAMTRIM step
+            : (trim_now ? std::min(texture_budget, trim_keep) : texture_budget);
     // PRT-STAGESHRINK (pr-tests, Round 10, RYGT_STAGING_SHRINK, GT7 on; 0 = off): over the VRAM
     // budget (PRT-VRAMTRIM, checked every 30 frames) the upload copies kept for reuse
     // (PERF-GTS-362, up to 512 MB, in VRAM through Resizable BAR) are cut to 64 MB, oldest first;
@@ -24585,7 +24816,52 @@ void NativeRenderer::EvictImages() {
         }
         return Common::IsGt7();
     }();
-    if (stage_shrink && trim_now && device && frame == prt_trim_checked) {
+    // PRT-STAGESHRINK v2 (pr-tests, Round 11, RYGT_STAGING_SHRINK_V2, GT7 on; 0 = Round 10's):
+    // at every check over the budget the kept copies outside the 256 MB upload copy reserve are
+    // all freed (not 64 MB kept), and while over the budget new ones outside it are freed instead
+    // of kept (copies in the reserve stay: freeing them returns nothing to the driver). Every
+    // 10 s over the budget one line says what is kept, in the reserve or not. Round 10: it fired
+    // 3 times, at the trim start; the ~240 MB kept all race were in the reserve.
+    static const bool stage_shrink_v2 = [] {
+        const char* env = std::getenv("RYGT_STAGING_SHRINK_V2");
+        if (env && *env) {
+            return env[0] != '0' && Common::IsGt7();
+        }
+        return Common::IsGt7();
+    }();
+    if (stage_shrink && stage_shrink_v2 && device) {
+        static bool keeping_outside = true;
+        if (keeping_outside == trim_now) {
+            keeping_outside = !trim_now;
+            device->SetKeepCopiesOutsideReserve(keeping_outside);
+        }
+        static u64 v2_freed = 0, v2_checks = 0;
+        static auto v2_logged_at = std::chrono::steady_clock::time_point{};
+        if (trim_now && frame == prt_trim_checked) {
+            ++v2_checks;
+            v2_freed += device->TrimKeptCopies(0);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - v2_logged_at >= std::chrono::seconds{10}) {
+                v2_logged_at = now;
+                const auto buffers = device->VideoMemoryBufferBytes();
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-STAGESHRINK v2 [{}]: over the VRAM budget, {} checks, {:.0f} MB "
+                            "of kept upload copies freed; kept now {:.0f} MB ({:.0f} MB in the "
+                            "reserve, {:.0f} MB outside), reserve {:.0f} MB with {:.0f} MB in use; "
+                            "{} copies freed instead of kept so far (frame {})",
+                            Common::PrtHitch::LocalClock(), v2_checks, v2_freed / 1048576.0,
+                            buffers.kept_copies / 1048576.0,
+                            buffers.kept_copies_reserved / 1048576.0,
+                            (buffers.kept_copies - std::min(buffers.kept_copies,
+                                                            buffers.kept_copies_reserved)) /
+                                1048576.0,
+                            buffers.reserve / 1048576.0, buffers.reserve_used / 1048576.0,
+                            buffers.not_kept, frame);
+                v2_freed = 0;
+                v2_checks = 0;
+            }
+        }
+    } else if (stage_shrink && trim_now && device && frame == prt_trim_checked) {
         if (const u64 freed = device->TrimKeptCopies(64_MB); freed != 0) {
             static std::atomic<u32> shrink_logged{};
             if (const u32 n = shrink_logged++; n < 32 || n % 200 == 0) {
@@ -24767,6 +25043,55 @@ void NativeRenderer::EvictImages() {
                                 mb(buffers.readback), mb(buffers.kept_copies),
                                 mb(buffers.kept_copies_vram), mb(buffers.reserve), mb(unknown),
                                 mb(unknown > named ? unknown - named : 0));
+                }
+                // PRT-VMAFREE (pr-tests, Round 11, RYGT_VMA_FREE_LOG, GT7 on; 0 = off): where the
+                // free memory inside VMA's device-local blocks sits, per memory type: blocks
+                // (dedicated allocations count as one block each), allocated and free MB, how many
+                // free ranges and the largest one (a few large ranges: whole blocks could go; many
+                // small ones: fragmentation), allocation sizes. Round 10: 6.4 to 6.8 GB of blocks
+                // with 1.5 to 1.7 GB free inside. Same cadence as PRT-VRAMREG; log only.
+                static const bool vma_free_log = [] {
+                    const char* env = std::getenv("RYGT_VMA_FREE_LOG");
+                    return !(env && env[0] == '0') && Common::IsGt7();
+                }();
+                if (vma_free_log && memory_props) {
+                    std::string types;
+                    for (u32 type = 0; type < memory_props->memoryTypeCount; ++type) {
+                        const auto& mt = memory_props->memoryTypes[type];
+                        if ((mt.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+                            continue;
+                        }
+                        const VmaDetailedStatistics& st = vma_stats.memoryType[type];
+                        if (st.statistics.blockCount == 0) {
+                            continue;
+                        }
+                        const u64 blocks_b = st.statistics.blockBytes;
+                        const u64 alloc_b = st.statistics.allocationBytes;
+                        const bool host_visible =
+                            (mt.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+                        types += fmt::format(
+                            "{}type {} ({}): {} blocks {:.0f} MB (avg {:.0f} MB), {:.0f} MB in {} "
+                            "allocations ({:.2f} KB to {:.1f} MB), free {:.0f} MB in {} ranges "
+                            "(largest {:.1f} MB)",
+                            types.empty() ? "" : "; ", type,
+                            host_visible ? "VRAM, CPU-visible (ReBAR)" : "VRAM",
+                            st.statistics.blockCount, mb(blocks_b),
+                            mb(blocks_b) / double(st.statistics.blockCount), mb(alloc_b),
+                            st.statistics.allocationCount,
+                            st.statistics.allocationCount ? double(st.allocationSizeMin) / 1024.0
+                                                          : 0.0,
+                            st.statistics.allocationCount ? mb(st.allocationSizeMax) : 0.0,
+                            mb(blocks_b > alloc_b ? blocks_b - alloc_b : 0), st.unusedRangeCount,
+                            st.unusedRangeCount ? mb(st.unusedRangeSizeMax) : 0.0);
+                    }
+                    const auto buffers = device ? device->VideoMemoryBufferBytes()
+                                                : Native::Rhi::Device::VideoMemoryBuffers{};
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-VMAFREE [{}]: {}; upload copy reserve (its own pool) {:.0f} "
+                                "MB with {:.0f} MB in use",
+                                Common::PrtHitch::LocalClock(),
+                                types.empty() ? std::string{"no device-local blocks"} : types,
+                                mb(buffers.reserve), mb(buffers.reserve_used));
                 }
             }
             // PRT-VRAMREG2 (Round 7, same switch): what the 1.2 to 1.4 GB of VMA memory the
@@ -25735,6 +26060,10 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    if (Common::PrtHitch::On() && registry) { // PRT-HITCHLOG: the uploads so far
+        Common::PrtHitch::Set(Common::PrtHitch::Count::UploadBytes,
+                              registry->GetStats().upload_bytes.load(std::memory_order_relaxed));
+    }
     BufferOrderFrame(); // PERF-SGT-120
     TrimIdleChunks();
     {

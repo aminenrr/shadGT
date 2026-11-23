@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
+#include <vector>
 #include <immintrin.h>
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
@@ -15,6 +19,7 @@
 #include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
+#include "common/prt_hitch.h"
 #include "common/prt_stall_cause.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
@@ -452,10 +457,91 @@ static void NoteFlush(const std::source_location& loc) {
 }
 
 #endif
+// PRT-SUBMITS (pr-tests, Round 11, RYGT_SUBMIT_LOG, GT7 on; 0 = off): every submit is counted by
+// the call site that forced it (Flush, Finish, or a Wait on work not yet submitted), and every
+// 10 s (with PRT-PERF) one line gives submits per game frame and the top sites. Round 10: races
+// did 17k to 23k submits per 10 s while GpuRecorder, VkCommands and Binder ran 55 to 75% each.
+// No behaviour change; a short lock per submit.
+namespace {
+bool PrtSubmitLogOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SUBMIT_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+struct PrtSubmitSite {
+    const char* file = nullptr;
+    u32 line = 0;
+    const char* function = nullptr;
+    const char* reason = nullptr;
+    u64 count = 0;
+};
+std::mutex prt_submit_mutex;
+std::array<PrtSubmitSite, 64> prt_submit_sites{}; // guarded by prt_submit_mutex
+size_t prt_submit_used = 0;                        // guarded by prt_submit_mutex
+u64 prt_submit_total = 0;                          // guarded by prt_submit_mutex
+thread_local const std::source_location* t_prt_submit_from = nullptr;
+thread_local const char* t_prt_submit_reason = nullptr;
+
+void PrtNoteSubmit(const std::source_location& loc, const char* reason) {
+    const char* file = loc.file_name();
+    const u32 line = u32(loc.line());
+    std::scoped_lock lock{prt_submit_mutex};
+    ++prt_submit_total;
+    for (size_t i = 0; i < prt_submit_used; ++i) {
+        auto& site = prt_submit_sites[i];
+        if (site.line == line && site.file == file && site.reason == reason) {
+            ++site.count;
+            return;
+        }
+    }
+    const size_t at = std::min(prt_submit_used, prt_submit_sites.size() - 1);
+    if (prt_submit_used < prt_submit_sites.size()) {
+        ++prt_submit_used;
+        prt_submit_sites[at] = {file, line, loc.function_name(), reason, 0};
+    }
+    ++prt_submit_sites[at].count; // full: the last slot takes the rest
+}
+
+std::string PrtSubmitText(u64 frames) {
+    std::vector<PrtSubmitSite> sites;
+    u64 total = 0;
+    {
+        std::scoped_lock lock{prt_submit_mutex};
+        sites.assign(prt_submit_sites.begin(), prt_submit_sites.begin() + prt_submit_used);
+        total = prt_submit_total;
+        prt_submit_total = 0;
+        for (size_t i = 0; i < prt_submit_used; ++i) {
+            prt_submit_sites[i].count = 0;
+        }
+    }
+    std::erase_if(sites, [](const PrtSubmitSite& site) { return site.count == 0; });
+    std::ranges::sort(sites, std::greater{}, &PrtSubmitSite::count);
+    std::string text = fmt::format("{} submits in {} game frames ({:.1f} a frame)", total, frames,
+                                   frames ? double(total) / double(frames) : 0.0);
+    for (size_t i = 0; i < sites.size() && i < 10; ++i) {
+        const auto& site = sites[i];
+        text += fmt::format("{} {} {}:{} {} {} ({:.1f} a frame)", i == 0 ? ";" : ",",
+                            site.reason, Common::StallCause::FileName(site.file), site.line,
+                            Common::StallCause::ShortFunction(site.function), site.count,
+                            frames ? double(site.count) / double(frames) : 0.0);
+    }
+    if (sites.size() > 10) {
+        text += fmt::format(", +{} more sites", sites.size() - 10);
+    }
+    return text;
+}
+} // namespace
+
 u64 Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
 #ifndef NDEBUG
     NoteFlush(loc);
 #endif
+    if (PrtSubmitLogOn()) { // PRT-SUBMITS
+        PrtNoteSubmit(t_prt_submit_from ? *t_prt_submit_from : loc,
+                      t_prt_submit_reason ? t_prt_submit_reason : "flush");
+    }
     // When flushing, we only send data to the driver; no waiting is necessary.
     return SubmitExecution(info);
 }
@@ -469,6 +555,9 @@ void Scheduler::Finish(std::source_location loc) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
+    if (PrtSubmitLogOn()) {
+        PrtNoteSubmit(loc, "finish (submit and wait)"); // PRT-SUBMITS
+    }
     SubmitExecution(info);
     Wait(presubmit_tick, loc);
 }
@@ -477,7 +566,14 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
+        // PRT-SUBMITS: counted at the waiting caller.
+        const std::source_location* const from = t_prt_submit_from;
+        const char* const reason = t_prt_submit_reason;
+        t_prt_submit_from = &loc;
+        t_prt_submit_reason = "wait on work not yet submitted";
         Flush(info);
+        t_prt_submit_from = from;
+        t_prt_submit_reason = reason;
     }
     if (work_semaphore.IsFree(tick)) {
         return;
@@ -487,7 +583,8 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
 #ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
 #endif
-    const Common::StallCause::FenceSite fence_site{loc.file_name(), u32(loc.line())}; // PRT-STALLCAUSE
+    const Common::StallCause::FenceSite fence_site{loc.file_name(), u32(loc.line()), nullptr,
+                                                   loc.function_name()}; // PRT-STALLCAUSE, PRT-FENCESITE
     work_semaphore.Wait(tick);
 #ifndef NDEBUG
     RecordGpuWait(loc, std::chrono::steady_clock::now() - start);
@@ -829,11 +926,37 @@ void Scheduler::PrtPerfThread(std::stop_token stoken) {
         if (cpu.empty()) {
             cpu = "n/a";
         }
+        // PRT-HITCHLOG (Round 11): the local clock, to match the owner's notes.
         LOG_WARNING(Render_Vulkan,
-                    "PRT-PERF {:.1f} s: GPU busy {:.0f}% (95%+ = GPU-bound), {} submits; VRAM {}; "
-                    "CPU {}",
+                    "PRT-PERF [{}] {:.1f} s: GPU busy {:.0f}% (95%+ = GPU-bound), {} submits; "
+                    "VRAM {}; CPU {}",
+                    Common::PrtHitch::LocalClock(),
                     std::chrono::duration<double>(now - window_start).count(),
                     samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick, vram, cpu);
+        // PRT-FENCESITE (Round 11): the CPU waits on the GPU in these 10 s, by call site.
+        if (Common::StallCause::FenceSiteOn()) {
+            const auto [count, us] =
+                Common::StallCause::FenceSiteTotals(Common::StallCause::SiteSlot::Window);
+            const std::string top = Common::StallCause::FenceSiteText(
+                Common::StallCause::SiteSlot::Window, 8, true);
+            if (count != 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-FENCESITE [{}] 10 s: {} fence waits that blocked, {:.0f} ms "
+                            "(threads add up); top sites by ms: {}",
+                            Common::PrtHitch::LocalClock(), count, double(us) / 1000.0, top);
+            }
+        }
+        // PRT-SUBMITS (Round 11): submits per game frame and the sites that forced them.
+        {
+            static u64 submit_frames_at = 0;
+            const u64 frames_now = Common::GetGameFrameTotals().frames;
+            const u64 frames = frames_now - std::min(frames_now, submit_frames_at);
+            submit_frames_at = frames_now;
+            if (PrtSubmitLogOn()) {
+                LOG_WARNING(Render_Vulkan, "PRT-SUBMITS [{}] 10 s: {}",
+                            Common::PrtHitch::LocalClock(), PrtSubmitText(frames));
+            }
+        }
         window_start = now;
         window_tick = tick;
         samples = 0;
@@ -858,7 +981,15 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        work_semaphore.Wait(op.gpu_tick);
+        {
+            // PRT-FENCESITE: the wait is named after the op's caller.
+            const Common::StallCause::FenceSite fence_site{
+                op.file, op.line,
+                Common::StallCause::FenceSiteOn() ? Common::StallCause::FenceKindOf(op.file, true)
+                                                  : nullptr,
+                op.function};
+            work_semaphore.Wait(op.gpu_tick);
+        }
         if (stoken.stop_requested()) {
             break;
         }

@@ -590,11 +590,17 @@ public:
         u64 kept_copies = 0;
         u64 kept_copies_vram = 0;
         u64 reserve = 0;
+        u64 kept_copies_reserved = 0; ///< PRT-STAGESHRINK v2: kept copies inside the reserve
+        u64 reserve_used = 0;         ///< PRT-STAGESHRINK v2: reserve bytes allocated
+        u64 not_kept = 0;             ///< PRT-STAGESHRINK v2: copies freed instead of kept
     };
     virtual VideoMemoryBuffers VideoMemoryBufferBytes() const { return {}; }
     /// PRT-STAGESHRINK (pr-tests): frees kept upload copies (oldest first) until at most `keep`
     /// bytes stay kept; returns the bytes freed.
     virtual u64 TrimKeptCopies(u64 keep) { return 0; }
+    /// PRT-STAGESHRINK v2 (pr-tests, Round 11): false = upload copies outside the reserve are
+    /// freed when the GPU is done with them instead of kept for reuse.
+    virtual void SetKeepCopiesOutsideReserve(bool keep) {}
 };
 
 } // namespace Native::Rhi

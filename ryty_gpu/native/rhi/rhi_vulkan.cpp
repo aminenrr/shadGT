@@ -624,6 +624,12 @@ public:
     }
     VideoMemoryBuffers VideoMemoryBufferBytes() const override;
     u64 TrimKeptCopies(u64 keep) override;
+    /// PRT-STAGESHRINK v2: copies outside the reserve are kept for reuse.
+    std::atomic<bool> keep_outside_reserve{true};
+    u64 recycle_not_kept = 0; ///< PRT-STAGESHRINK v2, guarded by recycle_mutex
+    void SetKeepCopiesOutsideReserve(bool keep) override {
+        keep_outside_reserve.store(keep, std::memory_order_relaxed);
+    }
     u64 recycle_reused = 0, recycle_allocated = 0, recycle_allocated_reserved = 0,
         recycle_dropped = 0, recycle_evicted = 0;
     std::chrono::steady_clock::time_point recycle_report{};
@@ -1221,7 +1227,13 @@ void VulkanDevice::Recycle(const RecycledBuffer& buffer) {
     bool keep = false;
     {
         std::scoped_lock lock{recycle_mutex};
-        if (recycled_bytes + buffer.bytes <= RecycleLimit()) {
+        // PRT-STAGESHRINK v2: over the VRAM budget, copies outside the reserve are not kept.
+        const bool keepable =
+            buffer.reserved || keep_outside_reserve.load(std::memory_order_relaxed);
+        if (!keepable) {
+            ++recycle_not_kept;
+        }
+        if (keepable && recycled_bytes + buffer.bytes <= RecycleLimit()) {
             recycled.push_back(buffer);
             recycled_bytes += buffer.bytes;
             recycled_vram_bytes += buffer.vram ? buffer.bytes : 0; // PRT-VRAMREG3
@@ -1275,6 +1287,15 @@ Device::VideoMemoryBuffers VulkanDevice::VideoMemoryBufferBytes() const {
     out.kept_copies = recycled_bytes;
     out.kept_copies_vram = recycled_vram_bytes;
     out.reserve = upload_reserve_bytes;
+    for (const RecycledBuffer& kept : recycled) { // PRT-STAGESHRINK v2
+        out.kept_copies_reserved += kept.reserved ? kept.bytes : 0;
+    }
+    out.not_kept = recycle_not_kept;
+    if (out.reserve != 0 && upload_reserve != VK_NULL_HANDLE) { // set before upload_reserve_bytes
+        VmaStatistics pool_stats{};
+        vmaGetPoolStatistics(allocator, upload_reserve, &pool_stats);
+        out.reserve_used = pool_stats.allocationBytes;
+    }
     return out;
 }
 

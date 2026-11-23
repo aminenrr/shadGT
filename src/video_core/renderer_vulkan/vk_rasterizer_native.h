@@ -293,6 +293,7 @@ private:
         u64 upload_bytes = 0;
         u64 max_groups = 0, max_groups_cs = 0; ///< the largest direct dispatch and its program
         u64 max_prims = 0, max_prims_ps = 0;   ///< the largest draw (indices x instances), its PS
+        u32 target_width = 0, target_height = 0; ///< PRT-PASSTIME: its largest render area
     };
     /// DIAG-GT7-001: a list's timestamps (at its start, after each global barrier, at its end).
     struct GpuTiming {
@@ -1174,6 +1175,8 @@ private:
     void SyncUiRange(VAddr address, u64 size, bool keep);
     /// DIAG-GT7-001: GPU timestamps of the main stream's lists.
     static bool GpuTimeOn();
+    static bool GpuTimeDiagOn(); ///< DIAG-GT7-001's own lines (SHADGT_DIAG_GPU_TIME=1)
+    static bool PassTimeOn();    ///< PRT-PASSTIME (RYGT_PASS_TIME_LOG)
     void GpuTimeBegin(Stream& s);
     void GpuTimeMark(Stream& s);
     void GpuTimeEnd(Stream& s, u64 tick);
@@ -1193,6 +1196,18 @@ private:
         u64 lists = 0, slow = 0;
         double busy_ms = 0.0, max_list_ms = 0.0, max_gap_ms = 0.0;
     } gpu_time_stats;
+    /// PRT-PASSTIME (pr-tests, Round 11): GPU time by render area over 10 s.
+    struct PassTimeStats {
+        struct Pass {
+            double gpu_ms = 0.0;
+            u64 passes = 0, draws = 0;
+        };
+        std::unordered_map<u32, Pass> by_target; ///< width << 16 | height (0: no draw)
+        u64 lists = 0, draws = 0, dispatches = 0;
+        double gpu_ms = 0.0, open_ms = 0.0;
+        u64 frame_at = 0;
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    } pass_time_stats;
     /// OPT-013..015 (SHADGT_NATIVE_REUSE=0 turns them off): work the previous draws of the list
     /// already did is not done again.
     static bool ReuseOn();

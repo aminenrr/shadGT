@@ -14,6 +14,7 @@
 #include <imgui.h>
 
 #include "common/perf_monitor.h"
+#include "common/prt_hitch.h"
 #include "common/prt_stall_cause.h"
 #include "common/prt_stall_sample.h"
 #include "common/sampling_profiler.h"
@@ -97,9 +98,14 @@ void CompileNoticeUI::TakeCauseBaseline() {
     for (size_t i = 0; i < cause_site_us.size(); ++i) {
         cause_site_us[i] = SC::g_site_us[i].load(std::memory_order_relaxed);
     }
-    std::scoped_lock lock{SC::g_fence_mutex};
-    SC::g_fence_longest_us = 0;
-    SC::g_fence_longest.clear();
+    {
+        std::scoped_lock lock{SC::g_fence_mutex};
+        SC::g_fence_longest_us = 0;
+        SC::g_fence_longest.clear();
+    }
+    if (SC::FenceSiteOn()) {
+        SC::FenceSiteText(SC::SiteSlot::Stall, 0, true); // PRT-FENCESITE: from this frame on
+    }
 }
 
 std::string CompileNoticeUI::CauseText() {
@@ -138,12 +144,19 @@ std::string CompileNoticeUI::CauseText() {
         longest_ms = double(SC::g_fence_longest_us) / 1000.0;
         longest = SC::g_fence_longest;
     }
+    // PRT-FENCESITE (Round 11): the fence waits of the stall by call site.
+    std::string fence_sites;
+    if (SC::FenceSiteOn()) {
+        const std::string top = SC::FenceSiteText(SC::SiteSlot::Stall, 6, false);
+        fence_sites = fmt::format("; PRT-FENCESITE: {}", top.empty() ? "no fence waits" : top);
+    }
     return fmt::format(
         "PRT-STALLCAUSE: guest clock held {:.0f} ms ({}), fence waits {:.0f} ms ({}, longest "
         "{:.0f} ms at {}), DIAG-GTS-518 sites ms [{}], present wait {:.0f} ms ({}), acquire wait "
-        "{:.0f} ms ({}), pipeline compile waits {:.0f} ms",
+        "{:.0f} ms ({}), pipeline compile waits {:.0f} ms{}",
         hold_ms, holds, fence_ms, fences, longest_ms, longest.empty() ? "-" : longest,
-        sites.empty() ? "none" : sites, present_ms, presents, acquire_ms, acquires, compile_ms);
+        sites.empty() ? "none" : sites, present_ms, presents, acquire_ms, acquires, compile_ms,
+        fence_sites);
 }
 
 void CompileNoticeUI::Draw() {
@@ -183,8 +196,9 @@ void CompileNoticeUI::Draw() {
                 stall_sampled = false;
                 const double ms = double(now.time_since_epoch().count() - stall_from) / 1e6;
                 LOG_WARNING(Render_Vulkan,
-                            "PRT-STALLLOG: no new game frame for {:.0f} ms, {} (most build jobs "
-                            "{}), frame {}{}{}",
+                            "PRT-STALLLOG [{}]: no new game frame for {:.0f} ms, {} (most build "
+                            "jobs {}), frame {}{}{}",
+                            Common::PrtHitch::LocalClock(), // PRT-HITCHLOG (Round 11)
                             ms, stall_jobs_max != 0 ? "pipelines building" : "nothing compiling",
                             stall_jobs_max, Common::GetGameFrameTotals().frames,
                             cause_on ? "; " : "", cause_on ? CauseText() : std::string{});

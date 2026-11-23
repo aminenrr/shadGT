@@ -26,6 +26,7 @@
 
 #include "common/assert.h"
 #include "common/prt_quiet_logs.h"
+#include "common/prt_hitch.h" // PRT-TESSWAIT (pr-tests, Round 11)
 #include "video_core/title_defaults.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
@@ -1657,6 +1658,39 @@ GraphicsPipeline::GraphicsPipeline(
         if (create_ms >= 20.0 || !Common::PrtQuietLogs()) {
             LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms",
                         debug_str, create_ms);
+        }
+        // PRT-TESSWAIT (pr-tests, Round 11, RYGT_TESS_WAIT_LOG, GT7 on; 0 = off): whether the
+        // driver cache kept a tessellated pipeline (a whole create, no libraries): a create of
+        // 30 ms or more compiled it. Each key's builds in this session are counted; a second
+        // build of a key means this renderer let the first pipeline go. Round 10: 9d049f35 and
+        // 0bf4547 were built twice in a session, 0c4fac70 five times at 565 to 707 ms.
+        static const bool tess_wait_log = [] {
+            const char* env = std::getenv("RYGT_TESS_WAIT_LOG");
+            return !(env && env[0] == '0') && Common::IsGt7();
+        }();
+        if (tessellated && tess_wait_log) {
+            Common::PrtHitch::Add(Common::PrtHitch::Count::TessBuilds, 1);
+            Common::PrtHitch::Add(Common::PrtHitch::Count::TessBuildUs, u64(create_ms * 1000.0));
+            static std::mutex builds_mutex;
+            static std::unordered_map<size_t, u32> builds;
+            u32 built = 0;
+            {
+                std::scoped_lock lock{builds_mutex};
+                built = ++builds[std::hash<GraphicsPipelineKey>{}(key)];
+            }
+            static std::atomic<u32> tess_logged{};
+            if (const u32 n = tess_logged++; n < 128 || n % 100 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-TESSWAIT [{}]: tessellated pipeline {} driver create {:.1f} ms: "
+                            "{}; build {} of this key this session{}; optimizer {}, driver cache "
+                            "{} ({} so far)",
+                            Common::PrtHitch::LocalClock(), debug_str, create_ms,
+                            create_ms >= 30.0 ? "compiled (not in the driver cache)"
+                                              : "from the driver cache",
+                            built, built > 1 ? " (the earlier pipeline was let go)" : "",
+                            plain_tessellated ? "off (DISABLE_OPTIMIZATION)" : "on",
+                            pipeline_cache ? "in use" : "none", n + 1);
+            }
         }
     }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",

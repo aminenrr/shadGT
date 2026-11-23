@@ -19,12 +19,15 @@
 #include "ryty_gpu/native/memory_range_runs.h"
 #include "ryty_gpu/native/epoch_lookup_memo.h"
 #include <string>
+#include <unordered_map>
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
 #include "common/thread.h"
 #include "common/logging/log.h"
+#include "common/prt_hitch.h" // PRT-VIEWCHURN (pr-tests, Round 11)
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -487,7 +490,89 @@ u64 ViewPiece() {
 }
 } // namespace
 
+// PRT-VIEWCHURN (pr-tests, Round 11, RYGT_VIEW_CHURN_LOG, GT7 on; 0 = off): every 10 s one line:
+// imported views made (ms per import, longest), dropped on unmap, imported again within 10 s of
+// being dropped (churn), and the views held. Feeds PRT-HITCHLOG. Round 10: views stayed at 1200
+// to 1400 (2 MB each: GT7 maps its memory in 2 MB pieces; there is no cap in this code) while
+// DIAG-132 dropped the same ranges that were then imported again. Log only.
+namespace {
+bool PrtViewChurnOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_VIEW_CHURN_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+struct PrtViewChurn {
+    std::mutex mutex;
+    std::unordered_map<VAddr, s64> dropped_at; ///< view base -> when it was dropped (us)
+    u64 imports = 0, import_us = 0, import_max_us = 0, drops = 0, again = 0, fails = 0;
+    s64 since_us = 0;
+};
+PrtViewChurn& ViewChurn() {
+    static PrtViewChurn churn;
+    return churn;
+}
+/// With the churn's mutex held: the 10 s line, when due.
+void PrtViewChurnReport(PrtViewChurn& churn, s64 now_us, size_t views, u64 bytes) {
+    if (churn.since_us == 0) {
+        churn.since_us = now_us;
+        return;
+    }
+    if (now_us - churn.since_us < 10'000'000) {
+        return;
+    }
+    const double seconds = double(now_us - churn.since_us) / 1e6;
+    if (churn.imports + churn.drops + churn.fails != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-VIEWCHURN [{}] {:.0f} s: {} views imported ({:.1f}/s, {:.2f} ms each, "
+                    "longest {:.1f} ms, {:.0f} ms in all), {} not imported, {} dropped on unmap "
+                    "({:.1f}/s), {} imported again within 10 s of a drop; {} views held ({} MiB)",
+                    Common::PrtHitch::LocalClock(), seconds, churn.imports,
+                    double(churn.imports) / seconds,
+                    churn.imports ? double(churn.import_us) / double(churn.imports) / 1000.0 : 0.0,
+                    double(churn.import_max_us) / 1000.0, double(churn.import_us) / 1000.0,
+                    churn.fails, churn.drops, double(churn.drops) / seconds, churn.again, views,
+                    bytes >> 20);
+    }
+    churn.imports = churn.import_us = churn.import_max_us = churn.drops = churn.again =
+        churn.fails = 0;
+    churn.since_us = now_us;
+    std::erase_if(churn.dropped_at,
+                  [&](const auto& entry) { return now_us - entry.second > 10'000'000; });
+}
+} // namespace
+
 bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
+    // PRT-VIEWCHURN: the import's time and whether the range was dropped a moment ago.
+    const s64 churn_from = PrtViewChurnOn() ? Common::PrtHitch::NowUs() : 0;
+    VAddr churn_base = 0;
+    bool churn_done = false;
+    SCOPE_EXIT {
+        if (churn_from == 0) {
+            return;
+        }
+        const s64 now_us = Common::PrtHitch::NowUs();
+        const u64 us = u64(std::max<s64>(now_us - churn_from, 0));
+        auto& churn = ViewChurn();
+        std::scoped_lock churn_lock{churn.mutex};
+        if (churn_done) {
+            ++churn.imports;
+            churn.import_us += us;
+            churn.import_max_us = std::max(churn.import_max_us, us);
+            Common::PrtHitch::Add(Common::PrtHitch::Count::ViewImports, 1);
+            Common::PrtHitch::Add(Common::PrtHitch::Count::ViewImportUs, us);
+            if (const auto it = churn.dropped_at.find(churn_base); it != churn.dropped_at.end()) {
+                if (now_us - it->second <= 10'000'000) {
+                    ++churn.again;
+                }
+                churn.dropped_at.erase(it);
+            }
+        } else if (us >= 50) {
+            ++churn.fails; // a real attempt (not a quick refusal)
+        }
+        PrtViewChurnReport(churn, now_us, views.size(), imported_bytes.load());
+    };
     Native::SlowCallTrace<8> trace{Native::trace_guest_hash_calls, "import-guest-view",
         {"guest-view", "map-alias", "host-properties", "allocate-memory", "create-bind-buffer",
          "device-address", "map-pages", "store-view"}};
@@ -714,6 +799,8 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
         LOG_WARNING(Render_Vulkan, "D1: imported view {:#x}+{:#x} ({} views, {} MiB)", base,
                     end - base, views.size(), imported_bytes.load() >> 20);
     }
+    churn_base = base; // PRT-VIEWCHURN
+    churn_done = true;
     return true;
 #else
     return false;
@@ -957,6 +1044,15 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
         imported_coverage.Clear(view.begin, view.end);
         UnmapPages(view.begin, view.end);
         imported_bytes -= view.end - view.begin;
+        if (PrtViewChurnOn()) { // PRT-VIEWCHURN
+            auto& churn = ViewChurn();
+            std::scoped_lock churn_lock{churn.mutex};
+            ++churn.drops;
+            if (churn.dropped_at.size() < 65536) {
+                churn.dropped_at[view.begin] = Common::PrtHitch::NowUs();
+            }
+            Common::PrtHitch::Add(Common::PrtHitch::Count::ViewDrops, 1);
+        }
         // DIAG-132: views dropped while GPU work may still read them.
         static std::atomic<u32> dropped{};
         if (const u32 n = ++dropped; n <= 40 || n % 100 == 0) {

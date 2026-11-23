@@ -8,6 +8,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
+#include "common/prt_hitch.h"
 #include "common/prt_stall_cause.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
@@ -1741,7 +1742,8 @@ void Presenter::WaitFrameDrawn(const Frame* frame) {
     if (!enabled || !frame || !frame->ready_scheduler || !rasterizer->Native()) {
         return;
     }
-    const Common::StallCause::FenceSite fence_site{"flip wait (frame ready)", 0}; // PRT-STALLCAUSE
+    const Common::StallCause::FenceSite fence_site{"flip wait (frame ready)", 0,
+                                                   "present / flip"}; // PRT-STALLCAUSE
     frame->ready_scheduler->GetWorkSemaphore()->Wait(frame->ready_tick);
 #else
     (void)frame;
@@ -1855,6 +1857,124 @@ struct PresentSteps {
     }
 };
 } // namespace
+
+#ifdef RYTY_GPU
+bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
+#endif
+
+// PRT-HITCHLOG (pr-tests, Round 11, RYGT_HITCH_LOG, GT7 50 ms; 0 = off): called at every game
+// frame shown; a frame of the threshold or more logs the local clock and what happened in it
+// (see common/prt_hitch.h). At most one line every 250 ms; the lines left out are counted in
+// the next one.
+static void PrtHitchFrame(const Instance& instance) {
+    if (!Common::PrtHitch::On()) {
+        return;
+    }
+    namespace PH = Common::PrtHitch;
+    namespace SC = Common::StallCause;
+    struct Totals {
+        std::array<u64, size_t(PH::Count::Count)> counts{};
+        u64 fence_us = 0, fences = 0, compile_us = 0, present_us = 0, hold_us = 0;
+        void Take() {
+            for (size_t i = 0; i < counts.size(); ++i) {
+                counts[i] = PH::g_counts[i].load(std::memory_order_relaxed);
+            }
+            fence_us = SC::g_wait_us[size_t(SC::Wait::Fence)].load(std::memory_order_relaxed);
+            fences = SC::g_wait_count[size_t(SC::Wait::Fence)].load(std::memory_order_relaxed);
+            present_us = SC::g_wait_us[size_t(SC::Wait::Present)].load(std::memory_order_relaxed) +
+                         SC::g_wait_us[size_t(SC::Wait::Acquire)].load(std::memory_order_relaxed);
+            hold_us = SC::g_wait_us[size_t(SC::Wait::ClockHold)].load(std::memory_order_relaxed);
+            compile_us = 0;
+            for (size_t i = 1; i < SC::SiteCount; ++i) { // DIAG-GTS-518 sites but "other"
+                compile_us += SC::g_site_us[i].load(std::memory_order_relaxed);
+            }
+        }
+    };
+    static Totals last{};
+    static s64 last_us = 0;
+    static s64 logged_us = 0;
+    static u64 not_logged = 0;
+    static u64 hitches = 0;
+    const s64 now_us = PH::NowUs();
+    Totals now{};
+    now.Take();
+    const s64 frame_us = last_us != 0 ? now_us - last_us : 0;
+    last_us = now_us;
+    const Totals before = last;
+    last = now;
+    if (frame_us < s64(PH::ThresholdMs()) * 1000) {
+        if (SC::FenceSiteOn()) {
+            SC::FenceSiteText(SC::SiteSlot::Hitch, 0, true); // the next frame's sites only
+        }
+        return;
+    }
+    ++hitches;
+    if (logged_us != 0 && now_us - logged_us < 250'000) {
+        ++not_logged;
+        if (SC::FenceSiteOn()) {
+            SC::FenceSiteText(SC::SiteSlot::Hitch, 0, true);
+        }
+        return;
+    }
+    logged_us = now_us;
+    const auto d = [&](PH::Count count) {
+        return now.counts[size_t(count)] - before.counts[size_t(count)];
+    };
+    const auto ms = [](u64 us) { return double(us) / 1000.0; };
+    const double frame_ms = double(frame_us) / 1000.0;
+    const double fence_ms = ms(now.fence_us - before.fence_us);
+    const double compile_ms = ms(now.compile_us - before.compile_us);
+    const double tess_wait_ms = ms(d(PH::Count::TessWaitUs));
+    const double tess_build_ms = ms(d(PH::Count::TessBuildUs));
+    const double import_ms = ms(d(PH::Count::ViewImportUs));
+    const double unmap_ms = ms(d(PH::Count::UnmapUs));
+    const double present_ms = ms(now.present_us - before.present_us);
+    const double hold_ms = ms(now.hold_us - before.hold_us);
+    // The cause: the largest of the waits the frame had, if it is a fifth of the frame or more.
+    const char* cause = "not seen (GPU-bound, or game CPU work)";
+    double cause_ms = frame_ms / 5.0;
+    const auto pick = [&](double value, const char* name) {
+        if (value >= cause_ms) {
+            cause_ms = value;
+            cause = name;
+        }
+    };
+    pick(fence_ms, "fence waits");
+    pick(compile_ms, "pipeline compile wait");
+    pick(tess_wait_ms, "tessellated pipeline wait");
+    pick(import_ms, "imported view imports");
+    pick(unmap_ms, "guest unmaps");
+    pick(present_ms, "present / acquire wait");
+    pick(hold_ms, "guest clock held");
+    if (cause_ms == frame_ms / 5.0 && d(PH::Count::TessBuilds) != 0) {
+        cause = "tessellated pipeline built on a worker (driver CPU)";
+    }
+    std::string fence_top;
+    if (SC::FenceSiteOn()) {
+        fence_top = SC::FenceSiteText(SC::SiteSlot::Hitch, 3, true);
+    }
+    const u64 vram = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() >> 20 : 0;
+    bool in_race = false;
+#ifdef RYTY_GPU
+    in_race = RytyRaceRunning();
+#endif
+    LOG_WARNING(Render_Vulkan,
+                "PRT-HITCHLOG [{}]: frame {:.0f} ms{}, cause: {}; fence waits {:.0f} ms ({}{}{}), "
+                "pipeline compile waits {:.0f} ms, tess pipelines: waits {} ({:.0f} ms), skips {}, "
+                "built {} ({:.0f} ms driver); imported views {} ({:.1f} ms), dropped {}; unmaps {} "
+                "({:.1f} ms); region creates {}; upload {:.1f} MB; present/acquire wait {:.0f} ms; "
+                "VRAM {} MB ({} hitches so far{})",
+                PH::LocalClock(), frame_ms, in_race ? " in a race" : "", cause, fence_ms,
+                now.fences - before.fences, fence_top.empty() ? "" : "; top: ", fence_top,
+                compile_ms, d(PH::Count::TessWaits), tess_wait_ms, d(PH::Count::TessSkips),
+                d(PH::Count::TessBuilds), tess_build_ms, d(PH::Count::ViewImports), import_ms,
+                d(PH::Count::ViewDrops), d(PH::Count::Unmaps), unmap_ms,
+                d(PH::Count::RegionCreates), double(d(PH::Count::UploadBytes)) / 1048576.0,
+                present_ms, vram, hitches,
+                not_logged ? fmt::format(", {} not logged (one line per 250 ms)", not_logged)
+                           : std::string{});
+    not_logged = 0;
+}
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                         u64 anti_lag_frame) {
@@ -2323,6 +2443,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         Common::NoteGameFrameCadence();
         Common::NoteGameFrame();
         RyDiag::FrameShown();
+        PrtHitchFrame(instance); // PRT-HITCHLOG
     }
 }
 
