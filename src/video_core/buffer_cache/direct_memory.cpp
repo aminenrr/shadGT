@@ -26,6 +26,7 @@
 
 #include "common/thread.h"
 #include "common/logging/log.h"
+#include "common/game_title.h"
 #include "common/prt_hitch.h" // PRT-VIEWCHURN (pr-tests, Round 11)
 #include "common/scope_exit.h"
 #include "common/thread.h"
@@ -131,7 +132,10 @@ DirectMemory::~DirectMemory() {
     imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
     // Active mapped views can still be referenced by the final non-native submission. Their
     // lease deleters free Vulkan memory when the map is destroyed immediately after this body.
-    if (!views.empty() || !held_native_releases.empty()) scheduler.Finish();
+    if (!views.empty() || !held_native_releases.empty() || !async_leases.empty()) {
+        scheduler.Finish();
+    }
+    async_leases.clear(); // PRT-LEASEASYNC: the GPU has finished
 }
 
 bool DirectMemory::Enabled() {
@@ -837,8 +841,109 @@ std::optional<std::vector<DirectMemory::LeasedPart>> DirectMemory::PlanLeasedPar
         });
 }
 
+// PRT-LEASEASYNC (pr-tests, Round 12, RYGT_LEASE_RETIRE_ASYNC, default off, GT7 only): unmapped
+// imported views' leases were each handed to the priority thread, which blocked on their GPU tick
+// (Round 11: 2.8-4.4k waits per 10 s, up to 10 ms each) and held up the readback fence signals
+// queued behind them. With the switch the leases wait here; every later retire call (and the GPU
+// idle release) checks the GPU's tick without waiting and frees the ones it passed. A lease keeps
+// its VkBuffer, memory and alias alive, so nothing is freed or reused before its tick. Leases that
+// wait longer than 250 ms, or more than 2048 batches, go to the priority thread as before.
+static bool PrtLeaseAsync() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_LEASE_RETIRE_ASYNC");
+        const bool value = env && env[0] == '1' && Common::IsGt7();
+        if (value) {
+            LOG_INFO(Render_Vulkan, "PRT-LEASEASYNC: on, unmapped view leases retire without "
+                                    "waiting on the priority thread");
+        }
+        return value;
+    }();
+    return on;
+}
+
+static s64 PrtLeaseNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool DirectMemory::QueueLeasesAsync(std::vector<std::shared_ptr<void>>& leases, u64 tick) {
+    try {
+        std::scoped_lock lk{async_leases_mutex};
+        async_leases.push_back(AsyncLeases{tick, PrtLeaseNowUs(), {}});
+        async_leases.back().leases.swap(leases);
+        ++async_queued;
+        async_max_depth = std::max<u64>(async_max_depth, async_leases.size());
+    } catch (...) {
+        return false; // the leases stay with the caller
+    }
+    return true;
+}
+
+void DirectMemory::PollAsyncLeases(bool force_all) {
+    std::vector<std::shared_ptr<void>> done;
+    std::vector<AsyncLeases> late;
+    {
+        std::scoped_lock lk{async_leases_mutex};
+        if (async_leases.empty()) {
+            return;
+        }
+        const s64 now = PrtLeaseNowUs();
+        for (auto it = async_leases.begin(); it != async_leases.end();) {
+            if (force_all || scheduler.IsFree(it->tick)) {
+                for (auto& lease : it->leases) done.push_back(std::move(lease));
+                ++async_retired;
+                it = async_leases.erase(it);
+            } else if (now - it->queued_us > 250'000 || async_leases.size() > 2048) {
+                late.push_back(std::move(*it));
+                ++async_fallbacks;
+                it = async_leases.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (async_report_us == 0) async_report_us = now;
+        if (now - async_report_us >= 10'000'000) {
+            LOG_INFO(Render_Vulkan,
+                     "PRT-LEASEASYNC: last {:.1f} s: {} lease batches queued, {} retired without a "
+                     "wait, {} sent to the priority thread (late), {} waiting, max {}",
+                     double(now - async_report_us) / 1e6, async_queued, async_retired,
+                     async_fallbacks, async_leases.size(), async_max_depth);
+            async_report_us = now;
+            async_queued = async_retired = async_fallbacks = 0;
+            async_max_depth = async_leases.size();
+        }
+    }
+    for (auto& entry : late) {
+        auto cleanup = import_cleanup;
+        if (!RetireImportedLeases(entry.leases,
+                [&](auto callback) {
+                    scheduler.DeferPriorityOperationAt(entry.tick, std::move(callback));
+                },
+                [cleanup](auto held) {
+                    try { cleanup->Enqueue([held] { held->clear(); }); }
+                    catch (...) { held->clear(); }
+                })) {
+            scheduler.Wait(entry.tick); // could not schedule: wait here, then free
+            entry.leases.clear();
+        }
+    }
+    if (!done.empty()) {
+        // Their ticks have passed; free on the cleanup worker (no view lock during destruction).
+        auto held = std::make_shared<std::vector<std::shared_ptr<void>>>(std::move(done));
+        try { import_cleanup->Enqueue([held] { held->clear(); }); }
+        catch (...) { held->clear(); }
+    }
+}
+
 bool DirectMemory::RetireLeasesAfterSplice(std::vector<std::shared_ptr<void>>& leases, u64 tick) {
     if (!leases.empty() && tick == 0) return false;
+    if (PrtLeaseAsync()) {
+        if (leases.empty() || QueueLeasesAsync(leases, tick)) {
+            PollAsyncLeases(false);
+            return true;
+        }
+    }
     auto cleanup = import_cleanup;
     return RetireImportedLeases(leases,
         [&](auto callback) { scheduler.DeferPriorityOperationAt(tick, std::move(callback)); },
@@ -868,6 +973,7 @@ void DirectMemory::ReleaseHeldAfterGpuIdle() {
         held.swap(held_native_releases);
     }
     held.clear(); // GPU is idle; no view lock is held during driver destruction.
+    if (PrtLeaseAsync()) PollAsyncLeases(true); // PRT-LEASEASYNC: the GPU is idle
 }
 
 bool DirectMemory::TryForEachPart(

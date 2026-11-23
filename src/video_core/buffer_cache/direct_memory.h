@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <deque>
+#include <mutex>
+
 #include <functional>
 
 #include <atomic>
@@ -179,6 +182,19 @@ private:
     std::atomic<u64> failed_count{};
     std::atomic<u64> volatile_pages{};
     std::shared_ptr<ImportCleanupWorker> import_cleanup;
+    // PRT-LEASEASYNC (pr-tests, Round 12): leases waiting for their GPU tick, checked without
+    // waiting on later retire calls (RYGT_LEASE_RETIRE_ASYNC).
+    struct AsyncLeases {
+        u64 tick;
+        s64 queued_us;
+        std::vector<std::shared_ptr<void>> leases;
+    };
+    std::mutex async_leases_mutex;
+    std::deque<AsyncLeases> async_leases;
+    u64 async_queued{}, async_retired{}, async_fallbacks{}, async_max_depth{};
+    s64 async_report_us{};
+    bool QueueLeasesAsync(std::vector<std::shared_ptr<void>>& leases, u64 tick);
+    void PollAsyncLeases(bool force_all);
 };
 
 } // namespace VideoCore
