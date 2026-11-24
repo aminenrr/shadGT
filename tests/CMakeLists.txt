@@ -90,6 +90,13 @@ target_include_directories(shadps4_readable_binding_test PRIVATE ${CMAKE_SOURCE_
 target_compile_features(shadps4_readable_binding_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_readable_binding_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_readable_binding_test)
+add_executable(shadgt_stored_pipeline_slack_test test_stored_pipeline_slack.cpp)
+target_include_directories(shadgt_stored_pipeline_slack_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_stored_pipeline_slack_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_stored_pipeline_slack_test PRIVATE
+    GTest::gtest_main Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadgt_stored_pipeline_slack_test)
+
 add_executable(shadps4_cube_store_policy_test test_cube_store_policy.cpp)
 target_include_directories(shadps4_cube_store_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_cube_store_policy_test PRIVATE cxx_std_23)
