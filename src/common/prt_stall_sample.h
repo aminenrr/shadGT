@@ -32,7 +32,7 @@ void MaybeSample(double stalled_ms, bool& sampled_this_stall);
 bool AudioLoadOn();
 /// The thread to sample from now on (0 = stop sampling).
 void AudioLoadArm(std::uint32_t tid);
-/// PRT-AUDIOMXCSR / PRT-AUDIOFTZ (Round 16): the audio thread to read (and with RYGT_AUDIO_FTZ=1
+/// PRT-AUDIOMXCSR / PRT-AUDIOFTZ (Round 16, FTZ GT7 on since R17): the audio thread to read (and with PRT-AUDIOFTZ
 /// fix) MXCSR on once a second, hot or not; 0 = none.
 void AudioMxcsrArm(std::uint32_t tid);
 /// Called about every 1 ms by the PRT-PERF thread; takes a sample every 10 ms while armed.

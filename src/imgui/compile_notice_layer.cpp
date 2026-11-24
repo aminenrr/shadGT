@@ -591,12 +591,13 @@ static std::vector<AudioSample> g_audio_samples;     // only the PRT-PERF thread
 static std::uint32_t g_audio_failed = 0;
 
 // PRT-AUDIOMXCSR (pr-tests, Round 16, RYGT_AUDIO_MXCSR_LOG, GT7 on with PRT-AUDIOLOAD; 0 = off;
-// log only) and PRT-AUDIOFTZ (RYGT_AUDIO_FTZ, default off): R15 took the red-zone jumps out of
+// log only) and PRT-AUDIOFTZ (RYGT_AUDIO_FTZ, GT7 on since Round 17; 0 = off): R15 took the red-zone jumps out of
 // the hot 128-sample mix loop (GT7.exe+0x2b68340) and the audio thread still ran 80-98% of a
 // core. Orbis threads run with MXCSR 0x9fc0 (flush-to-zero + denormals-are-zero); without them,
 // fading voices go denormal and float math slows 10-100x. Once a second this reads the audio
 // thread's MXCSR; the PRT-AUDIOLOAD line gives the values seen and, with RYGT_AUDIO_FTZ=1, how
-// often FTZ+DAZ had to be set back on.
+// often FTZ+DAZ had to be set back on. R16 test: the audio thread starts with 0x1fa0 (FTZ and DAZ
+// off), runs 80-92% of a core with 1429 underruns; with FTZ+DAZ set it runs 15-18% with 0.
 static bool AudioMxcsrLogOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_AUDIO_MXCSR_LOG");
@@ -608,7 +609,7 @@ static bool AudioMxcsrLogOn() {
 static bool AudioFtzOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_AUDIO_FTZ");
-        return env && env[0] == '1' && Common::IsGt7();
+        return !(env && env[0] == '0') && Common::IsGt7();
     }();
     return on;
 }
