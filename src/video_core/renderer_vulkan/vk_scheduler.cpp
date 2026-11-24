@@ -21,6 +21,7 @@
 #include "common/perf_monitor.h"
 #include "common/prt_hitch.h"
 #include "common/prt_stall_cause.h"
+#include "common/prt_stall_sample.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
@@ -904,6 +905,12 @@ void Scheduler::PrtPerfThread(std::stop_token stoken) {
     u64 busy_samples = 0;
     u64 window_tick = CurrentTick();
     GpuStallWatch stall_watch; // PERF-GT7-160 (port)
+    const bool audio_load = Common::PrtStallSample::AudioLoadOn(); // PRT-AUDIOLOAD (Round 13)
+    if (audio_load) {
+        LOG_WARNING(Render_Vulkan, "PRT-AUDIOLOAD: on, SceSndzAudioOutMain is sampled every 10 ms "
+                                   "while it uses more than 80% of a core (RYGT_AUDIO_LOAD_LOG=0 "
+                                   "turns it off)");
+    }
     while (!stoken.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
         work_semaphore.Refresh();
@@ -913,6 +920,9 @@ void Scheduler::PrtPerfThread(std::stop_token stoken) {
         busy_samples += gpu_tick < submitted ? 1 : 0;
         const auto now = std::chrono::steady_clock::now();
         stall_watch.Sample(gpu_tick, gpu_tick < submitted, now); // PERF-GT7-160 (port)
+        if (audio_load) {
+            Common::PrtStallSample::AudioLoadPoll(); // PRT-AUDIOLOAD: every 10 ms while armed
+        }
         if (now - window_start < std::chrono::seconds{10}) {
             continue;
         }
@@ -945,6 +955,41 @@ void Scheduler::PrtPerfThread(std::stop_token stoken) {
                             "(threads add up); top sites by ms: {}",
                             Common::PrtHitch::LocalClock(), count, double(us) / 1000.0, top);
             }
+        }
+        // PRT-AUDIOLOAD (Round 13): GT7's audio thread, when it uses more than 80% of a core.
+        // The spots are from the samples taken in this window (armed by the window before).
+        if (audio_load) {
+            const Common::NamedThreadLoad audio =
+                Common::LastNamedThreadLoad("SceSndzAudioOutMain");
+            std::uint32_t sampled = 0;
+            std::string spots = Common::PrtStallSample::AudioLoadReport(6, sampled);
+            const bool hot = audio.tid != 0 && audio.percent > 80.0;
+            std::string fences;
+            if (Common::StallCause::FenceSiteOn()) {
+                const auto [count, us] =
+                    Common::StallCause::FenceSiteTotals(Common::StallCause::SiteSlot::Watched);
+                fences = count == 0
+                             ? std::string{"none"}
+                             : fmt::format("{} waits {:.1f} ms: {}", count, double(us) / 1000.0,
+                                           Common::StallCause::FenceSiteText(
+                                               Common::StallCause::SiteSlot::Watched, 4, true));
+            } else {
+                fences = "n/a (RYGT_FENCE_SITE_LOG off)";
+            }
+            if (hot || sampled != 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-AUDIOLOAD [{}] 10 s: {} tid {} {:.0f}% of a core (user {:.0f}%, "
+                            "kernel {:.0f}%); {} samples: {}; fence waits by it: {}",
+                            Common::PrtHitch::LocalClock(),
+                            audio.name.empty() ? std::string{"SceSndzAudioOutMain"} : audio.name,
+                            audio.tid, audio.percent, audio.user_percent, audio.kernel_percent,
+                            sampled, spots.empty() ? std::string{"none yet (next window)"} : spots,
+                            fences);
+            } else if (Common::StallCause::FenceSiteOn()) {
+                Common::StallCause::FenceSiteText(Common::StallCause::SiteSlot::Watched, 0, true);
+            }
+            Common::PrtStallSample::AudioLoadArm(hot ? audio.tid : 0);
+            Common::StallCause::g_watch_tid.store(audio.tid, std::memory_order_relaxed);
         }
         // PRT-SUBMITS (Round 11): submits per game frame and the sites that forced them.
         {

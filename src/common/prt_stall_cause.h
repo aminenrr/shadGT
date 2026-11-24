@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "common/game_title.h"
+#include "common/perf_monitor.h" // PRT-AUDIOLOAD: CurrentOsThreadId
 #include "common/types.h"
 
 namespace Common::StallCause {
@@ -97,7 +98,11 @@ inline bool FenceSiteOn() {
 }
 
 /// PRT-FENCESITE: the counting slots, each reset by its own reader.
-enum class SiteSlot : u32 { Stall, Window, Hitch, Count };
+/// Watched (PRT-AUDIOLOAD, Round 13): only the waits of the thread in g_watch_tid.
+enum class SiteSlot : u32 { Stall, Window, Hitch, Watched, Count };
+
+/// PRT-AUDIOLOAD: the OS thread whose fence waits also go to SiteSlot::Watched (0 = none).
+inline std::atomic<u32> g_watch_tid{0};
 
 struct SiteStat {
     const char* file = nullptr;
@@ -211,7 +216,12 @@ inline void NoteFenceSiteLocked(u64 us) {
     }
     ++stat->total_count;
     stat->total_us += us;
+    const u32 watch_tid = g_watch_tid.load(std::memory_order_relaxed);
+    const bool watched = watch_tid != 0 && watch_tid == Common::CurrentOsThreadId();
     for (size_t slot = 0; slot < size_t(SiteSlot::Count); ++slot) {
+        if (slot == size_t(SiteSlot::Watched) && !watched) {
+            continue; // PRT-AUDIOLOAD
+        }
         ++stat->count[slot];
         stat->us[slot] += us;
         stat->max_us[slot] = std::max(stat->max_us[slot], us);

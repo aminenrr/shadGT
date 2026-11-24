@@ -20,6 +20,20 @@ namespace Common {
 /// PRT-PERF: in every build, for the PRT-PERF line in Release.
 std::string SampleThreadCpuUsage(size_t max_threads);
 
+/// PRT-AUDIOLOAD (pr-tests, Round 13): the busiest thread whose name contains `needle` in the
+/// last SampleThreadCpuUsage window (percent of one core, split user / kernel); tid 0 when none.
+struct NamedThreadLoad {
+    u32 tid = 0;
+    double percent = 0.0;
+    double user_percent = 0.0;
+    double kernel_percent = 0.0;
+    std::string name;
+};
+NamedThreadLoad LastNamedThreadLoad(const char* needle);
+
+/// PRT-AUDIOLOAD: the OS id of the calling thread (0 where unsupported).
+u32 CurrentOsThreadId();
+
 #ifdef SHADGT_DIAGNOSTICS
 using DiagnosticCounter = std::atomic<u64>;
 #else

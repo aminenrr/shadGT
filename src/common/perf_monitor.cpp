@@ -49,6 +49,7 @@ namespace {
 struct ThreadSample {
     HANDLE handle{};
     u64 cpu_100ns{};
+    u64 user_100ns{}; ///< PRT-AUDIOLOAD
     bool seen{};
 };
 
@@ -134,12 +135,25 @@ std::string ThreadName(HANDLE handle, DWORD tid) {
     return name;
 }
 
+std::mutex g_cpu_usage_mutex;
+std::unordered_map<DWORD, ThreadSample> g_cpu_threads; ///< guarded by g_cpu_usage_mutex
+
+// PRT-AUDIOLOAD (Round 13): the last window's usage of every thread, for LastNamedThreadLoad.
+struct LastUsage {
+    DWORD tid;
+    double percent;
+    double user_percent;
+    double kernel_percent;
+};
+std::vector<LastUsage> g_last_usages;                   ///< guarded by g_cpu_usage_mutex
+std::unordered_map<DWORD, std::string> g_usage_names; ///< guarded by g_cpu_usage_mutex
+
 } // namespace
 
 std::string SampleThreadCpuUsage(size_t max_threads) {
-    static std::mutex mutex;
+    auto& mutex = g_cpu_usage_mutex;
     std::scoped_lock lk{mutex};
-    static std::unordered_map<DWORD, ThreadSample> threads;
+    auto& threads = g_cpu_threads;
     static auto last_time = std::chrono::steady_clock::now();
 
     const auto now = std::chrono::steady_clock::now();
@@ -157,6 +171,7 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
     };
     std::vector<Usage> usages;
     double total_percent = 0.0;
+    g_last_usages.clear(); // PRT-AUDIOLOAD
 
     const auto account = [&](DWORD tid, bool inserted, auto& sample) {
         FILETIME creation, exit, kernel, user;
@@ -164,13 +179,21 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
             return;
         }
         sample.seen = true;
-        const u64 cpu = FileTimeTo100ns(kernel) + FileTimeTo100ns(user);
+        const u64 user_time = FileTimeTo100ns(user);
+        const u64 cpu = FileTimeTo100ns(kernel) + user_time;
         if (!inserted && elapsed_100ns > 0.0 && cpu >= sample.cpu_100ns) {
             const double percent = double(cpu - sample.cpu_100ns) * 100.0 / elapsed_100ns;
             total_percent += percent;
             usages.push_back({percent, tid, sample.handle});
+            const double user_percent =
+                user_time >= sample.user_100ns
+                    ? double(user_time - sample.user_100ns) * 100.0 / elapsed_100ns
+                    : 0.0;
+            g_last_usages.push_back(
+                {tid, percent, user_percent, std::max(0.0, percent - user_percent)});
         }
         sample.cpu_100ns = cpu;
+        sample.user_100ns = user_time;
     };
     // PERF-GT7-054: this process's threads only (NtGetNextThread); the Toolhelp snapshot walks
     // every thread on the machine, 60 ms here with browsers open, and ran in a frame.
@@ -212,6 +235,7 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
     });
     std::erase_if(PrtThreadModules(),
                   [&](const auto& pair) { return !threads.contains(pair.first); });
+    std::erase_if(g_usage_names, [&](const auto& pair) { return !threads.contains(pair.first); });
 
     std::ranges::sort(usages, std::greater{}, &Usage::percent);
     std::string summary = fmt::format("process {:.0f}% of {}%;", total_percent,
@@ -222,9 +246,52 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
     }
     return summary;
 }
+
+// PRT-AUDIOLOAD (pr-tests, Round 13): see perf_monitor.h.
+NamedThreadLoad LastNamedThreadLoad(const char* needle) {
+    std::scoped_lock lk{g_cpu_usage_mutex};
+    NamedThreadLoad best;
+    for (const LastUsage& usage : g_last_usages) {
+        std::string name;
+        if (const auto name_it = g_usage_names.find(usage.tid); name_it != g_usage_names.end()) {
+            name = name_it->second;
+        } else {
+            const auto thread_it = g_cpu_threads.find(usage.tid);
+            if (thread_it == g_cpu_threads.end() || !thread_it->second.handle) {
+                continue;
+            }
+            name = ThreadName(thread_it->second.handle, usage.tid);
+            if (!name.starts_with("tid")) { // a thread named later is looked up again
+                g_usage_names.emplace(usage.tid, name);
+            }
+        }
+        if (name.find(needle) == std::string::npos ||
+            (best.tid != 0 && usage.percent <= best.percent)) {
+            continue;
+        }
+        best.tid = usage.tid;
+        best.percent = usage.percent;
+        best.user_percent = usage.user_percent;
+        best.kernel_percent = usage.kernel_percent;
+        best.name = std::move(name);
+    }
+    return best;
+}
+
+u32 CurrentOsThreadId() {
+    return static_cast<u32>(GetCurrentThreadId());
+}
 #else
 std::string SampleThreadCpuUsage(size_t) {
     return {};
+}
+
+NamedThreadLoad LastNamedThreadLoad(const char*) {
+    return {};
+}
+
+u32 CurrentOsThreadId() {
+    return 0;
 }
 #endif
 

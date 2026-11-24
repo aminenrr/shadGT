@@ -9,10 +9,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 #include <imgui.h>
 
+#include "common/game_title.h"
 #include "common/perf_monitor.h"
 #include "common/prt_hitch.h"
 #include "common/prt_stall_cause.h"
@@ -474,5 +477,139 @@ void MaybeSample(double stalled_ms, bool& sampled_this_stall) {
     (void)sampled_this_stall;
 #endif
 }
+
+// PRT-AUDIOLOAD (pr-tests, Round 13): see common/prt_stall_sample.h.
+bool AudioLoadOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_AUDIO_LOAD_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+
+static std::atomic<std::uint32_t> g_audio_tid{0};
+
+void AudioLoadArm(std::uint32_t tid) {
+    g_audio_tid.store(tid, std::memory_order_relaxed);
+}
+
+#ifdef _WIN32
+struct AudioSample {
+    std::uint64_t rip;
+    std::uint64_t caller; // the first code address on its stack (0 = none)
+};
+static constexpr std::size_t AudioSampleMax = 1200; // 10 s at one per 10 ms, and some slack
+static std::vector<AudioSample> g_audio_samples;     // only the PRT-PERF thread touches these
+static std::uint32_t g_audio_failed = 0;
+
+void AudioLoadPoll() {
+    const std::uint32_t tid = g_audio_tid.load(std::memory_order_relaxed);
+    if (tid == 0 || g_audio_samples.size() >= AudioSampleMax) {
+        return;
+    }
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds{10}) {
+        return;
+    }
+    last = now;
+    const Sample sample = TakeSample(tid);
+    if (!sample.ok) {
+        ++g_audio_failed;
+        return;
+    }
+    if (g_audio_samples.capacity() == 0) {
+        g_audio_samples.reserve(AudioSampleMax);
+    }
+    g_audio_samples.push_back({sample.rip, sample.count != 0 ? sample.code[0] : 0});
+}
+
+std::string AudioLoadReport(std::size_t top, std::uint32_t& samples) {
+    samples = static_cast<std::uint32_t>(g_audio_samples.size());
+    if (g_audio_samples.empty()) {
+        g_audio_failed = 0;
+        return {};
+    }
+    // Spots are 64-byte code ranges; each names its most seen address and most seen caller.
+    struct Spot {
+        std::uint64_t bucket = 0;
+        std::uint32_t count = 0;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> rips;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> callers;
+    };
+    const auto bump = [](std::vector<std::pair<std::uint64_t, std::uint32_t>>& list,
+                         std::uint64_t value) {
+        for (auto& [key, n] : list) {
+            if (key == value) {
+                ++n;
+                return;
+            }
+        }
+        list.emplace_back(value, 1);
+    };
+    const auto most = [](const std::vector<std::pair<std::uint64_t, std::uint32_t>>& list) {
+        std::pair<std::uint64_t, std::uint32_t> best{0, 0};
+        for (const auto& item : list) {
+            if (item.second > best.second) {
+                best = item;
+            }
+        }
+        return best;
+    };
+    std::vector<Spot> spots;
+    for (const AudioSample& sample : g_audio_samples) {
+        const std::uint64_t bucket = sample.rip & ~std::uint64_t{63};
+        Spot* spot = nullptr;
+        for (Spot& s : spots) {
+            if (s.bucket == bucket) {
+                spot = &s;
+                break;
+            }
+        }
+        if (spot == nullptr) {
+            spots.push_back(Spot{bucket});
+            spot = &spots.back();
+        }
+        ++spot->count;
+        bump(spot->rips, sample.rip);
+        bump(spot->callers, sample.caller);
+    }
+    std::sort(spots.begin(), spots.end(),
+              [](const Spot& a, const Spot& b) { return a.count > b.count; });
+    const bool symbols = StallSymbolsOn();
+    std::string text;
+    for (std::size_t i = 0; i < spots.size() && i < top; ++i) {
+        const Spot& spot = spots[i];
+        const std::uint64_t rip = most(spot.rips).first;
+        const auto caller = most(spot.callers);
+        text += fmt::format("{}{} {:.0f}%{}", text.empty() ? "" : ", ",
+                            Common::SamplingProfiler::DescribeCode(rip),
+                            spot.count * 100.0 / double(samples),
+                            symbols ? SymbolName(rip) : std::string{});
+        if (caller.first != 0) {
+            text += fmt::format(" (stack {}{} in {:.0f}%)",
+                                Common::SamplingProfiler::DescribeCode(caller.first),
+                                symbols ? SymbolName(caller.first) : std::string{},
+                                caller.second * 100.0 / double(spot.count));
+        }
+    }
+    if (spots.size() > top) {
+        text += fmt::format(", +{} more spots", spots.size() - top);
+    }
+    if (g_audio_failed != 0) {
+        text += fmt::format("; {} samples failed", g_audio_failed);
+    }
+    g_audio_samples.clear();
+    g_audio_failed = 0;
+    return text;
+}
+#else
+void AudioLoadPoll() {}
+
+std::string AudioLoadReport(std::size_t, std::uint32_t& samples) {
+    samples = 0;
+    return {};
+}
+#endif
 
 } // namespace Common::PrtStallSample

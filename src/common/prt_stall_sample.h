@@ -11,6 +11,10 @@
 // deadlock it. Round 7 GT7 had 0.6 to 0.8 s pauses with nothing compiling, short fence waits
 // and no mutex wait: this shows where the game's own threads are.
 
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
 namespace Common::PrtStallSample {
 
 /// The game thread that last submitted GPU work (sceGnmSubmit*) / last flipped.
@@ -19,5 +23,18 @@ void NoteFlipThread();
 
 /// Called by the stall logger while a stall goes on; samples once per stall.
 void MaybeSample(double stalled_ms, bool& sampled_this_stall);
+
+// PRT-AUDIOLOAD (pr-tests, Round 13, RYGT_AUDIO_LOAD_LOG, GT7 on; 0 = off; log only): GT7's
+// audio thread SceSndzAudioOutMain used 95-99% of a core in Round 12 races while the sound
+// crackled. While the PRT-PERF thread finds it above 80% of a core in a 10 s window, it samples
+// the thread (suspend, instruction pointer and stack code addresses, resume, as PRT-STALLSAMPLE)
+// every 10 ms in the next window and logs its top code spots.
+bool AudioLoadOn();
+/// The thread to sample from now on (0 = stop sampling).
+void AudioLoadArm(std::uint32_t tid);
+/// Called about every 1 ms by the PRT-PERF thread; takes a sample every 10 ms while armed.
+void AudioLoadPoll();
+/// The top `top` code spots of the samples since the last call ("" when none), then resets.
+std::string AudioLoadReport(std::size_t top, std::uint32_t& samples);
 
 } // namespace Common::PrtStallSample
