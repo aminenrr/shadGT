@@ -24894,7 +24894,9 @@ void NativeRenderer::EvictImages() {
         }
         return Common::IsGt7();
     }();
-    // PRT-STAGESHRINK v2 (pr-tests, Round 11, RYGT_STAGING_SHRINK_V2, GT7 on; 0 = Round 10's):
+    // PRT-STAGESHRINK v2 (pr-tests, Round 11, RYGT_STAGING_SHRINK_V2; Round 13 PRT-PHOTOFIX: default
+    // off, 1 = on in GT7; 0 = Round 10's). Owner Round 12 scape test: v2 makes photos black, and it
+    // freed 0 MB in Rounds 11 and 12.
     // at every check over the budget the kept copies outside the 256 MB upload copy reserve are
     // all freed (not 64 MB kept), and while over the budget new ones outside it are freed instead
     // of kept (copies in the reserve stay: freeing them returns nothing to the driver). Every
@@ -24902,10 +24904,15 @@ void NativeRenderer::EvictImages() {
     // 3 times, at the trim start; the ~240 MB kept all race were in the reserve.
     static const bool stage_shrink_v2 = [] {
         const char* env = std::getenv("RYGT_STAGING_SHRINK_V2");
-        if (env && *env) {
-            return env[0] != '0' && Common::IsGt7();
+        // PRT-PHOTOFIX: off unless RYGT_STAGING_SHRINK_V2=1
+        const bool value = env && *env && env[0] != '0' && Common::IsGt7();
+        if (Common::IsGt7()) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-PHOTOFIX: STAGESHRINK v2 {} (RYGT_STAGING_SHRINK_V2={}; default off "
+                        "since Round 13, it made photos black)",
+                        value ? "on" : "off", env && *env ? env : "unset");
         }
-        return Common::IsGt7();
+        return value;
     }();
     if (stage_shrink && stage_shrink_v2 && device) {
         static bool keeping_outside = true;
