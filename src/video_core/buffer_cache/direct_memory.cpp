@@ -841,7 +841,8 @@ std::optional<std::vector<DirectMemory::LeasedPart>> DirectMemory::PlanLeasedPar
         });
 }
 
-// PRT-LEASEASYNC (pr-tests, Round 12, RYGT_LEASE_RETIRE_ASYNC, default off, GT7 only): unmapped
+// PRT-LEASEASYNC (pr-tests, Round 12, RYGT_LEASE_RETIRE_ASYNC; Round 13: default on in GT7, 0 = off;
+// the owner's Round 12 run had fewer hitches and lower race VRAM with it, GT7 only): unmapped
 // imported views' leases were each handed to the priority thread, which blocked on their GPU tick
 // (Round 11: 2.8-4.4k waits per 10 s, up to 10 ms each) and held up the readback fence signals
 // queued behind them. With the switch the leases wait here; every later retire call (and the GPU
@@ -851,7 +852,7 @@ std::optional<std::vector<DirectMemory::LeasedPart>> DirectMemory::PlanLeasedPar
 static bool PrtLeaseAsync() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_LEASE_RETIRE_ASYNC");
-        const bool value = env && env[0] == '1' && Common::IsGt7();
+        const bool value = !(env && env[0] == '0') && Common::IsGt7(); // Round 13: on by default
         if (value) {
             LOG_INFO(Render_Vulkan, "PRT-LEASEASYNC: on, unmapped view leases retire without "
                                     "waiting on the priority thread");
