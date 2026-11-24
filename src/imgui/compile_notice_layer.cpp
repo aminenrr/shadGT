@@ -281,6 +281,7 @@ void Unregister() {
 #endif
 #include <windows.h>
 #include <dbghelp.h>
+#include <psapi.h>
 #include <mutex>
 #pragma comment(lib, "dbghelp.lib")
 #endif
@@ -502,8 +503,15 @@ void AudioLoadArm(std::uint32_t tid) {
 
 static std::atomic<std::uint32_t> g_audio_mxcsr_tid{0};
 
+#ifdef _WIN32
+static void AudioFaultArm(std::uint32_t tid);
+#endif
+
 void AudioMxcsrArm(std::uint32_t tid) {
     g_audio_mxcsr_tid.store(tid, std::memory_order_relaxed);
+#ifdef _WIN32
+    AudioFaultArm(tid); // PRT-AUDIOFAULT (Round 16b)
+#endif
 }
 
 #ifdef _WIN32
@@ -663,11 +671,145 @@ static void AudioMxcsrPoll(std::uint32_t tid) {
     CloseHandle(thread);
 }
 
-static std::string AudioMxcsrText() {
-    if (g_audio_mxcsr.empty() && g_audio_ftz_set == 0 && g_audio_ftz_failed == 0) {
+// PRT-AUDIOFAULT (pr-tests, Round 16b, RYGT_AUDIO_FAULT_LOG, GT7 on with PRT-AUDIOLOAD; 0 = off;
+// log only): R15 showed GT7's audio thread at 15-21% of a core in kernel time, also in windows
+// nobody sampled it, while its hot spot is a plain float mix loop. A first-in-line vectored
+// handler counts the exceptions raised on that thread (write-watch and guard faults, single
+// steps, HLE traps) and keeps the last 256 (code, address, rip); it never handles one. The
+// PRT-AUDIOLOAD line adds the count by code, the top 64 KB fault areas and code spots, and the
+// process page faults (soft + hard) of the 10 s window.
+static bool AudioFaultOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_AUDIO_FAULT_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+
+struct AudioFault {
+    std::atomic<std::uint32_t> code{0};
+    std::atomic<std::uint64_t> address{0};
+    std::atomic<std::uint64_t> rip{0};
+};
+static constexpr std::uint32_t AudioFaultRing = 256;
+static AudioFault g_audio_faults[AudioFaultRing];
+static std::atomic<std::uint32_t> g_audio_fault_tid{0};
+static std::atomic<std::uint64_t> g_audio_fault_count{0};
+static std::uint64_t g_audio_fault_seen = 0; // PRT-PERF thread only
+
+static LONG CALLBACK AudioFaultCount(EXCEPTION_POINTERS* info) {
+    const std::uint32_t tid = g_audio_fault_tid.load(std::memory_order_relaxed);
+    if (tid == 0 || tid != GetCurrentThreadId() || info == nullptr ||
+        info->ExceptionRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const EXCEPTION_RECORD* record = info->ExceptionRecord;
+    std::uint64_t address = reinterpret_cast<std::uint64_t>(record->ExceptionAddress);
+    if ((record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+         record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+        record->NumberParameters >= 2) {
+        address = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
+    }
+    const std::uint64_t n = g_audio_fault_count.fetch_add(1, std::memory_order_relaxed);
+    AudioFault& slot = g_audio_faults[n % AudioFaultRing];
+    slot.code.store(static_cast<std::uint32_t>(record->ExceptionCode), std::memory_order_relaxed);
+    slot.address.store(address, std::memory_order_relaxed);
+    slot.rip.store(info->ContextRecord != nullptr ? info->ContextRecord->Rip : 0,
+                   std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void AudioFaultArm(std::uint32_t tid) {
+    if (!AudioFaultOn()) {
+        return;
+    }
+    static bool installed = false;
+    if (tid != 0 && !installed) {
+        installed = AddVectoredExceptionHandler(1, AudioFaultCount) != nullptr;
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-AUDIOFAULT: {}, exceptions on the audio thread are counted "
+                    "(RYGT_AUDIO_FAULT_LOG=0 turns it off)",
+                    installed ? "on" : "handler not added");
+    }
+    g_audio_fault_tid.store(tid, std::memory_order_relaxed);
+}
+
+static std::string AudioFaultText() {
+    if (!AudioFaultOn()) {
         return {};
     }
-    std::string text = "; MXCSR";
+    std::string text;
+    PROCESS_MEMORY_COUNTERS memory{};
+    memory.cb = sizeof(memory);
+    static DWORD last_page_faults = 0;
+    static bool have_page_faults = false;
+    using MemoryInfoFn = BOOL(WINAPI*)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+    static const auto memory_info = reinterpret_cast<MemoryInfoFn>(
+        GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo"));
+    if (memory_info != nullptr && memory_info(GetCurrentProcess(), &memory, sizeof(memory))) {
+        if (have_page_faults) {
+            text += fmt::format("; process page faults {}", memory.PageFaultCount - last_page_faults);
+        }
+        last_page_faults = memory.PageFaultCount;
+        have_page_faults = true;
+    }
+    const std::uint64_t total = g_audio_fault_count.load(std::memory_order_relaxed);
+    const std::uint64_t fresh = total - g_audio_fault_seen;
+    g_audio_fault_seen = total;
+    if (g_audio_fault_tid.load(std::memory_order_relaxed) == 0) {
+        return text;
+    }
+    text += fmt::format("; PRT-AUDIOFAULT {} exceptions on it", fresh);
+    if (fresh == 0) {
+        return text;
+    }
+    const std::uint64_t keep = std::min<std::uint64_t>(fresh, AudioFaultRing);
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> codes;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> areas;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> rips;
+    const auto bump = [](std::vector<std::pair<std::uint64_t, std::uint32_t>>& list,
+                         std::uint64_t value) {
+        for (auto& [key, n] : list) {
+            if (key == value) {
+                ++n;
+                return;
+            }
+        }
+        list.emplace_back(value, 1);
+    };
+    for (std::uint64_t i = total - keep; i < total; ++i) {
+        const AudioFault& slot = g_audio_faults[i % AudioFaultRing];
+        bump(codes, slot.code.load(std::memory_order_relaxed));
+        bump(areas, slot.address.load(std::memory_order_relaxed) & ~std::uint64_t{0xffff});
+        bump(rips, slot.rip.load(std::memory_order_relaxed));
+    }
+    const auto by_count = [](const auto& a, const auto& b) { return a.second > b.second; };
+    std::sort(codes.begin(), codes.end(), by_count);
+    std::sort(areas.begin(), areas.end(), by_count);
+    std::sort(rips.begin(), rips.end(), by_count);
+    text += fmt::format(" (last {}: codes", keep);
+    for (std::size_t i = 0; i < codes.size() && i < 4; ++i) {
+        text += fmt::format(" {:#x} x{}", codes[i].first, codes[i].second);
+    }
+    text += "; areas";
+    for (std::size_t i = 0; i < areas.size() && i < 3; ++i) {
+        text += fmt::format(" {:#x} x{}", areas[i].first, areas[i].second);
+    }
+    text += "; at";
+    for (std::size_t i = 0; i < rips.size() && i < 3; ++i) {
+        text += fmt::format(" {} x{}", Common::SamplingProfiler::DescribeCode(rips[i].first),
+                            rips[i].second);
+    }
+    text += ")";
+    return text;
+}
+
+static std::string AudioMxcsrText() {
+    const std::string faults = AudioFaultText(); // PRT-AUDIOFAULT (Round 16b)
+    if (g_audio_mxcsr.empty() && g_audio_ftz_set == 0 && g_audio_ftz_failed == 0) {
+        return faults;
+    }
+    std::string text = faults + "; MXCSR";
     for (const auto& [value, n] : g_audio_mxcsr) {
         text += fmt::format(" {:#x} x{} (FTZ {}, DAZ {})", value, n, (value & 0x8000) ? "on" : "off",
                             (value & 0x40) ? "on" : "off");
