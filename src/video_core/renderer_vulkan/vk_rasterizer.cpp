@@ -3306,8 +3306,8 @@ static u32 PrtFenceBatchUs() {
             return 0u;
         }
         const u32 result = value == 1 ? 500u : u32(std::min<unsigned long>(value, 20000));
-        LOG_INFO(Render_Vulkan, "PRT-FENCEBATCH: on, fences ride a submit made less than {} us ago",
-                 result);
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-FENCEBATCH: on, fences ride a submit made less than {} us ago", result);
         return result;
     }();
     return us;
@@ -3330,7 +3330,7 @@ void Rasterizer::PrtFenceBatchReport(s64 now_us) {
         !prt_fence_batch_report_us.compare_exchange_strong(last, now_us)) {
         return;
     }
-    LOG_INFO(Render_Vulkan,
+    LOG_WARNING(Render_Vulkan, // Round 13: Release builds filter Info
              "PRT-FENCEBATCH: last {:.1f} s: {} fences rode a recent submit, {} fence submits, {} "
              "idle flushes (window {} us)",
              double(now_us - last) / 1e6, prt_fence_batch_held.exchange(0),
