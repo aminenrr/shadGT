@@ -500,6 +500,12 @@ void AudioLoadArm(std::uint32_t tid) {
     g_audio_tid.store(tid, std::memory_order_relaxed);
 }
 
+static std::atomic<std::uint32_t> g_audio_mxcsr_tid{0};
+
+void AudioMxcsrArm(std::uint32_t tid) {
+    g_audio_mxcsr_tid.store(tid, std::memory_order_relaxed);
+}
+
 #ifdef _WIN32
 struct AudioSample {
     std::uint64_t rip;
@@ -576,8 +582,113 @@ static constexpr std::size_t AudioSampleMax = 1200; // 10 s at one per 10 ms, an
 static std::vector<AudioSample> g_audio_samples;     // only the PRT-PERF thread touches these
 static std::uint32_t g_audio_failed = 0;
 
+// PRT-AUDIOMXCSR (pr-tests, Round 16, RYGT_AUDIO_MXCSR_LOG, GT7 on with PRT-AUDIOLOAD; 0 = off;
+// log only) and PRT-AUDIOFTZ (RYGT_AUDIO_FTZ, default off): R15 took the red-zone jumps out of
+// the hot 128-sample mix loop (GT7.exe+0x2b68340) and the audio thread still ran 80-98% of a
+// core. Orbis threads run with MXCSR 0x9fc0 (flush-to-zero + denormals-are-zero); without them,
+// fading voices go denormal and float math slows 10-100x. Once a second this reads the audio
+// thread's MXCSR; the PRT-AUDIOLOAD line gives the values seen and, with RYGT_AUDIO_FTZ=1, how
+// often FTZ+DAZ had to be set back on.
+static bool AudioMxcsrLogOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_AUDIO_MXCSR_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+
+static bool AudioFtzOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_AUDIO_FTZ");
+        return env && env[0] == '1' && Common::IsGt7();
+    }();
+    return on;
+}
+
+static constexpr std::uint32_t MxcsrFtzDaz = 0x8040;
+static std::vector<std::pair<std::uint32_t, std::uint32_t>> g_audio_mxcsr; // value, times seen
+static std::uint32_t g_audio_ftz_set = 0;
+static std::uint32_t g_audio_ftz_failed = 0;
+
+static void AudioMxcsrPoll(std::uint32_t tid) {
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds{1}) {
+        return;
+    }
+    last = now;
+    const bool force = AudioFtzOn();
+    if (tid == 0 || tid == GetCurrentThreadId()) {
+        return;
+    }
+    const DWORD access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | (force ? THREAD_SET_CONTEXT : 0);
+    HANDLE thread = OpenThread(access, FALSE, tid);
+    if (thread == nullptr) {
+        return;
+    }
+    if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_FLOATING_POINT;
+        if (GetThreadContext(thread, &context)) {
+            const std::uint32_t value = context.MxCsr;
+            bool found = false;
+            for (auto& [key, n] : g_audio_mxcsr) {
+                if (key == value) {
+                    ++n;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && g_audio_mxcsr.size() < 8) {
+                g_audio_mxcsr.emplace_back(value, 1);
+            }
+            if (force && (value & MxcsrFtzDaz) != MxcsrFtzDaz) {
+                CONTEXT fixed{};
+                fixed.ContextFlags = CONTEXT_FLOATING_POINT;
+                if (GetThreadContext(thread, &fixed)) {
+                    fixed.MxCsr |= MxcsrFtzDaz;
+                    fixed.FltSave.MxCsr |= MxcsrFtzDaz;
+                    if (SetThreadContext(thread, &fixed)) {
+                        ++g_audio_ftz_set;
+                    } else {
+                        ++g_audio_ftz_failed;
+                    }
+                } else {
+                    ++g_audio_ftz_failed;
+                }
+            }
+        }
+        ResumeThread(thread);
+    }
+    CloseHandle(thread);
+}
+
+static std::string AudioMxcsrText() {
+    if (g_audio_mxcsr.empty() && g_audio_ftz_set == 0 && g_audio_ftz_failed == 0) {
+        return {};
+    }
+    std::string text = "; MXCSR";
+    for (const auto& [value, n] : g_audio_mxcsr) {
+        text += fmt::format(" {:#x} x{} (FTZ {}, DAZ {})", value, n, (value & 0x8000) ? "on" : "off",
+                            (value & 0x40) ? "on" : "off");
+    }
+    if (AudioFtzOn()) {
+        text += fmt::format(", PRT-AUDIOFTZ set FTZ+DAZ {} times", g_audio_ftz_set);
+        if (g_audio_ftz_failed != 0) {
+            text += fmt::format(" ({} failed)", g_audio_ftz_failed);
+        }
+    }
+    g_audio_mxcsr.clear();
+    g_audio_ftz_set = 0;
+    g_audio_ftz_failed = 0;
+    return text;
+}
+
 void AudioLoadPoll() {
     const std::uint32_t tid = g_audio_tid.load(std::memory_order_relaxed);
+    if (AudioMxcsrLogOn() || AudioFtzOn()) {
+        AudioMxcsrPoll(g_audio_mxcsr_tid.load(std::memory_order_relaxed));
+    }
     if (tid == 0 || g_audio_samples.size() >= AudioSampleMax) {
         return;
     }
@@ -604,7 +715,7 @@ std::string AudioLoadReport(std::size_t top, std::uint32_t& samples) {
     samples = static_cast<std::uint32_t>(g_audio_samples.size());
     if (g_audio_samples.empty()) {
         g_audio_failed = 0;
-        return {};
+        return AudioMxcsrText();
     }
     // Spots are 64-byte code ranges; each names its most seen address and most seen caller.
     struct Spot {
@@ -685,6 +796,7 @@ std::string AudioLoadReport(std::size_t top, std::uint32_t& samples) {
                         spots.front().count, regs);
         }
     }
+    text += AudioMxcsrText();
     g_audio_samples.clear();
     g_audio_failed = 0;
     return text;

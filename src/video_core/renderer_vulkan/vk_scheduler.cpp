@@ -976,7 +976,7 @@ void Scheduler::PrtPerfThread(std::stop_token stoken) {
             } else {
                 fences = "n/a (RYGT_FENCE_SITE_LOG off)";
             }
-            if (hot || sampled != 0) {
+            if (hot || sampled != 0 || !spots.empty()) {
                 LOG_WARNING(Render_Vulkan,
                             "PRT-AUDIOLOAD [{}] 10 s: {} tid {} {:.0f}% of a core (user {:.0f}%, "
                             "kernel {:.0f}%); {} samples: {}; fence waits by it: {}",
@@ -989,6 +989,7 @@ void Scheduler::PrtPerfThread(std::stop_token stoken) {
                 Common::StallCause::FenceSiteText(Common::StallCause::SiteSlot::Watched, 0, true);
             }
             Common::PrtStallSample::AudioLoadArm(hot ? audio.tid : 0);
+            Common::PrtStallSample::AudioMxcsrArm(audio.tid); // PRT-AUDIOMXCSR (Round 16)
             Common::StallCause::g_watch_tid.store(audio.tid, std::memory_order_relaxed);
         }
         // PRT-SUBMITS (Round 11): submits per game frame and the sites that forced them.
