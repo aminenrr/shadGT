@@ -4151,7 +4151,7 @@ void NativeRenderer::GpuTimeCollect() {
         const u64 frames = frame > sh.frame_at ? frame - sh.frame_at : 0;
         const double per = frames ? double(frames) : 1.0;
         if (sh.passes != 0) {
-            LOG_INFO(Render_Vulkan,
+            LOG_WARNING(Render_Vulkan,
                      "PRT-SHADOWLOG [{}] 10 s, {} frames: passes into a render area of 16384+ "
                      "(largest {}x{}): {:.1f} passes and {:.0f} draws per frame, {:.2f} GPU ms per "
                      "frame, slowest pass {:.2f} ms; largest viewport {}x{}, scissor {}x{}; "

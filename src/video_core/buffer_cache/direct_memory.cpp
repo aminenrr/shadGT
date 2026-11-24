@@ -854,7 +854,7 @@ static bool PrtLeaseAsync() {
         const char* env = std::getenv("RYGT_LEASE_RETIRE_ASYNC");
         const bool value = !(env && env[0] == '0') && Common::IsGt7(); // Round 13: on by default
         if (value) {
-            LOG_INFO(Render_Vulkan, "PRT-LEASEASYNC: on, unmapped view leases retire without "
+            LOG_WARNING(Render_Vulkan, "PRT-LEASEASYNC: on, unmapped view leases retire without "
                                     "waiting on the priority thread");
         }
         return value;
@@ -905,7 +905,7 @@ void DirectMemory::PollAsyncLeases(bool force_all) {
         }
         if (async_report_us == 0) async_report_us = now;
         if (now - async_report_us >= 10'000'000) {
-            LOG_INFO(Render_Vulkan,
+            LOG_WARNING(Render_Vulkan,
                      "PRT-LEASEASYNC: last {:.1f} s: {} lease batches queued, {} retired without a "
                      "wait, {} sent to the priority thread (late), {} waiting, max {}",
                      double(now - async_report_us) / 1e6, async_queued, async_retired,
