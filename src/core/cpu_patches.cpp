@@ -1604,6 +1604,19 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
 
 using AddressRanges = std::vector<std::pair<uintptr_t, uintptr_t>>;
 
+// PRT-REDZONESKIP (pr-tests, Round 15, RYGT_AUDIO_MIX_REDZONE_SKIP): one function left without
+// red-zone trampolines (GT7's hot audio mix loop).
+static uintptr_t g_red_zone_skip_address = 0;
+static uintptr_t g_red_zone_skipped_function = 0;
+
+void SetRedZoneSkipAddress(uintptr_t address) {
+    g_red_zone_skip_address = address;
+}
+
+uintptr_t GetRedZoneSkippedFunction() {
+    return g_red_zone_skipped_function;
+}
+
 /// Applies the CPU patches to every function of the segment. If red_zone_protection is true,
 /// the red-zone accesses of those functions are protected as well. If covered_ranges is not
 /// null, it receives the sorted address ranges of the decoded instructions.
@@ -1681,7 +1694,13 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
             }
         }
 
-        if (red_zone_protection && function.uses_red_zone) {
+        const bool red_zone_skipped = g_red_zone_skip_address != 0 &&
+                                      g_red_zone_skip_address >= function_start &&
+                                      g_red_zone_skip_address < function_end;
+        if (red_zone_skipped && red_zone_protection) {
+            g_red_zone_skipped_function = function_start;
+        }
+        if (red_zone_protection && function.uses_red_zone && !red_zone_skipped) {
             ++result.red_zone_function_count;
             result.indirect_red_zone_function_count += function.has_indirect_branch;
             for (const auto& [address, decoded] : function.instructions) {

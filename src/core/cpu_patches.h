@@ -84,6 +84,12 @@ void PrePatchInstructions(u64 segment_addr, u64 segment_size);
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
                                                   std::span<const uintptr_t> function_starts);
 
+/// PRT-REDZONESKIP (pr-tests, Round 15): red-zone protection skips the function that contains
+/// this address. Call before PatchRedZoneMemoryInstructions; 0 = none.
+void SetRedZoneSkipAddress(uintptr_t address);
+/// The function start PRT-REDZONESKIP skipped, or 0 when none was.
+uintptr_t GetRedZoneSkippedFunction();
+
 /// Applies CPU patches ahead of time to the functions listed in the EH frame search table. A patch
 /// site too short for a jump is relocated together with its neighboring instructions. Between
 /// those functions, only the SSE4a instructions long enough for a jump are patched.

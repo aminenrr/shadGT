@@ -107,10 +107,39 @@ void RytyProtectGuestRedZones() {
         return;
     }
     Core::RegisterPatchModule(code.start, code.size, trampolines, TrampolineSize);
+    // PRT-REDZONESKIP (pr-tests, Round 15, RYGT_AUDIO_MIX_REDZONE_SKIP, default off): leave
+    // GT7's hot 128-sample audio mix loop (GT7.exe+0x2b68340, 7 trampoline jumps per sample
+    // block in Round 14) without red-zone protection. 1 = that loop, only when its first bytes
+    // (mov ebp,[rsp-0x20]; xor ebx,ebx) match; any other value = image offset to skip, unchecked.
+    if (const char* env = std::getenv("RYGT_AUDIO_MIX_REDZONE_SKIP");
+        env && env[0] != '\0' && env[0] != '0') {
+        constexpr u64 Gt7MixLoopRva = 0x2b68340;
+        constexpr u8 Gt7MixLoopBytes[] = {0x8b, 0x6c, 0x24, 0xe0, 0x31, 0xdb};
+        const bool use_default = env[0] == '1' && env[1] == '\0';
+        const u64 rva = use_default ? Gt7MixLoopRva : std::strtoull(env, nullptr, 0);
+        u8* const target = base + rva;
+        if (rva == 0 || target < code.start || target >= code.start + code.size) {
+            std::fprintf(stderr, "[ryty_gpu] PRT-REDZONESKIP: offset %#llx is outside the code, "
+                                 "nothing skipped\n",
+                         static_cast<unsigned long long>(rva));
+        } else if (use_default &&
+                   std::memcmp(target, Gt7MixLoopBytes, sizeof(Gt7MixLoopBytes)) != 0) {
+            std::fprintf(stderr, "[ryty_gpu] PRT-REDZONESKIP: code at %#llx is not GT7's audio mix "
+                                 "loop, nothing skipped\n",
+                         static_cast<unsigned long long>(rva));
+        } else {
+            Core::SetRedZoneSkipAddress(reinterpret_cast<uintptr_t>(target));
+        }
+    }
     const auto result = Core::PatchRedZoneMemoryInstructions(
         reinterpret_cast<u64>(code.start), code.size, function_starts);
     DWORD ignored = 0;
     VirtualProtect(code.start, code.size, old_protect, &ignored);
+    if (const uintptr_t skipped = Core::GetRedZoneSkippedFunction(); skipped != 0) {
+        std::fprintf(stderr, "[ryty_gpu] PRT-REDZONESKIP: red-zone protection skipped for the "
+                             "function at GT7.exe+%#llx\n",
+                     static_cast<unsigned long long>(skipped - reinterpret_cast<uintptr_t>(base)));
+    }
     FlushInstructionCache(GetCurrentProcess(), code.start, code.size);
     std::fprintf(stderr,
                  "[ryty_gpu] FIX-074: red-zone patching in %lu ms: %llu functions, %llu use the red "
