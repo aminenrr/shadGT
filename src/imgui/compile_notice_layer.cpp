@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -325,6 +326,7 @@ struct Sample {
     std::uint64_t rip = 0;
     std::uint32_t count = 0;
     std::uint64_t code[16]{};
+    std::uint64_t regs[16]{}; // PRT-AUDIOLOOP (Round 14): rax..r15 in CONTEXT order
 };
 
 // Is the page executable? VirtualQuery takes no loader lock.
@@ -360,6 +362,11 @@ static Sample TakeSample(std::uint32_t tid) {
         if (GetThreadContext(thread, &context)) {
             sample.ok = true;
             sample.rip = context.Rip;
+            const std::uint64_t regs[16] = {context.Rax, context.Rcx, context.Rdx, context.Rbx,
+                                            context.Rsp, context.Rbp, context.Rsi, context.Rdi,
+                                            context.R8,  context.R9,  context.R10, context.R11,
+                                            context.R12, context.R13, context.R14, context.R15};
+            std::copy(std::begin(regs), std::end(regs), std::begin(sample.regs));
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(reinterpret_cast<const void*>(context.Rsp), &info, sizeof(info)) ==
                     sizeof(info) &&
@@ -497,7 +504,74 @@ void AudioLoadArm(std::uint32_t tid) {
 struct AudioSample {
     std::uint64_t rip;
     std::uint64_t caller; // the first code address on its stack (0 = none)
+    std::uint64_t regs[16];
 };
+
+// PRT-AUDIOLOOP (pr-tests, Round 14, RYGT_AUDIO_LOOP_LOG, GT7 on with PRT-AUDIOLOAD; 0 = off; log
+// only): R13 put 46-61% of the hot audio thread's samples in one 16-byte loop (GT7.exe+0x2b68360,
+// stack +0x2b5a2a5) while its load climbed from ~20% to 95% of a core over a race. For the
+// window's hottest spot this gives each register's low, middle and high value over the samples
+// in it (a loop count or list length that grows shows up as a rising middle from one line to the
+// next), and once per run the 128 code bytes around it, to read the loop offline.
+static bool AudioLoopOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_AUDIO_LOOP_LOG");
+        return !(env && env[0] == '0') && Common::IsGt7();
+    }();
+    return on;
+}
+
+static std::string AudioLoopText(const std::vector<AudioSample>& samples, std::uint64_t bucket) {
+    static constexpr const char* names[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp",
+                                              "rsi", "rdi", "r8",  "r9",  "r10", "r11",
+                                              "r12", "r13", "r14", "r15"};
+    std::vector<std::uint64_t> values;
+    std::string text;
+    for (int reg = 0; reg < 16; ++reg) {
+        if (reg == 4) {
+            continue; // rsp
+        }
+        values.clear();
+        for (const AudioSample& sample : samples) {
+            if ((sample.rip & ~std::uint64_t{63}) == bucket) {
+                values.push_back(sample.regs[reg]);
+            }
+        }
+        if (values.empty()) {
+            return {};
+        }
+        std::sort(values.begin(), values.end());
+        const std::uint64_t low = values.front();
+        const std::uint64_t mid = values[values.size() / 2];
+        const std::uint64_t high = values.back();
+        if (high <= 0xffffffffull) {
+            text += fmt::format("{}{} {}/{}/{}", text.empty() ? "" : ", ", names[reg], low, mid,
+                                high);
+        } else {
+            text += fmt::format("{}{} {:#x}/+{:#x}/+{:#x}", text.empty() ? "" : ", ", names[reg],
+                                low, mid - low, high - low);
+        }
+    }
+    static bool dumped = false;
+    if (!dumped) {
+        dumped = true;
+        const std::uint64_t start = bucket >= 64 ? bucket - 64 : bucket;
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(start), &info, sizeof(info)) ==
+                sizeof(info) &&
+            info.State == MEM_COMMIT && (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
+            reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize >= start + 192) {
+            std::string bytes;
+            const auto* code = reinterpret_cast<const std::uint8_t*>(start);
+            for (int i = 0; i < 192; ++i) {
+                bytes += fmt::format("{:02x}", code[i]);
+            }
+            LOG_WARNING(Render_Vulkan, "PRT-AUDIOLOOP: code bytes from {} (192): {}",
+                        Common::SamplingProfiler::DescribeCode(start), bytes);
+        }
+    }
+    return text;
+}
 static constexpr std::size_t AudioSampleMax = 1200; // 10 s at one per 10 ms, and some slack
 static std::vector<AudioSample> g_audio_samples;     // only the PRT-PERF thread touches these
 static std::uint32_t g_audio_failed = 0;
@@ -521,7 +595,9 @@ void AudioLoadPoll() {
     if (g_audio_samples.capacity() == 0) {
         g_audio_samples.reserve(AudioSampleMax);
     }
-    g_audio_samples.push_back({sample.rip, sample.count != 0 ? sample.code[0] : 0});
+    AudioSample entry{sample.rip, sample.count != 0 ? sample.code[0] : 0, {}};
+    std::copy(std::begin(sample.regs), std::end(sample.regs), std::begin(entry.regs));
+    g_audio_samples.push_back(entry);
 }
 
 std::string AudioLoadReport(std::size_t top, std::uint32_t& samples) {
@@ -598,6 +674,16 @@ std::string AudioLoadReport(std::size_t top, std::uint32_t& samples) {
     }
     if (g_audio_failed != 0) {
         text += fmt::format("; {} samples failed", g_audio_failed);
+    }
+    if (AudioLoopOn() && !spots.empty()) {
+        const std::string regs = AudioLoopText(g_audio_samples, spots.front().bucket);
+        if (!regs.empty()) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-AUDIOLOOP [{}]: {} ({} samples), registers low/middle/high: {}",
+                        Common::PrtHitch::LocalClock(),
+                        Common::SamplingProfiler::DescribeCode(spots.front().bucket),
+                        spots.front().count, regs);
+        }
     }
     g_audio_samples.clear();
     g_audio_failed = 0;

@@ -3295,13 +3295,14 @@ static s64 NativeFenceBatchInterval() {
 #endif
 
 // PRT-FENCEBATCH (pr-tests, Round 12): see DeferFenceSignal. 0 = off.
+// Round 14: on by default in GT7 (500 us); RYGT_FENCE_BATCH=0 turns it off.
 static u32 PrtFenceBatchUs() {
     static const u32 us = [] {
         const char* env = std::getenv("RYGT_FENCE_BATCH");
-        if (!(env && *env) || !Common::IsGt7()) {
+        if (!Common::IsGt7()) {
             return 0u;
         }
-        const unsigned long value = std::strtoul(env, nullptr, 10);
+        const unsigned long value = (env && *env) ? std::strtoul(env, nullptr, 10) : 1ul;
         if (value == 0) {
             return 0u;
         }
@@ -3572,7 +3573,7 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         // spun-label addresses apply to GT7 only (Gt7SpunLabel), never to GT Sport.
     }
 #endif
-    // PRT-FENCEBATCH (pr-tests, Round 12, RYGT_FENCE_BATCH, default 0 = off; n = us, 1 = 500 us,
+    // PRT-FENCEBATCH (pr-tests, Round 12, RYGT_FENCE_BATCH, Round 14 default on = 500 us, 0 = off; n = us,
     // GT7 only): a deferred fence that would submit at once only because readbacks are pending,
     // its address has an earlier deferred write or it is not held, rides the next submit when
     // the last submit was less than n us ago. Its signal still runs on the priority thread only
