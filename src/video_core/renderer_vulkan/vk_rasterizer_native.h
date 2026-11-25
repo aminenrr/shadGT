@@ -2143,6 +2143,12 @@ private:
     /// NAT-108: views of evicted images, destroyed once the GPU passed the tick.
     std::deque<std::pair<u64, vk::UniqueImageView>> retired_views;
     void EvictImages();
+    /// PRT-TEXSTALE / PRT-TEXREFRESH / PRT-PROTECTFAIL (pr-tests, Round 21, GT7): once a frame on
+    /// the recorder, from EvictImages.
+    void PrtTextureChecks();
+    /// PRT-TEXSTALE: a texture VRAMHEAD (1), VRAMTRIM (2) or VRAMIDLE (3) let go, so one made
+    /// again at its address and size is reported as made after that.
+    void PrtNoteLetGo(const Native::ImageEntry& entry, u8 why);
     struct ReportBase {
         u64 uploads = 0, upload_bytes = 0, evicted = 0;
         std::array<u64, 3> stale{};

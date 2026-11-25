@@ -217,6 +217,26 @@ bool CompatibleLayerStrides(const VideoCore::ImageInfo& a, const VideoCore::Imag
     return true;
 }
 
+std::atomic<bool> g_prt_probe_on{false}; // PRT-TEXSTALE (pr-tests, Round 21)
+
+u64 PrtProbeHash(VAddr address, u64 size) {
+    constexpr u64 Sample = 4096;
+    if (size == 0) {
+        return 1;
+    }
+    if (size <= 4 * Sample) {
+        return Core::HashGuestBytes(address, size) | 1;
+    }
+    const std::array<u64, 4> offsets{0, (size / 3) & ~(Sample - 1), ((size * 2) / 3) & ~(Sample - 1),
+                                     size - Sample};
+    u64 hash = 0x9e3779b97f4a7c15ull ^ size;
+    for (const u64 offset : offsets) {
+        hash = std::rotl(hash, 17) ^ Core::HashGuestBytes(address + offset, Sample);
+        hash *= 0xff51afd7ed558ccdull;
+    }
+    return hash | 1;
+}
+
 bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
     if (a.guest_address != b.guest_address || a.num_bits != b.num_bits ||
         a.size != b.size || a.pitch != b.pitch || a.tile_mode != b.tile_mode ||
@@ -2280,6 +2300,13 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
             // for "unchanged" and never uploaded, and the texture kept the forced picture.
             entry->content_hash = 0;
         }
+        // PRT-TEXSTALE (pr-tests, Round 21): a sample hash of what this upload reads, for the
+        // stale check out of races (the bytes as the CPU sees them now).
+        if (entry->from_cpu && g_prt_probe_on.load(std::memory_order_relaxed)) {
+            entry->prt_probe = memory_clamp && memory_clamp(info.guest_address, size) == size
+                                   ? PrtProbeHash(info.guest_address, size)
+                                   : 0;
+        }
         // (diagnosis) SHADGT_DIAG_ZERO_TEXTURES=<w>x<h>x<bits>: textures of that size upload zeros.
         static const std::array<u32, 3> zero_size = [] {
             std::array<u32, 3> parts{};
@@ -2504,6 +2531,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
 #ifndef NDEBUG
         const u8 kind = source ? 4 : gpu_source.kind; // FIX-153 (diagnosis)
 #endif
+        entry->prt_upload_kind = source ? 4 : gpu_source.kind; // PRT-TEXSTALE (Round 21)
         if (source) {
             staging.push_back(std::move(source));
         }

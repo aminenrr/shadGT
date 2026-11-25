@@ -3997,8 +3997,26 @@ static bool PrtDrvSealDrainOn() {
 // track is loaded (a course path the RyGT file layer saw, RytyGpuNoteGuestFile) go to that track's
 // own open segment; menu, shared and car pipelines (built out of a race, or known already) stay in
 // the common segments. A track's segments age out together (PRT-DRVSTALE, its counted sessions).
+// Round 21: default off in GT7 (Round 20 test: no course path ever reaches the file layer, GT7
+// reads its tracks through gt.idx volumes); RYGT_DRIVER_CACHE_TRACK=1 turns it on.
 static bool PrtDrvTrackOn() {
-    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_TRACK"));
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_TRACK");
+        return env && *env && env[0] != '0' && Common::IsGt7();
+    }();
+    return on;
+}
+
+// PRT-DRVSTALE v2 (Round 21, RYGT_DRIVER_CACHE_STALE_V2, GT7 on; 0 = Round 18 rule): run 3 exit
+// dropped seg3 (8916 pipelines, 1931 used) and seg4 (6840, 2173 used), and Round 20 run 2's splash
+// then built all 8984 launcher records of a dropped segment again (12.1 s). Now a sealed segment
+// is dropped only when under 10% of its pipelines were used in the last N counted sessions; when
+// one is dropped (this rule, the cap, a migrate or a track drop) its used pipelines leave the
+// index, so the splash prewarm builds them again into the open segment, and its unused ones are
+// kept in the index as stale ("X" lines), so the splash prewarm and the launcher pass skip them.
+// A stale pipeline the game asks for again is built at its first use and leaves the stale list.
+static bool PrtDrvStaleV2On() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_STALE_V2"));
     return on;
 }
 
@@ -4458,6 +4476,11 @@ struct PrtSegState {
     // PRT-DRVTRACK (Round 20): each track's open segment (the common one is open_id).
     std::unordered_map<std::string, u32> open_by_track;
     bool seal_wanted = false; // PRT-DRVSEAL drain: a save found an open segment past its size
+    // PRT-DRVSTALE v2 (Round 21): pipelines of dropped segments the game did not use lately,
+    // with the counted session they were dropped in; skipped by the splash and launcher pass.
+    std::unordered_map<u64, u32> stale;
+    u32 stale_added = 0;   // this session
+    u32 rebuild_added = 0; // this session: used ones of a dropped segment, built again
 };
 
 PrtSegState& Seg() {
@@ -4611,6 +4634,12 @@ static std::string PrtSegIndexText(PrtSegState& state) {
         text += fmt::format("P {:016x} {} {} {}\n", hash, entry.seg, entry.last_used,
                             seg->track.empty() ? std::string{"-"} : seg->track);
     }
+    // PRT-DRVSTALE v2 (Round 21): stale pipelines (older builds ignore the X lines).
+    for (const auto& [hash, session] : state.stale) {
+        if (!state.map.contains(hash)) {
+            text += fmt::format("X {:016x} {}\n", hash, session);
+        }
+    }
     return text;
 }
 
@@ -4674,10 +4703,15 @@ static std::pair<u32, u32> PrtSegRecentUse(PrtSegState& state, u32 id, u32 windo
 static u32 PrtSegDropLocked(PrtSegState& state, PrtSegment& seg, u32 window) {
     const u32 since = state.session + 1 > window ? state.session + 1 - window : 0;
     u32 used = 0;
+    const bool v2 = PrtDrvStaleV2On();
     for (auto it = state.map.begin(); it != state.map.end();) {
         if (it->second.seg == seg.id) {
             if (it->second.last_used != 0 && it->second.last_used >= since) {
                 ++used;
+                ++state.rebuild_added; // v2: not in the index, the splash builds it again
+            } else if (v2 && state.stale.size() < 400000 &&
+                       state.stale.emplace(it->first, state.session).second) {
+                ++state.stale_added; // v2: kept as stale, skipped by the splash and launcher
             }
             it = state.map.erase(it);
         } else {
@@ -4952,6 +4986,7 @@ static vk::PipelineCache PrtSegCacheFor(u64 hash) {
         return {};
     }
     const u32 last_used = state.used_before_entry.erase(hash) != 0 ? state.session + 1 : 0;
+    state.stale.erase(hash); // PRT-DRVSTALE v2: built again, no longer stale
     state.map[hash] =
         PrtSegEntry{.seg = open->id, .last_used = last_used, .assign_gen = state.save_gen};
     ++open->assigned_since_save;
@@ -5055,8 +5090,22 @@ static const char* PrtSegUnverifiedReason(u64 hash) {
         }
         return nullptr;
     }
+    if (PrtDrvStaleV2On() && state.stale.contains(hash)) {
+        return nullptr; // PRT-DRVSTALE v2 (Round 21): stale, not built at the splash
+    }
     const auto why = state.unverified.find(hash);
     return why != state.unverified.end() ? why->second : "not in the index";
+}
+
+// PRT-DRVSTALE v2 (Round 21): whether a recorded pipeline is stale (skipped by the splash prewarm
+// and the launcher pass). Fills the count of stale pipelines in the index.
+static bool PrtSegIsStale(u64 hash) {
+    if (!PrtDrvStaleV2On() || !PrtSegActive()) {
+        return false;
+    }
+    auto& state = Seg();
+    std::scoped_lock lock{state.mutex};
+    return !state.stale.empty() && state.stale.contains(hash) && !state.map.contains(hash);
 }
 
 void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in) {
@@ -5136,6 +5185,12 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
                     PrtSegEntry entry{};
                     if (fields >> hash_text >> entry.seg >> entry.last_used) {
                         entries[std::strtoull(hash_text.c_str(), nullptr, 16)] = entry;
+                    }
+                } else if (tag == "X" && PrtDrvStaleV2On()) { // PRT-DRVSTALE v2 (Round 21)
+                    std::string hash_text;
+                    u32 dropped_in = 0;
+                    if (fields >> hash_text >> dropped_in) {
+                        state.stale[std::strtoull(hash_text.c_str(), nullptr, 16)] = dropped_in;
                     }
                 }
             }
@@ -5655,15 +5710,29 @@ void PipelineCache::PrtDriverCacheExit() {
                 continue;
             }
             const auto [total, recent] = PrtSegRecentUse(state, seg->id, window);
-            if (total != 0 && recent * 2 >= total) {
+            // Round 21 PRT-DRVSTALE v2: dropped only under 10% used (Round 18: under half).
+            const bool v2 = PrtDrvStaleV2On();
+            if (total != 0 && (v2 ? u64{recent} * 10 >= u64{total} : recent * 2 >= total)) {
+                if (v2 && recent * 2 < total) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-DRVSTALE v2: seg{} ({} MB, {} pipelines, {} used in the last "
+                                "{} sessions, {:.1f}%) kept: 10% or more used",
+                                seg->id, seg->bytes >> 20, total, recent, window,
+                                PrtPercent(recent, total));
+                }
                 continue;
             }
+            const u32 stale_before = state.stale_added;
             PrtSegDropLocked(state, *seg, window);
             LOG_WARNING(Render_Vulkan,
-                        "PRT-DRVSTALE: seg{} ({} MB, {} pipelines) mostly unused in the last {} "
+                        "PRT-DRVSTALE{}: seg{} ({} MB, {} pipelines) mostly unused in the last {} "
                         "sessions ({} used): dropped; the used ones are built again by the splash "
-                        "prewarm next start",
-                        seg->id, seg->bytes >> 20, total, window, recent);
+                        "prewarm next start into the open segment{}",
+                        v2 ? " v2" : "", seg->id, seg->bytes >> 20, total, window, recent,
+                        v2 ? fmt::format(", {} unused ones marked stale in the index (the splash "
+                                         "and the launcher pass skip them)",
+                                         state.stale_added - stale_before)
+                           : std::string{});
         }
     }
     // PRT-DRVTRACK (Round 20): a track none of whose pipelines the game used in the last N
@@ -5705,6 +5774,15 @@ void PipelineCache::PrtDriverCacheExit() {
                         "segments ({} MB, {} pipelines) dropped together",
                         track, window, use.segments, use.bytes >> 20, use.pipelines);
         }
+    }
+    if (PrtDrvStaleV2On() && (state.stale_added != 0 || state.rebuild_added != 0 ||
+                              !state.stale.empty())) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVSTALE v2: exit: {} used pipelines of dropped segments left the index "
+                    "(the splash builds them into the open segment next start), {} unused ones "
+                    "marked stale this session; {} stale in the index (skipped by the splash and "
+                    "the launcher pass)",
+                    state.rebuild_added, state.stale_added, state.stale.size());
     }
     u32 sealed = 0;
     u32 open_count = 0;
@@ -10295,6 +10373,21 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
             ++skipped_marked;
             return true;
         });
+    }
+    // PRT-DRVSTALE v2 (Round 21): records of pipelines a dropped segment held and the game did not
+    // use lately are skipped (splash prewarm and launcher pass alike).
+    if (PrtDrvStaleV2On() && PrtSegActive()) {
+        const size_t before_stale = keys.size();
+        std::erase_if(keys, [&](const GraphicsPipelineKey& key) {
+            return PrtSegIsStale(std::hash<GraphicsPipelineKey>{}(key));
+        });
+        if (before_stale != keys.size()) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-DRVSTALE v2: {} recorded pipelines are stale (a dropped segment, not "
+                        "used lately) and not built {}",
+                        before_stale - keys.size(),
+                        prewarm_only ? "by the launcher pass" : "at the splash");
+        }
     }
     if (!prewarm_only && PrtSplashSkipOn()) {
         const char* clean = std::getenv("RYGT_LAUNCHER_PREWARM_CLEAN");

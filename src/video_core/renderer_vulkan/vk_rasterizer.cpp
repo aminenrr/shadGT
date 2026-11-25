@@ -3503,6 +3503,165 @@ static void PrtRbWaitNote(const char* file, u32 line, u64 bytes, u64 us) {
     }
 }
 
+// PRT-RBWAIT v2 (pr-tests, Round 21, RYGT_READBACK_WAIT_V2, GT7 on; 0 = the Round 20 line only;
+// log only): Round 20 showed no PRT-RBWAIT line at all: the fences GT7 waits on bring no readback
+// data of their own. Every deferred fence is now counted by why it was deferred (has data,
+// address order FIX-049, background readback pending, direct hold D3 / native) and its caller
+// site, with the time from DeferFenceSignal to its label landing (priority thread wait included)
+// and whether it submitted at once or rode a later submit. Every 10 s in a race, and outside one
+// when the window waited 500 ms or more (loading): totals per reason and the top 5 sites by ms.
+static bool PrtRbWaitV2On() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_READBACK_WAIT_V2");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+// PRT-RBBATCH v2 (pr-tests, Round 21, RYGT_READBACK_BATCH_ORDER, GT7 on with RYGT_READBACK_BATCH,
+// owner OK 2026-11-25 14:27; 0 = Round 20 rule): a fence deferred only to keep an address's order
+// (FIX-049: an earlier deferred write, no readback data of its own) also rides the held batch
+// instead of submitting at once. Same guard as Round 20: its label still lands after the GPU work
+// and after every earlier deferred label (deferred operations run in tick order); Scheduler::Wait,
+// WAIT_REG_MEM (FlushForDeferredFences) and the recorder idle hook submit the batch first; EOP
+// flush fences, SHADGT_DIRECT_HOLD_FLUSH, GT7's spun labels and labels inside a readback target
+// are never held; the batch cap (RYGT_READBACK_BATCH us) holds.
+static bool PrtRbBatchOrderOn() {
+    static const bool on = [] {
+        if (!Common::IsGt7()) {
+            return false;
+        }
+        const char* env = std::getenv("RYGT_READBACK_BATCH_ORDER");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return true;
+    }();
+    return on && PrtReadbackBatchUs() != 0;
+}
+
+namespace {
+enum PrtRbReason : u32 { RbData = 0, RbOrder, RbBackground, RbHold, RbReasons };
+const char* PrtRbReasonText(u32 reason) {
+    static constexpr const char* text[] = {"has data", "address order (FIX-049)",
+                                           "background readback", "direct hold (not held for data)"};
+    return text[reason < RbReasons ? reason : RbHold];
+}
+struct PrtRb2Site {
+    const char* file = nullptr;
+    u32 line = 0;
+    u32 reason = 0;
+    u64 count = 0;
+    u64 us = 0;
+    u64 max_us = 0;
+};
+struct PrtRb2Table {
+    std::mutex mutex;
+    std::vector<PrtRb2Site> sites;
+    std::array<u64, RbReasons> count{};
+    std::array<u64, RbReasons> us{};
+    s64 window_start_ns = 0;
+    bool race_seen = false;
+};
+PrtRb2Table& RbWait2() {
+    static auto* table = new PrtRb2Table();
+    return *table;
+}
+std::array<std::atomic<u64>, RbReasons> g_rb2_submitted{};
+std::array<std::atomic<u64>, RbReasons> g_rb2_rode{};
+std::atomic<u64> g_rb2_order_held{0};
+} // namespace
+
+// PRT-RBWAIT v2: one deferred fence's label landed `us` after DeferFenceSignal.
+static void PrtRbWait2Note(const char* file, u32 line, u32 reason, u64 us) {
+    auto& table = RbWait2();
+    const s64 now = PrtRbNowNs();
+    std::string report;
+    {
+        std::scoped_lock lock{table.mutex};
+        PrtRb2Site* site = nullptr;
+        for (auto& s : table.sites) {
+            if (s.file == file && s.line == line && s.reason == reason) {
+                site = &s;
+                break;
+            }
+        }
+        if (site == nullptr && table.sites.size() < 96) {
+            table.sites.push_back(PrtRb2Site{file, line, reason});
+            site = &table.sites.back();
+        }
+        if (site != nullptr) {
+            ++site->count;
+            site->us += us;
+            site->max_us = std::max(site->max_us, us);
+        }
+        const u32 r = reason < RbReasons ? reason : RbHold;
+        ++table.count[r];
+        table.us[r] += us;
+        table.race_seen = table.race_seen || PrtRbRaceNow();
+        if (table.window_start_ns == 0) {
+            table.window_start_ns = now;
+        }
+        if (now - table.window_start_ns >= 10'000'000'000ll) {
+            u64 total_us = 0, total = 0;
+            for (u32 i = 0; i < RbReasons; ++i) {
+                total_us += table.us[i];
+                total += table.count[i];
+            }
+            if (table.race_seen || total_us >= 500'000) {
+                std::vector<PrtRb2Site> order = table.sites;
+                std::sort(order.begin(), order.end(),
+                          [](const PrtRb2Site& a, const PrtRb2Site& b) { return a.us > b.us; });
+                std::string reasons;
+                for (u32 i = 0; i < RbReasons; ++i) {
+                    reasons += fmt::format("{}{} {}x {:.1f} ms ({} submitted at once, {} rode a "
+                                           "later submit)",
+                                           i == 0 ? "" : "; ", PrtRbReasonText(i), table.count[i],
+                                           double(table.us[i]) / 1000.0,
+                                           g_rb2_submitted[i].exchange(0), g_rb2_rode[i].exchange(0));
+                }
+                std::string top;
+                for (size_t i = 0; i < order.size() && i < 5; ++i) {
+                    top += fmt::format("{}{}:{} {} {}x {:.1f} ms (max {:.1f})",
+                                       top.empty() ? "" : ", ", PrtRbFile(order[i].file),
+                                       order[i].line, PrtRbReasonText(order[i].reason),
+                                       order[i].count, double(order[i].us) / 1000.0,
+                                       double(order[i].max_us) / 1000.0);
+                }
+                report = fmt::format(
+                    "PRT-RBWAIT v2 [{}]: last {:.1f} s {}: {} deferred fences, {:.1f} ms from "
+                    "fence to label landed (threads add up); by reason: {}; top 5 sites: {}{}",
+                    Common::PrtHitch::LocalClock(), double(now - table.window_start_ns) / 1e9,
+                    table.race_seen ? "in a race" : "out of a race (loading)", total,
+                    double(total_us) / 1000.0, reasons, top,
+                    PrtRbBatchOrderOn()
+                        ? fmt::format("; PRT-RBBATCH v2: {} order-only fences held ({} "
+                                      "batches, {} at the {} us cap since start)",
+                                      g_rb2_order_held.exchange(0), g_rb_batch_batches.load(),
+                                      g_rb_batch_capped.load(), PrtReadbackBatchUs())
+                        : std::string{});
+            } else {
+                for (u32 i = 0; i < RbReasons; ++i) {
+                    g_rb2_submitted[i].store(0, std::memory_order_relaxed);
+                    g_rb2_rode[i].store(0, std::memory_order_relaxed);
+                }
+                g_rb2_order_held.store(0, std::memory_order_relaxed);
+            }
+            table.sites.clear();
+            table.count = {};
+            table.us = {};
+            table.race_seen = false;
+            table.window_start_ns = now;
+        }
+    }
+    if (!report.empty()) {
+        LOG_WARNING(Render_Vulkan, "{}", report);
+    }
+}
+
 void Rasterizer::PrtFenceBatchReport(s64 now_us) {
     s64 last = prt_fence_batch_report_us.load(std::memory_order_relaxed);
     if (last == 0) {
@@ -3701,6 +3860,12 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         }
     }
     const s64 rb_from_ns = brings_data && PrtRbWaitOn() ? PrtRbNowNs() : 0;
+    // PRT-RBWAIT v2 (Round 21): why this fence is deferred, and when.
+    const u32 rb2_reason = brings_data                          ? u32(RbData)
+                           : (address_pending || earlier_deferred) ? u32(RbOrder)
+                           : readbacks_pending                  ? u32(RbBackground)
+                                                                : u32(RbHold);
+    const s64 rb2_from_ns = PrtRbWaitV2On() ? PrtRbNowNs() : 0;
     const char* const rb_file = loc.file_name();
     const u32 rb_line = static_cast<u32>(loc.line());
     {
@@ -3729,7 +3894,7 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
 #endif
          brings_data, readbacks = std::move(readbacks),
          async_readbacks = std::move(async_readbacks), signal = std::move(signal), rb_from_ns,
-         rb_file, rb_line, rb_bytes]() mutable {
+         rb_file, rb_line, rb_bytes, rb2_reason, rb2_from_ns]() mutable {
             texture_cache.CompleteReadbacks(readbacks);
             buffer_cache.CompleteAsyncReadbacks(async_readbacks);
             if (rb_from_ns != 0) { // PRT-RBWAIT (Round 20)
@@ -3740,6 +3905,10 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
             Common::ScopedMappingWritebackToken mapping_scope{mapping_token};
 #endif
             signal();
+            if (rb2_from_ns != 0) { // PRT-RBWAIT v2 (Round 21)
+                PrtRbWait2Note(rb_file, rb_line, rb2_reason,
+                               u64(std::max<s64>(PrtRbNowNs() - rb2_from_ns, 0) / 1000));
+            }
 #ifndef NDEBUG
             RecordDeferredFenceLatency(deferred_at);
 #endif
@@ -3818,6 +3987,30 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         } else {
             ++g_rb_batch_capped; // held long enough: the batch submits with this fence
         }
+    }
+    // PRT-RBBATCH v2 (Round 21, RYGT_READBACK_BATCH_ORDER): a fence deferred only for order (no
+    // readback data of its own, not an EOP flush) rides the held batch too; see PrtRbBatchOrderOn.
+    if (submit_now && !brings_data && !readbacks_pending &&
+        (address_pending || (!direct_hold && earlier_deferred)) && !flush &&
+        !hold_flush && !label_in_target && PrtRbBatchOrderOn() && liverpool &&
+        liverpool->Pipelined() && !Gt7SpunLabelAny(address)) {
+        const u64 tick = scheduler.CurrentTick();
+        const s64 now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (g_rb_batch_tick.exchange(tick, std::memory_order_acq_rel) != tick) {
+            g_rb_batch_first_us.store(now_us, std::memory_order_relaxed);
+            ++g_rb_batch_batches;
+        }
+        if (now_us - g_rb_batch_first_us.load(std::memory_order_relaxed) <
+            s64(PrtReadbackBatchUs())) {
+            submit_now = false;
+            ++g_rb2_order_held;
+        } else {
+            ++g_rb_batch_capped;
+        }
+    }
+    if (rb2_from_ns != 0) { // PRT-RBWAIT v2: submitted at once or rode a later submit
+        ++(submit_now ? g_rb2_submitted : g_rb2_rode)[rb2_reason];
     }
     if (submit_now) {
         scheduler.Flush();

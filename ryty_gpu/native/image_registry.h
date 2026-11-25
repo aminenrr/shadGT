@@ -206,6 +206,14 @@ public:
     mutable u64 race_read_frame = 0;
 #endif
 
+    /// PRT-TEXSTALE (pr-tests, Round 21): a sample hash of the guest bytes at the last upload
+    /// (0: none; see PrtProbeHash), where that upload read its bytes (as upload_kind, kept in
+    /// Release too), and how the image came to be (PrtOrigin, 255: not looked at yet).
+    /// Recorder thread only.
+    u64 prt_probe = 0;
+    u8 prt_upload_kind = 0;
+    u8 prt_origin = 255;
+
     /// A view, made on first use.
     const Rhi::ImageView* View(Rhi::Device& device, const ImageViewKey& key);
 
@@ -213,6 +221,14 @@ private:
     std::mutex views_mutex;
     std::vector<std::pair<ImageViewKey, std::unique_ptr<Rhi::ImageView>>> views;
 };
+
+/// PRT-TEXSTALE (pr-tests, Round 21): uploads take a sample hash of the guest bytes
+/// (ImageEntry::prt_probe) while this is on (RYGT_TEX_STALE_LOG, RYGT_TEX_REFRESH or
+/// RYGT_PROTECT_FAIL_UNTRACK).
+extern std::atomic<bool> g_prt_probe_on;
+/// PRT-TEXSTALE: hash of up to four 4 KB samples of [address, address + size) (the whole range
+/// up to 16 KB), read safely; never 0.
+u64 PrtProbeHash(VAddr address, u64 size);
 
 /// FIX-153 (diagnosis): SHADGT_NATIVE_WATCH_TEXTURE=<hex address>[,<hex address>...]: whether
 /// [begin, end) holds one of them; what happens there (writes, unmaps, invalidations, uploads)
@@ -413,6 +429,18 @@ public:
             std::scoped_lock lock{upload_mutex};
             pending_uploads.push_back(&entry);
         }
+    }
+    /// PRT-TEXREFRESH (pr-tests, Round 21): the guest bytes of a texture loaded from guest
+    /// memory changed while the cache took it for valid: uploaded again at its next use (its
+    /// NAT-109 hash is forgotten, so the upload is not skipped as unchanged).
+    void PrtMarkChanged(ImageEntry& entry) {
+        entry.content_hash = 0;
+        MarkStale(entry, Stale::CpuWrite);
+    }
+    /// PRT-TEXREFRESH: checked again at its next use (NAT-109's hash: uploaded only when its
+    /// bytes changed; a texture over 4 MB, which has no hash, is uploaded).
+    void PrtRevalidate(ImageEntry& entry) {
+        MarkStale(entry, Stale::CpuWrite);
     }
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);

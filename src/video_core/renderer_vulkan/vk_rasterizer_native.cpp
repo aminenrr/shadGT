@@ -143,6 +143,7 @@
 #include "core/memory.h"
 #include "ryty_gpu/native/committed_pages.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/prt_protect_fail.h" // PRT-PROTECTFAIL (pr-tests, Round 21)
 #include "ryty_gpu/native/cpu_texture_staging.h"
 #include "ryty_gpu/native/gpu_checkpoints.h"
 #include "ryty_gpu/native/slow_call_trace.h"
@@ -24465,6 +24466,438 @@ void NativeRenderer::PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames) {
     }
 }
 
+// ---- Round 21 (pr-tests): PRT-TEXSTALE, PRT-TEXREFRESH, PRT-PROTECTFAIL (GT7 only) -----------
+// R20 run 3 (owner, 2026-11-25 22:28): after ~20 track changes the main map's terrain and sky came
+// out in wrong saturated colours; a restart fixed it. Suspects: textures the cache still takes for
+// valid while their guest bytes changed (a write the page tracking missed: VirtualProtect 487 on
+// three 64 KB ranges, or writes that bypass it), textures VRAMHEAD/VRAMTRIM/VRAMIDLE let go and
+// made again, kept upload copies, recycled frame textures.
+
+// PRT-TEXSTALE (RYGT_TEX_STALE_LOG, GT7 on, log only): out of a race, each frame up to 64 textures
+// used this frame or the last, loaded from guest memory (not drawn by the GPU, not made of render
+// targets), are hashed again (PrtProbeHash) and compared with the hash taken at their upload.
+static bool PrtTexStaleOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_TEX_STALE_LOG");
+        if (env && *env) {
+            return env[0] != '0' && Common::IsGt7();
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+// PRT-TEXREFRESH (RYGT_TEX_REFRESH, GT7 on; 0 = off): when a race context ends, every texture
+// loaded from guest memory is looked at again over the next frames: one whose sample hash changed
+// is uploaded again at its next use, the others up to 4 MB are checked by their full NAT-109 hash at
+// their next use (uploaded only when changed). A PRT-TEXSTALE mismatch is uploaded again too.
+static bool PrtTexRefreshOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_TEX_REFRESH");
+        if (env && *env) {
+            return env[0] != '0' && Common::IsGt7();
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+namespace {
+struct PrtLetGo {
+    u64 frame = 0;
+    u8 why = 0;
+};
+struct PrtUntracked {
+    VAddr begin = 0;
+    VAddr end = 0;
+    VAddr allocation_base = 0;
+    u64 hash = 0;
+    std::vector<u8> copy; ///< the bytes at the last check (region pages' before-write copies)
+    u64 changes = 0;
+};
+struct PrtTexState {
+    std::unordered_map<u64, PrtLetGo> let_go; ///< address ^ size << 40
+    u32 stale_shard = 0;
+    bool was_context = false;
+    // PRT-TEXSTALE counts (10 s window)
+    u64 checks = 0, mismatches = 0;
+    std::array<u64, 8> by_origin{};
+    u64 detailed = 0;
+    std::chrono::steady_clock::time_point logged{};
+    // PRT-TEXREFRESH sweep
+    bool sweep = false;
+    u32 sweep_shard = 0;
+    u64 sweep_frames = 0, sweep_checked = 0, sweep_changed = 0, sweep_changed_bytes = 0;
+    u64 sweep_revalidated = 0, sweep_large_same = 0, sweep_ns = 0;
+    std::string sweep_started;
+    u64 refresh_on_mismatch = 0;
+    // PRT-PROTECTFAIL
+    std::vector<PrtUntracked> untracked;
+    u64 untracked_changes = 0, untracked_dropped = 0, other_failures = 0;
+    std::chrono::steady_clock::time_point untracked_logged{};
+};
+PrtTexState& PrtTex() {
+    static auto* state = new PrtTexState();
+    return *state;
+}
+u64 PrtLetGoKey(const Native::ImageEntry& entry) {
+    return entry.info.guest_address ^ (std::max<u64>(entry.info.guest_size, 1) << 40);
+}
+constexpr std::array<const char*, 5> PrtOriginText{
+    "fresh", "made again after PRT-VRAMHEAD let it go", "made again after PRT-VRAMTRIM let it go",
+    "made again after PRT-VRAMIDLE let it go", "uploaded again by PRT-TEXREFRESH (revalidated)"};
+} // namespace
+
+void NativeRenderer::PrtNoteLetGo(const Native::ImageEntry& entry, u8 why) {
+    if (!PrtTexStaleOn() || !entry.from_cpu) {
+        return;
+    }
+    auto& state = PrtTex();
+    if (state.let_go.size() >= 65536) {
+        state.let_go.clear();
+    }
+    state.let_go[PrtLetGoKey(entry)] = {frame, why};
+}
+
+void NativeRenderer::PrtTextureChecks() {
+    const bool stale_on = PrtTexStaleOn();
+    const bool refresh_on = PrtTexRefreshOn();
+    const bool protect_on = Core::PrtProtectFail::On();
+    if (!stale_on && !refresh_on && !protect_on) {
+        return;
+    }
+    Native::g_prt_probe_on.store(true, std::memory_order_relaxed);
+    auto& state = PrtTex();
+    const bool context = RytyGtsInRace() || RytyRaceRunning();
+    const auto sources_empty = [](Native::ImageEntry& entry) {
+        std::scoped_lock lock{entry.sources_mutex};
+        return entry.sources.empty();
+    };
+    // A texture loaded from guest memory, not written by the GPU, valid in the cache.
+    const auto loaded_valid = [](Native::ImageEntry& entry) {
+        return entry.from_cpu && entry.image && entry.prt_probe != 0 &&
+               !entry.needs_upload.load(std::memory_order_acquire) &&
+               !entry.force_upload.load(std::memory_order_relaxed) &&
+               !entry.gpu_backing_written.load(std::memory_order_relaxed) &&
+               entry.write_version.load(std::memory_order_relaxed) == 0 &&
+               entry.foreign_clock.load(std::memory_order_relaxed) == 0 &&
+               entry.rewrite_clock == 0 && !entry.reused.load(std::memory_order_relaxed);
+    };
+    const auto origin_of = [&](Native::ImageEntry& entry) -> u8 {
+        if (entry.prt_origin == 255) {
+            entry.prt_origin = 0;
+            if (const auto it = state.let_go.find(PrtLetGoKey(entry));
+                it != state.let_go.end() && entry.made_frame >= it->second.frame) {
+                entry.prt_origin = it->second.why;
+                state.let_go.erase(it);
+            }
+        }
+        return entry.prt_origin;
+    };
+    const auto in_untracked = [&](VAddr begin, VAddr end) {
+        return std::ranges::any_of(state.untracked, [&](const PrtUntracked& range) {
+            return range.begin < end && range.end > begin;
+        });
+    };
+
+    // PRT-PROTECTFAIL: new failures, then the untracked ranges checked against guest memory.
+    if (protect_on) {
+        for (const auto& record : Core::PrtProtectFail::Take()) {
+            const VAddr begin = VideoCore::PageManager::GetPageAddr(record.address);
+            const VAddr end = VideoCore::PageManager::GetNextPageAddr(
+                record.address + std::max<u64>(record.size, 1) - 1);
+            if (!record.watch) {
+                if (++state.other_failures <= 20) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-PROTECTFAIL: VirtualProtect {:#x}+{:#x} to {:#x} (opening the "
+                                "pages) failed: {} (thread {}); left as it is",
+                                record.address, record.size, record.protect, record.error,
+                                record.thread_id);
+                }
+                continue;
+            }
+            if (in_untracked(begin, end) || state.untracked.size() >= 128 || end - begin > 4_MB) {
+                continue;
+            }
+            // The owner, once per range: what the renderer keeps there.
+            u32 textures = 0, targets = 0;
+            std::string first;
+            registry->ForEachOverlapping(begin, end, [&](Native::ImageEntry& entry) {
+                (entry.from_cpu ? textures : targets) += 1;
+                if (first.size() < 300) {
+                    first += fmt::format("{}{} {:#x}+{:#x} {}x{} {}", first.empty() ? "" : "; ",
+                                         entry.from_cpu ? "texture" : "target",
+                                         entry.info.guest_address, entry.info.guest_size,
+                                         entry.info.size.width, entry.info.size.height,
+                                         vk::to_string(entry.info.pixel_format));
+                }
+            });
+            u32 region_count = 0, mirror_count = 0;
+            {
+                std::shared_lock map_lock{buffer_map_mutex};
+                for (const auto& [base, region] : regions) {
+                    region_count += region.begin < end && region.end > begin ? 1 : 0;
+                }
+                for (const auto& [base, mirror] : mirrors) {
+                    mirror_count += mirror.begin < end && mirror.end > begin ? 1 : 0;
+                }
+            }
+            const bool tracked = page_watches.Tracked(begin);
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-PROTECTFAIL [{}]: write watch of {:#x}+{:#x} failed: VirtualProtect "
+                        "to {:#x} error {} (thread {}); memory there: region {:#x}+{:#x} of "
+                        "allocation {:#x}, state {:#x} type {:#x} protect {:#x}; owner: {} "
+                        "textures, {} targets{}{}, {} regions, {} mirrors; the native tracker "
+                        "counts the pages {}; from now on checked against guest memory every "
+                        "frame (untracked)",
+                        Common::PrtHitch::LocalClock(), record.address, record.size,
+                        record.protect, record.error, record.thread_id, record.region_base,
+                        record.region_size, record.allocation_base, record.state, record.type,
+                        record.current_protect, textures, targets, first.empty() ? "" : ": ",
+                        first, region_count, mirror_count,
+                        tracked ? "watched (writes there were not seen)" : "not watched");
+            PrtUntracked range{begin, end, record.allocation_base};
+            range.copy.resize(end - begin);
+            if (!Core::RytyMemory::GuardedCopy(range.copy.data(),
+                                               reinterpret_cast<const void*>(begin), end - begin)) {
+                range.copy.clear();
+            }
+            range.hash = 0; // checked below: what the cache holds may be stale already
+            state.untracked.push_back(std::move(range));
+        }
+        for (auto it = state.untracked.begin(); it != state.untracked.end();) {
+            auto& range = *it;
+            // The mapping changed (unmapped, or mapped anew: its watches start clean): dropped.
+            if (frame % 60 == 0) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<void*>(range.begin), &info, sizeof(info)) !=
+                        sizeof(info) ||
+                    info.State != MEM_COMMIT ||
+                    reinterpret_cast<VAddr>(info.AllocationBase) != range.allocation_base) {
+                    ++state.untracked_dropped;
+                    it = state.untracked.erase(it);
+                    continue;
+                }
+            }
+            const u64 size = range.end - range.begin;
+            const u64 hash = Core::HashGuestBytes(range.begin, size) | 1;
+            if (hash != range.hash) {
+                const bool first_check = range.hash == 0;
+                range.hash = hash;
+                ++range.changes;
+                state.untracked_changes += first_check ? 0 : 1;
+                // As a write fault would: region pages get their before-write copy (FIX-173),
+                // textures there are uploaded again at their next use (the small ones only when
+                // their bytes changed).
+                bool in_region = false;
+                {
+                    std::shared_lock map_lock{buffer_map_mutex};
+                    in_region = RegionOver(range.begin, size) != nullptr;
+                }
+                {
+                    std::scoped_lock pending_lock{region_dirty_mutex};
+                    if (in_region && range.copy.size() == size) {
+                        for (VAddr page = range.begin; page < range.end; page += 4096) {
+                            auto& slot = page_snapshots[page];
+                            if (!slot) {
+                                slot = std::make_unique<std::array<u8, 4096>>();
+                                std::memcpy(slot->data(), range.copy.data() + (page - range.begin),
+                                            4096);
+                            }
+                        }
+                    }
+                    pending_region_writes.emplace_back(range.begin, range.end);
+                }
+                has_pending_region_writes.store(true, std::memory_order_release);
+                {
+                    std::scoped_lock watch_lock{fill_watch_mutex};
+                    registry->CpuWrite(range.begin, size, 0);
+                }
+                if (range.copy.size() == size &&
+                    !Core::RytyMemory::GuardedCopy(range.copy.data(),
+                                                   reinterpret_cast<const void*>(range.begin),
+                                                   size)) {
+                    range.copy.clear();
+                }
+            }
+            ++it;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!state.untracked.empty() && now - state.untracked_logged >= std::chrono::seconds{10}) {
+            state.untracked_logged = now;
+            if (state.untracked_changes != 0 || state.untracked_dropped != 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-PROTECTFAIL [{}]: {} untracked ranges checked every frame; last "
+                            "10 s: {} changes seen (textures and regions there loaded again), {} "
+                            "ranges dropped (mapping changed)",
+                            Common::PrtHitch::LocalClock(), state.untracked.size(),
+                            state.untracked_changes, state.untracked_dropped);
+            }
+            state.untracked_changes = state.untracked_dropped = 0;
+        }
+    }
+
+    // PRT-TEXREFRESH: the race context ended: the sweep starts.
+    if (refresh_on && state.was_context && !context) {
+        state.sweep = true;
+        state.sweep_shard = 0;
+        state.sweep_frames = state.sweep_checked = state.sweep_changed = 0;
+        state.sweep_changed_bytes = state.sweep_revalidated = state.sweep_large_same = 0;
+        state.sweep_ns = 0;
+        state.sweep_started = Common::PrtHitch::LocalClock();
+    }
+    state.was_context = context;
+    if (context) {
+        state.sweep = false; // a new race: the next end sweeps again
+    }
+    if (refresh_on && state.sweep && !context) {
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<Native::ImageEntry*> found;
+        for (u32 n = 0; n < 4 && state.sweep_shard < Native::ImageRegistry::ShardCount();
+             ++n, ++state.sweep_shard) {
+            registry->ForEachImageInShard(state.sweep_shard, [&](Native::ImageEntry& entry) {
+                if (loaded_valid(entry)) {
+                    found.push_back(&entry);
+                }
+            });
+        }
+        constexpr u64 HashedSize = 4_MB; // NAT-109's full hash covers textures up to this size
+        for (Native::ImageEntry* entry : found) {
+            if (!sources_empty(*entry)) {
+                continue;
+            }
+            ++state.sweep_checked;
+            const u64 size = entry->info.guest_size;
+            if (Native::PrtProbeHash(entry->info.guest_address, size) != entry->prt_probe) {
+                ++state.sweep_changed;
+                state.sweep_changed_bytes += size;
+                origin_of(*entry);
+                entry->prt_origin = 4;
+                registry->PrtMarkChanged(*entry);
+            } else if (size <= HashedSize && entry->content_hash != 0) {
+                ++state.sweep_revalidated;
+                registry->PrtRevalidate(*entry);
+            } else {
+                ++state.sweep_large_same;
+            }
+        }
+        ++state.sweep_frames;
+        state.sweep_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count());
+        if (state.sweep_shard >= Native::ImageRegistry::ShardCount()) {
+            state.sweep = false;
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-TEXREFRESH [{}]: race context ended at {}: {} textures loaded from "
+                        "guest memory looked at in {} frames: {} changed, uploaded again at their "
+                        "next use ({:.1f} MB), {} up to 4 MB checked again by their full hash at "
+                        "their next use, {} larger ones unchanged left; {:.1f} ms in all",
+                        Common::PrtHitch::LocalClock(), state.sweep_started, state.sweep_checked,
+                        state.sweep_frames, state.sweep_changed,
+                        state.sweep_changed_bytes / 1048576.0, state.sweep_revalidated,
+                        state.sweep_large_same, state.sweep_ns / 1e6);
+        }
+    }
+
+    // PRT-TEXSTALE: out of a race, up to 64 textures in use checked a frame.
+    if (stale_on && !context) {
+        std::vector<Native::ImageEntry*> found;
+        for (u32 n = 0; n < 4 && found.size() < 64; ++n) {
+            registry->ForEachImageInShard(state.stale_shard, [&](Native::ImageEntry& entry) {
+                if (!state.let_go.empty() && entry.from_cpu) {
+                    origin_of(entry);
+                }
+                if (found.size() < 64 && entry.last_use.load(std::memory_order_relaxed) + 1 >= frame &&
+                    loaded_valid(entry)) {
+                    found.push_back(&entry);
+                }
+            });
+            state.stale_shard = (state.stale_shard + 1) % Native::ImageRegistry::ShardCount();
+        }
+        for (Native::ImageEntry* entry : found) {
+            if (!sources_empty(*entry)) {
+                continue;
+            }
+            ++state.checks;
+            const VAddr address = entry->info.guest_address;
+            const u64 size = entry->info.guest_size;
+            const u64 probe = Native::PrtProbeHash(address, size);
+            // Still valid after the hash (a write fault marks it stale before the write lands).
+            if (probe == entry->prt_probe || entry->needs_upload.load(std::memory_order_acquire)) {
+                continue;
+            }
+            ++state.mismatches;
+            const u8 origin = origin_of(*entry);
+            bool recycled = false;
+            if (entry->image && RecycleFrameTextures()) {
+                std::scoped_lock recycle_lock{recycle_mutex};
+                recycled = recycle_keys.contains(entry->image->NativeHandle());
+            }
+            const bool kept_copy = entry->prt_upload_kind == 5;
+            ++state.by_origin[recycled ? 5 : kept_copy ? 6 : std::min<u8>(origin, 4)];
+            if (state.detailed < 50) {
+                ++state.detailed;
+                const VAddr first_page = VideoCore::PageManager::GetPageAddr(address);
+                const VAddr last_page =
+                    VideoCore::PageManager::GetPageAddr(address + std::max<u64>(size, 1) - 1);
+                const u64 upload_frame = entry->upload_frame.load(std::memory_order_relaxed);
+                static constexpr std::array<const char*, 6> kinds{
+                    "CPU copy", "region", "imported view", "gathered copy", "CPU copy",
+                    "kept upload copy (PERF-GT7-130)"};
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-TEXSTALE [{}]: texture {:#x}+{:#x} {}x{} {} mips {} layers {} "
+                            "tile {} array {} differs from its upload while the cache takes it "
+                            "for valid: {}{}{}; {} frames since its last upload ({} uploads, last "
+                            "from {}), made in frame {}; pages write tracked: first {}, last {}{}; "
+                            "last stale reason {}",
+                            Common::PrtHitch::LocalClock(), address, size, entry->info.size.width,
+                            entry->info.size.height, vk::to_string(entry->info.pixel_format),
+                            entry->info.resources.levels, entry->info.resources.layers,
+                            u32(entry->info.tile_mode), u32(entry->info.array_mode),
+                            PrtOriginText[std::min<u8>(origin, 4)],
+                            recycled ? ", recycled frame texture image (PERF-SGT-021)" : "",
+                            kept_copy ? ", last upload from a kept upload copy" : "",
+                            upload_frame == UINT64_MAX || upload_frame > frame ? 0 : frame - upload_frame,
+                            entry->total_uploads.load(std::memory_order_relaxed),
+                            kinds[std::min<u8>(entry->prt_upload_kind, 5)], entry->made_frame,
+                            page_watches.Tracked(first_page) ? "yes" : "no",
+                            page_watches.Tracked(last_page) ? "yes" : "no",
+                            in_untracked(first_page, last_page + 4096)
+                                ? " (in a PRT-PROTECTFAIL range)"
+                                : "",
+                            entry->last_stale == 255 ? std::string{"none"}
+                                                     : std::to_string(entry->last_stale));
+            }
+            if (refresh_on) {
+                ++state.refresh_on_mismatch;
+                entry->prt_origin = 4;
+                registry->PrtMarkChanged(*entry);
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (stale_on && now - state.logged >= std::chrono::seconds{10}) {
+        state.logged = now;
+        if (state.checks != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-TEXSTALE [{}]: last 10 s out of a race: {} textures in use checked "
+                        "against guest memory, {} differed while valid (fresh {}, after VRAMHEAD "
+                        "{}, after VRAMTRIM {}, after VRAMIDLE {}, revalidated {}, recycled frame "
+                        "texture {}, kept upload copy {}){}{}",
+                        Common::PrtHitch::LocalClock(), state.checks, state.mismatches,
+                        state.by_origin[0], state.by_origin[1], state.by_origin[2],
+                        state.by_origin[3], state.by_origin[4], state.by_origin[5],
+                        state.by_origin[6],
+                        refresh_on ? fmt::format("; PRT-TEXREFRESH: {} of them uploaded again",
+                                                 state.refresh_on_mismatch)
+                                   : std::string{},
+                        state.detailed >= 50 ? "; detail lines capped at 50" : "");
+        }
+        state.checks = state.mismatches = state.refresh_on_mismatch = 0;
+        state.by_origin = {};
+    }
+}
+
 void NativeRenderer::EvictImages() {
     DrainBinder(); // FEAT-SGT-022: no set the binder keeps names a view dropped here
     Native::SlowCallTrace<4> trace{true, "frame-retirement",
@@ -24483,6 +24916,7 @@ void NativeRenderer::EvictImages() {
             registry->Invalidate(address, size, Native::ImageRegistry::Stale::CpuWrite);
         }
     }
+    PrtTextureChecks(); // Round 21: PRT-TEXSTALE, PRT-TEXREFRESH, PRT-PROTECTFAIL
     // NAT-108: images not used for two seconds go (GT Sport's scratch pool holds render
     // targets of ever-changing sizes: the UI's blur panels, effects).
     constexpr u64 KeepFrames = 120;
@@ -25348,7 +25782,13 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     };
-    registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
+    const auto on_main_evict = [&](Native::ImageEntry& entry) {
+        if (trim_now) {
+            PrtNoteLetGo(entry, 2); // PRT-TEXSTALE (Round 21): PRT-VRAMTRIM over the budget
+        }
+        on_evict(entry);
+    };
+    registry->Evict(frame - KeepFrames, on_main_evict, [&](Native::ImageEntry& entry) {
         return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
     }, trim_now ? 64u : 16u);
     // PRT-VRAMIDLE (Round 8, RYGT_VRAM_TRIM_IDLE_FRAMES, GT7 30; 0 = off; only with PRT-VRAMTRIM
@@ -25421,6 +25861,7 @@ void NativeRenderer::EvictImages() {
         const auto on_idle_evict = [&](Native::ImageEntry& entry) {
             ++idle_count;
             idle_bytes += std::max<u64>(entry.info.guest_size, 1);
+            PrtNoteLetGo(entry, 3); // PRT-TEXSTALE (Round 21)
             on_evict(entry);
         };
         registry->Evict(frame - trim_idle_frames, on_idle_evict, [&](Native::ImageEntry& entry) {
@@ -25520,6 +25961,7 @@ void NativeRenderer::EvictImages() {
                     if (head_evicted.size() < 65536) {
                         head_evicted[entry.info.guest_address ^ (size << 40)] = {frame, size};
                     }
+                    PrtNoteLetGo(entry, 1); // PRT-TEXSTALE (Round 21)
                     on_evict(entry);
                 };
                 registry->Evict(frame - idle_frames, on_head_evict, [&](Native::ImageEntry& entry) {

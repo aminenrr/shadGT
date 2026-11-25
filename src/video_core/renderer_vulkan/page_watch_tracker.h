@@ -57,6 +57,15 @@ public:
             }
         }
     }
+    // PRT-TEXSTALE (pr-tests, Round 21): whether the tracker counts this page as watched.
+    bool Tracked(std::uint64_t page) {
+        auto& shard = shards[(page / RangeSize) % ShardCount];
+        std::scoped_lock lock{shard.mutex};
+        const auto found = shard.ranges.find(page / RangeSize);
+        if (found == shard.ranges.end()) return false;
+        const auto index = (page % RangeSize) / PageSize;
+        return (found->second[index / 64] & (std::uint64_t{1} << (index % 64))) != 0;
+    }
     void ClearExclusions(std::uint64_t begin, std::uint64_t end) {
         for (auto page = begin; page < end; page += PageSize) {
             auto& shard = shards[(page / RangeSize) % ShardCount];

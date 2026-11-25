@@ -3,6 +3,7 @@
 // them or to Windows directly.
 
 #include "ryty_gpu/ryty_diag.h"
+#include "ryty_gpu/prt_protect_fail.h"
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_alias_cache.h"
 #include "ryty_gpu/native/snapshot_backing_protocol.h"
@@ -12,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -939,6 +941,62 @@ std::vector<ExecRange> ExecRanges(VAddr virtual_addr, u64 size) {
 
 } // namespace Core::RytyMemory
 
+namespace Core::PrtProtectFail {
+namespace {
+std::mutex g_mutex;
+std::vector<Record> g_waiting;
+} // namespace
+
+bool On() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PROTECT_FAIL_UNTRACK");
+        if (env && *env) {
+            return env[0] != '0' && Common::IsGt7();
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+void Note(const Record& record) {
+    std::scoped_lock lock{g_mutex};
+    if (g_waiting.size() < 256) {
+        g_waiting.push_back(record);
+    }
+}
+
+std::vector<Record> Take() {
+    std::vector<Record> taken;
+    std::scoped_lock lock{g_mutex};
+    taken.swap(g_waiting);
+    return taken;
+}
+
+// PRT-PROTECTFAIL: a failed VirtualProtect of [address, address + size) asked for `protect`.
+static void NoteFailure(VAddr address, u64 size, DWORD protect, DWORD error, bool watch) {
+    if (!On()) {
+        return;
+    }
+    Record record{};
+    record.address = address;
+    record.size = size;
+    record.protect = protect;
+    record.error = error;
+    record.watch = watch;
+    record.thread_id = GetCurrentThreadId();
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == sizeof(info)) {
+        record.region_base = reinterpret_cast<VAddr>(info.BaseAddress);
+        record.allocation_base = reinterpret_cast<VAddr>(info.AllocationBase);
+        record.region_size = info.RegionSize;
+        record.state = info.State;
+        record.type = info.Type;
+        record.current_protect = info.Protect;
+    }
+    Note(record);
+}
+} // namespace Core::PrtProtectFail
+
 namespace Core {
 
 struct AddressSpace::Impl {};
@@ -1042,8 +1100,11 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
         if (IsCommitted(info)) {
             if (!VirtualProtect(reinterpret_cast<void*>(address), region_end - address, protect,
                                 &old_protect)) {
+                const DWORD error = GetLastError();
                 LOG_ERROR(Kernel_Vmm, "VirtualProtect {:#x}+{:#x} failed: {}", address,
-                          region_end - address, GetLastError());
+                          region_end - address, error);
+                PrtProtectFail::NoteFailure(address, region_end - address, protect, error,
+                                            !write); // PRT-PROTECTFAIL (Round 21)
             }
         }
         address = region_end;
