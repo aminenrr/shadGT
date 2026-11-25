@@ -3846,6 +3846,10 @@ void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& single_pa
 //   PRT-DRVMEM       RYGT_DRIVER_CACHE_MEM_LOG     process memory after the load and at exit
 //   PRT-DRVSAFE      RYGT_DRIVER_CACHE_SAFE_WRITE  index written to a temp file, then renamed
 //   PRT-DRVSAVE      RYGT_DRIVER_CACHE_IDLE_SAVE   open segment also saved when idle in menus
+// Round 19: PRT-DRVMOVE    RYGT_DRIVER_CACHE_MISS_MOVE   a sealed segment miss always moves
+//           PRT-DRVSEAL    RYGT_DRIVER_CACHE_SEAL_EARLY  open segment sealed at its size mid-session
+//           RYGT_SPLASH_VERIFY=2 (strict), RYGT_DRIVER_CACHE_MIGRATE percent (50), race DRVMEM lines,
+//           the old single file cleanup never deletes a segment.
 // The old shards (RYGT_DRIVER_CACHE_SHARDS) stay as a fallback, off by default; setting them
 // turns PRT-DRVSEG off, so only one of the two paths runs.
 // ---------------------------------------------------------------------------------------------
@@ -3928,8 +3932,49 @@ static bool PrtSplashVerifyOn() {
     return on;
 }
 
+// PRT-SPLASHVERIFY (Round 19): 2 (GT7 default) trusts a pipeline only when its index entry was
+// read at start for a segment file that really loaded data (the open segment too); 1 = Round 18
+// (any index entry of a segment present this start).
+static bool PrtSplashVerifyStrict() {
+    static const bool strict = [] {
+        const char* env = std::getenv("RYGT_SPLASH_VERIFY");
+        if (env && *env) {
+            return std::strtoul(env, nullptr, 10) >= 2;
+        }
+        return Common::IsGt7();
+    }();
+    return strict;
+}
+
 static bool PrtDrvMigrateOn() {
     static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_MIGRATE"));
+    return on;
+}
+
+// PRT-DRVMIGRATE (Round 19): an imported shard under this share of driver hits is dropped once.
+// RYGT_DRIVER_CACHE_MIGRATE: unset or 1 = 50 (Round 18 was 10), 2 to 100 = that percent.
+static u32 PrtDrvMigratePercent() {
+    static const u32 percent = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_MIGRATE");
+        const u32 value = env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 1u;
+        return value >= 2 ? std::min<u32>(value, 100u) : 50u;
+    }();
+    return percent;
+}
+
+// PRT-DRVMOVE (Round 19, RYGT_DRIVER_CACHE_MISS_MOVE, GT7 on; 0 = Round 18's rule): a pipeline
+// that misses in its sealed segment always moves to the open segment, once.
+static bool PrtDrvMissMoveOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_MISS_MOVE"));
+    return on;
+}
+
+// PRT-DRVSEAL (Round 19, RYGT_DRIVER_CACHE_SEAL_EARLY, GT7 on; 0 = off): out of a race, after
+// every 1000 pipelines put in the open segment, its size is asked of the driver; past the segment
+// size it is saved (and sealed) right away, so a long splash rebuild fills 600 MB segments, not
+// one large one.
+static bool PrtDrvSealEarlyOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_SEAL_EARLY"));
     return on;
 }
 
@@ -4167,6 +4212,7 @@ struct PrtSegment {
     bool sealed = false;
     bool migrated = false; // PRT-DRVMIGRATE: an imported shard
     bool judged = false;   // PRT-DRVMIGRATE: its hit rate was looked at
+    u32 judged_pct = 0;    // PRT-DRVMIGRATE (Round 19): the percent rule it was kept by
     u32 created_session = 0;
     u64 bytes = 0;         // the file's size at the last load or save
     bool dropped = false;  // this session; its file goes at the next index write
@@ -4182,6 +4228,7 @@ struct PrtSegEntry {
     u32 seg = 0;
     u32 last_used = 0;   // counted session it was last used in (0 = not by the game yet)
     u32 assign_gen = 0;  // save generation it was put in its segment
+    bool on_disk = false; // PRT-SPLASHVERIFY (Round 19): read at start for a segment that loaded data
 };
 
 struct PrtSegState {
@@ -4197,6 +4244,7 @@ struct PrtSegState {
     u32 migrated_mod = 0;         // PRT-DRVMIGRATE: old shard count, the old hash % rule
     u32 save_gen = 1;
     u32 open_assigned_since_save = 0;
+    u32 seal_check_at = 1000; // PRT-DRVSEAL: open_assigned_since_save of the next size check
     std::chrono::steady_clock::time_point last_assign{};
     std::chrono::steady_clock::time_point last_save{};
     std::vector<std::unique_ptr<PrtSegment>> segs;
@@ -4276,15 +4324,21 @@ static std::string PrtSegIndexText(PrtSegState& state) {
     text.reserve(64 + state.map.size() * 32);
     text += "PRT-DRVSEG 1\n";
     text += fmt::format("identity {}\n", state.identity);
+    // Round 19: no imported shard left, no old hash rule.
+    bool migrated_left = false;
+    for (const auto& seg : state.segs) {
+        migrated_left = migrated_left || (seg->migrated && !seg->dropped);
+    }
     text += fmt::format("session {}\nmigrated {}\nopen {}\nnext {}\n", state.session,
-                        state.migrated_mod, state.open_id, state.next_id);
+                        migrated_left ? state.migrated_mod : 0u, state.open_id, state.next_id);
     for (const auto& seg : state.segs) {
         if (seg->dropped) {
             continue;
         }
+        // The judged field holds the percent rule it was kept by (Round 18 wrote 1).
         text += fmt::format("S {} {} {} {} {} {}\n", seg->id, seg->sealed ? 1 : 0,
-                            seg->migrated ? 1 : 0, seg->judged ? 1 : 0, seg->created_session,
-                            seg->bytes);
+                            seg->migrated ? 1 : 0, seg->judged ? std::max<u32>(seg->judged_pct, 1) : 0,
+                            seg->created_session, seg->bytes);
     }
     for (const auto& [hash, entry] : state.map) {
         const PrtSegment* seg = SegById(state, entry.seg);
@@ -4483,8 +4537,9 @@ static vk::PipelineCache PrtSegCacheFor(u64 hash) {
 
 // After a create on this thread: a pipeline its sealed segment did not have (PRT-DRVHIT: every
 // create of it missed) moves to the open segment, so it is saved there and hits from the next
-// start. Only while that segment hits in general (50+ creates, half or more hits): a driver that
-// never reports hits for some kind of create must not copy whole segments into the open one.
+// start. Round 18 moved it only while that segment hit in general (50+ creates, half or more
+// hits); Round 19 PRT-DRVMOVE (RYGT_DRIVER_CACHE_MISS_MOVE) always moves it. Once: in the open
+// segment it is no longer in a sealed one.
 static void PrtSegAfterCreate(u64 hash) {
     const bool missed = t_drvhit_misses != 0 && t_drvhit_misses == t_drvhit_creates;
     PrtDrvHitThreadReset();
@@ -4501,14 +4556,20 @@ static void PrtSegAfterCreate(u64 hash) {
     if (!seg || !seg->sealed || seg->hit_slot < 0) {
         return;
     }
-    const auto& slot = DrvHit().slots[seg->hit_slot];
-    const u32 creates = slot.creates.load(std::memory_order_relaxed);
-    const u32 hits = slot.hits.load(std::memory_order_relaxed);
-    if (creates < 50 || hits * 2 < creates) {
+    if (!PrtDrvMissMoveOn()) {
+        const auto& slot = DrvHit().slots[seg->hit_slot];
+        const u32 creates = slot.creates.load(std::memory_order_relaxed);
+        const u32 hits = slot.hits.load(std::memory_order_relaxed);
+        if (creates < 50 || hits * 2 < creates) {
+            return;
+        }
+    }
+    if (!SegById(state, state.open_id)) {
         return;
     }
     it->second.seg = state.open_id;
     it->second.assign_gen = state.save_gen;
+    it->second.on_disk = false;
     ++state.open_assigned_since_save;
     state.last_assign = std::chrono::steady_clock::now();
     state.moved_on_miss.fetch_add(1, std::memory_order_relaxed);
@@ -4556,13 +4617,25 @@ static const char* PrtSegUnverifiedReason(u64 hash) {
     const auto it = state.map.find(hash);
     if (it != state.map.end()) {
         const PrtSegment* seg = SegById(state, it->second.seg);
-        return seg && !seg->dropped ? nullptr : "segment dropped";
+        if (!seg || seg->dropped) {
+            return "segment dropped";
+        }
+        // Round 19: only an entry read at start for a segment file that loaded data. One put in a
+        // segment this start (the old hash rule, a miss moved, a build) is not in a file yet.
+        if (PrtSplashVerifyStrict() && !it->second.on_disk) {
+            return "not in a segment file loaded this start";
+        }
+        return nullptr;
     }
     const auto why = state.unverified.find(hash);
     return why != state.unverified.end() ? why->second : "not in the index";
 }
 
-void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
+void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in) {
+    // PRT-DRVSEG (Round 19): a copy. The caller passes driver_cache_path, which this function sets
+    // to the open segment below; through the reference the old single file cleanup at the end then
+    // deleted the open segment (.seg2) every start (Round 18 test).
+    const std::filesystem::path base = base_in;
     auto& state = Seg();
     const auto before_private = PrtProcessMemoryMb().first;
     const auto props = instance.GetPhysicalDevice().getProperties();
@@ -4581,6 +4654,7 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
     struct IndexSeg {
         u32 id;
         bool sealed, migrated, judged;
+        u32 judged_pct;
         u32 created;
         u64 bytes;
     };
@@ -4616,7 +4690,12 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
                         seg.bytes) {
                         seg.sealed = sealed != 0;
                         seg.migrated = migrated != 0;
-                        seg.judged = judged != 0;
+                        // Round 19: kept by a lower percent rule (Round 18: 1, the 10% rule):
+                        // judged again.
+                        seg.judged = judged != 0 && (!seg.migrated ||
+                                                     static_cast<u32>(judged) >=
+                                                         PrtDrvMigratePercent());
+                        seg.judged_pct = seg.judged ? static_cast<u32>(judged) : 0;
                         listed.push_back(seg);
                     }
                 } else if (tag == "P") {
@@ -4697,10 +4776,11 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
                 break;
             }
             const u64 bytes = std::filesystem::file_size(target, ec);
-            listed.push_back(IndexSeg{index, true, true, false, 0, ec ? 0 : bytes});
+            listed.push_back(IndexSeg{index, true, true, false, 0, 0, ec ? 0 : bytes});
             LOG_WARNING(Render_Vulkan, "PRT-DRVMIGRATE: {} ({} MB) imported as sealed seg{}; "
-                                       "dropped once after a session if under 10% driver hits",
-                        sources[index].filename().string(), (ec ? 0 : bytes) >> 20, index);
+                                       "dropped once after a session if under {}% driver hits",
+                        sources[index].filename().string(), (ec ? 0 : bytes) >> 20, index,
+                        PrtDrvMigratePercent());
         }
         state.migrated_mod = static_cast<u32>(listed.size());
         state.next_id = state.migrated_mod;
@@ -4727,6 +4807,7 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
         seg->sealed = listed_seg.sealed;
         seg->migrated = listed_seg.migrated;
         seg->judged = listed_seg.judged;
+        seg->judged_pct = listed_seg.judged_pct;
         seg->created_session = listed_seg.created;
         seg->path = PrtSegPath(base, seg->id);
         seg->saved_gen = 1;
@@ -4843,7 +4924,8 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
     }
     // Entries of segments that are not there any more are not kept.
     for (auto& [hash, entry] : entries) {
-        if (SegById(state, entry.seg)) {
+        if (const PrtSegment* seg = SegById(state, entry.seg)) {
+            entry.on_disk = seg->bytes != 0; // PRT-SPLASHVERIFY (Round 19)
             state.map.emplace(hash, entry);
         } else if (!state.unverified.contains(hash)) {
             state.unverified[hash] = "segment missing";
@@ -4864,8 +4946,11 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
                 given_total >> 20, cap == 0 ? std::string{"none (Unlimited)"} : std::to_string(cap),
                 state.session, state.unverified.size());
     // The old single file is not read with segments on (it was imported when there were no
-    // shards); a leftover one beside imported shards goes, as PRT-DRVSINGLE did.
-    if (std::filesystem::is_regular_file(base, ec) && PrtDriverSingleDeleteOn()) {
+    // shards); a leftover one beside imported shards goes, as PRT-DRVSINGLE did. Round 19: only
+    // the plain <cache>.vkpipelinecache, never a .segN or .segindex file.
+    const std::string base_name = base.filename().string();
+    const bool plain_file = base_name.ends_with(".vkpipelinecache");
+    if (plain_file && std::filesystem::is_regular_file(base, ec) && PrtDriverSingleDeleteOn()) {
         const u64 bytes = std::filesystem::file_size(base, ec);
         std::filesystem::remove(base, ec);
         LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: old single file {} ({} MB) {}",
@@ -4908,6 +4993,7 @@ void PipelineCache::PrtSaveDriverSegments(bool wait, const char* why) {
         id = open->id;
         gen = state.save_gen++;
         state.open_assigned_since_save = 0;
+        state.seal_check_at = 1000; // PRT-DRVSEAL
         state.last_save = std::chrono::steady_clock::now();
     }
     pipelines_at_driver_save = num_new_pipelines;
@@ -4994,7 +5080,10 @@ void PipelineCache::PrtDriverCacheExit() {
     if (counted) {
         ++state.session;
     }
-    // PRT-DRVMIGRATE: an imported shard with under 10% driver hits (100+ creates) goes once.
+    // PRT-DRVMIGRATE: an imported shard under the percent rule (Round 19: 50%, Round 18: 10%) of
+    // driver hits (100+ creates) goes once; the splash prewarm builds its pipelines again into
+    // the open segment (PRT-DRVSEAL seals it at the segment size).
+    const u32 migrate_pct = PrtDrvMigratePercent();
     for (auto& seg : state.segs) {
         if (!seg->migrated || seg->judged || seg->dropped || seg->hit_slot < 0) {
             continue;
@@ -5007,17 +5096,20 @@ void PipelineCache::PrtDriverCacheExit() {
                         seg->id, creates);
             continue;
         }
-        if (hits * 10 < creates) {
+        if (u64{hits} * 100 < u64{creates} * migrate_pct) {
             const u32 used = PrtSegDropLocked(state, *seg, std::max<u32>(PrtDrvStaleSessions(), 1));
             LOG_WARNING(Render_Vulkan,
                         "PRT-DRVMIGRATE: seg{} (imported shard, {} MB) had {}/{} driver hits "
-                        "({:.1f}%, under 10%): dropped once; {} used pipelines built again at the "
+                        "({:.1f}%, under {}%): dropped once; {} used pipelines built again at the "
                         "splash next start",
-                        seg->id, seg->bytes >> 20, hits, creates, PrtPercent(hits, creates), used);
+                        seg->id, seg->bytes >> 20, hits, creates, PrtPercent(hits, creates),
+                        migrate_pct, used);
         } else {
             seg->judged = true;
-            LOG_WARNING(Render_Vulkan, "PRT-DRVMIGRATE: seg{} kept: {}/{} driver hits ({:.1f}%)",
-                        seg->id, hits, creates, PrtPercent(hits, creates));
+            seg->judged_pct = migrate_pct;
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-DRVMIGRATE: seg{} kept: {}/{} driver hits ({:.1f}%, {}% needed)",
+                        seg->id, hits, creates, PrtPercent(hits, creates), migrate_pct);
         }
     }
     // PRT-DRVSTALE: a sealed segment at least N counted sessions old whose pipelines were mostly
@@ -5064,6 +5156,8 @@ void PipelineCache::PrtDrvTimer(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:DrvCacheTimer");
     using namespace std::chrono_literals;
     auto last_log = std::chrono::steady_clock::now();
+    auto last_seal_check = last_log;
+    u64 last_race_private_mb = 0; // PRT-DRVMEM race lines (Round 19)
     while (!stop.stop_requested()) {
         for (int step = 0; step < 10 && !stop.stop_requested(); ++step) {
             std::this_thread::sleep_for(100ms);
@@ -5072,10 +5166,32 @@ void PipelineCache::PrtDrvTimer(std::stop_token stop) {
             break;
         }
         const auto now = std::chrono::steady_clock::now();
+        bool ten_s = false;
         if (now - last_log >= 10s) {
             last_log = now;
+            ten_s = true;
             PrtDrvHitLog(false);
         }
+#ifdef RYTY_GPU
+        // PRT-DRVMEM (Round 19, RYGT_DRIVER_CACHE_MEM_LOG): every 10 s in a race, what the process
+        // holds, to find what grows to ~15 GB private by exit (the cache load is +3.15 GB).
+        if (ten_s && PrtDrvMemOn() && RytyRaceRunning()) {
+            const auto [private_mb, working_mb] = PrtProcessMemoryMb();
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-DRVMEM: race: process private {} MB ({}{} MB in 10 s), working set {} "
+                        "MB",
+                        private_mb, private_mb >= last_race_private_mb ? "+" : "-",
+                        last_race_private_mb == 0
+                            ? u64{0}
+                            : (private_mb >= last_race_private_mb
+                                   ? private_mb - last_race_private_mb
+                                   : last_race_private_mb - private_mb),
+                        working_mb);
+            last_race_private_mb = private_mb;
+        } else if (ten_s) {
+            last_race_private_mb = 0;
+        }
+#endif
         if (!PrtSegActive()) {
             continue;
         }
@@ -5087,6 +5203,41 @@ void PipelineCache::PrtDrvTimer(std::stop_token stop) {
             state.content_session.store(true, std::memory_order_relaxed);
         }
 #endif
+        // PRT-DRVSEAL (Round 19): a long splash rebuild seals the open segment at its size.
+        if (PrtDrvSealEarlyOn() && !in_race && !driver_cache_writing.load() &&
+            now - last_seal_check >= 10s) {
+            vk::PipelineCache open_cache{};
+            u32 open_id = 0;
+            {
+                std::scoped_lock lock{state.mutex};
+                if (state.open_assigned_since_save >= state.seal_check_at) {
+                    if (const PrtSegment* open = SegById(state, state.open_id)) {
+                        open_cache = open->handle;
+                        open_id = open->id;
+                    }
+                    state.seal_check_at = state.open_assigned_since_save + 1000;
+                }
+            }
+            if (open_cache) {
+                last_seal_check = now;
+                size_t held = 0;
+                void* no_data = nullptr;
+                const auto result = state.device.getPipelineCacheData(open_cache, &held, no_data);
+                if (result == vk::Result::eSuccess && held >= PrtDrvSegBytes()) {
+                    std::unique_lock lookup{lookup_mutex, std::try_to_lock};
+                    if (lookup.owns_lock()) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRT-DRVSEAL: open seg{} holds {} MB (segment size {} MB): "
+                                    "saved now to seal it",
+                                    open_id, held >> 20, PrtDrvSegBytes() >> 20);
+                        PrtSaveDriverSegments(false, "segment full");
+                        continue;
+                    }
+                    std::scoped_lock lock{state.mutex};
+                    state.seal_check_at = state.open_assigned_since_save; // next second
+                }
+            }
+        }
         if (!PrtDrvIdleSaveOn() || in_race || g_game_in_play.load(std::memory_order_relaxed) ||
             driver_cache_writing.load()) {
             continue;

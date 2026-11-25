@@ -25443,6 +25443,104 @@ void NativeRenderer::EvictImages() {
             idle_bytes = 0;
         }
     }
+    // PRT-VRAMHEAD (pr-tests, Round 19, RYGT_VRAM_HEADROOM_MB, GT7 512; 0 = off): the trims above
+    // act only once VRAM is over the budget. From budget minus this headroom (5830 MB on a 6342 MB
+    // budget) idle textures loaded from guest memory (a reload is an upload, their bytes are still
+    // there) go early, a few each frame, harder the closer VRAM is to the budget: from 4 a frame
+    // idle 120 frames or more at the start of the headroom (the kept textures too from a quarter
+    // into it), to 64 a frame idle 30 frames or more at the budget. Pictures the GPU wrote (FIX-157, FIX-GT7-153) stay.
+    // Round 18 test: race hitches of 250-500 ms with the GPU at 88-135 ms a frame (paging) only at
+    // VRAM 6320-6393 of 6342 MB; at 5.9 GB only small ones. Every 10 s (in a race, or when it let
+    // textures go): VRAM, the target, MB let go, checks over budget, and textures it let go that
+    // were made again at the same address and size (a reload: a pop risk).
+    static const u64 headroom = [] {
+        const char* env = std::getenv("RYGT_VRAM_HEADROOM_MB");
+        if (env && *env) {
+            return std::min<u64>(std::strtoull(env, nullptr, 10), 4096) << 20;
+        }
+        return Common::IsGt7() ? u64{512} << 20 : u64{0};
+    }();
+    if (headroom != 0 && !pressure && frame > KeepFrames) {
+        struct HeadEvicted {
+            u64 frame;
+            u64 size;
+        };
+        static u64 head_checked = 0;
+        static u64 head_used = 0;
+        static u64 head_budget = 0;
+        static u64 head_checks = 0, head_over = 0, head_count = 0, head_bytes = 0;
+        static u64 head_reloads = 0, head_reload_bytes = 0, head_peak = 0;
+        static u32 head_shard = 0;
+        static std::unordered_map<u64, HeadEvicted> head_evicted; // address ^ size << 40
+        static auto head_logged = std::chrono::steady_clock::now();
+        if (frame >= head_checked + 10) {
+            head_checked = frame;
+            head_budget = r.instance.GetTotalMemoryBudget();
+            head_used = head_budget ? r.instance.GetDeviceMemoryUsage() : 0;
+            ++head_checks;
+            head_over += head_budget && head_used > head_budget ? 1 : 0;
+            head_peak = std::max(head_peak, head_used);
+        }
+        const u64 target = head_budget > headroom ? head_budget - headroom : 0;
+        if (head_budget != 0 && head_used > target) {
+            const double closeness =
+                std::min(1.0, double(head_used - target) / double(std::max<u64>(headroom, 1)));
+            const u64 idle_frames = std::max<u64>(30, KeepFrames - u64(closeness * 90.0));
+            const u32 per_frame = 4u + u32(closeness * 60.0);
+            if (frame > idle_frames) {
+                const auto on_head_evict = [&](Native::ImageEntry& entry) {
+                    const u64 size = std::max<u64>(entry.info.guest_size, 1);
+                    ++head_count;
+                    head_bytes += size;
+                    if (head_evicted.size() < 65536) {
+                        head_evicted[entry.info.guest_address ^ (size << 40)] = {frame, size};
+                    }
+                    on_evict(entry);
+                };
+                registry->Evict(frame - idle_frames, on_head_evict, [&](Native::ImageEntry& entry) {
+                    // The kept textures go too once VRAM is a quarter into the headroom.
+                    return !entry.from_cpu || !entry.image || !loaded_texture(entry) ||
+                           (closeness < 0.25 && kept_textures.contains(&entry)) || keep(entry);
+                }, per_frame);
+            }
+        }
+        // Reloads: a texture let go early made again (same address and size) within 30 s.
+        if (!head_evicted.empty()) {
+            registry->ForEachImageInShard(head_shard, [&](Native::ImageEntry& entry) {
+                if (!entry.from_cpu) {
+                    return;
+                }
+                const u64 size = std::max<u64>(entry.info.guest_size, 1);
+                const auto it = head_evicted.find(entry.info.guest_address ^ (size << 40));
+                if (it != head_evicted.end() && entry.made_frame >= it->second.frame) {
+                    ++head_reloads;
+                    head_reload_bytes += size;
+                    head_evicted.erase(it);
+                }
+            });
+            head_shard = (head_shard + 1) % Native::ImageRegistry::ShardCount();
+            if (frame % 600 == 0) {
+                std::erase_if(head_evicted,
+                              [&](const auto& item) { return item.second.frame + 1800 < frame; });
+            }
+        }
+        const auto head_now = std::chrono::steady_clock::now();
+        if (head_now - head_logged >= std::chrono::seconds{10}) {
+            head_logged = head_now;
+            if (head_count != 0 || head_reloads != 0 || RytyRaceRunning()) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-VRAMHEAD [{}]: VRAM {} of {} MB (peak {} MB), headroom target {} "
+                            "MB; last 10 s: {} idle textures let go early ({:.0f} MB), over budget "
+                            "at {} of {} checks, {} let go textures made again ({:.0f} MB){}",
+                            Common::PrtHitch::LocalClock(), head_used >> 20, head_budget >> 20,
+                            head_peak >> 20, target >> 20, head_count, head_bytes / 1048576.0,
+                            head_over, head_checks, head_reloads, head_reload_bytes / 1048576.0,
+                            RytyRaceRunning() ? " (in a race)" : "");
+            }
+            head_checks = head_over = head_count = head_bytes = 0;
+            head_reloads = head_reload_bytes = head_peak = 0;
+        }
+    }
     if (RecycleFrameTextures()) {
         // PERF-SGT-021: per-frame textures go after a few idle frames, so a handful of
         // images of each shape go round (not one for each of the last 120 frames).
