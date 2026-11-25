@@ -49,6 +49,7 @@
 #include "video_core/renderer_vulkan/draw_selection_identity.h"
 #include "video_core/renderer_vulkan/native_fence_batch.h"
 #include "common/elf_info.h"
+#include "common/prt_hitch.h" // PRT-RBWAIT (pr-tests, Round 20)
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/shadow.h"
@@ -3321,6 +3322,187 @@ static bool Gt7SpunLabelAny(VAddr address) {
                    (address >= 0x10200004e0 && address < 0x1020000500));
 }
 
+#ifdef RYTY_GPU
+bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
+#endif
+static bool PrtRbRaceNow() {
+#ifdef RYTY_GPU
+    return RytyRaceRunning();
+#else
+    return false;
+#endif
+}
+
+// PRT-RBWAIT (pr-tests, Round 20, RYGT_READBACK_WAIT_LOG, GT7 on; 0 = off): r19-2's first lap
+// stutter was readback DeferFenceSignal waits (100+ small waits a frame at the race start). In a
+// race, each fence that carries readback data is timed from DeferFenceSignal to its data landing in
+// guest memory (the priority thread's wait for the GPU included), by the caller's site and the
+// readback size; every 10 s the top 5 sites by time.
+static bool PrtRbWaitOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_READBACK_WAIT_LOG");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+// PRT-RBBATCH (pr-tests, Round 20, RYGT_READBACK_BATCH, GT7 on (owner OK 2026-11-25 14:27); 0 =
+// off, 1 = 2000 us, n = us up to 20000; GT Sport off): a fence that would submit at once only
+// because readbacks are pending is held (rides the next submit), so the readbacks of one batch
+// share one GPU tick and the priority thread waits once for all of them instead of once each.
+// Stale data guard, strict: the readback data still lands in guest memory before that fence's
+// label is written (same deferred operation, order unchanged), so the guest cannot see the label
+// before the data; every CPU wait on the timeline (Scheduler::Wait), a GPU WAIT_REG_MEM
+// (FlushForDeferredFences) and the recorder going idle (the guest waiting on a label) submit the
+// batch first; EOP flush fences, GT7's spun labels, fences whose address has an earlier deferred
+// write and labels inside a readback target are never held; a batch is held at most n us from its
+// first fence.
+static u32 PrtReadbackBatchUs() {
+    static const u32 us = [] {
+        if (!Common::IsGt7()) {
+            return 0u;
+        }
+        const char* env = std::getenv("RYGT_READBACK_BATCH");
+        const unsigned long value = (env && *env) ? std::strtoul(env, nullptr, 10) : 1ul;
+        if (value == 0) {
+            return 0u;
+        }
+        const u32 result = value == 1 ? 2000u : u32(std::clamp<unsigned long>(value, 100, 20000));
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-RBBATCH: on, readback fences of one batch share one GPU wait (held at "
+                    "most {} us)",
+                    result);
+        return result;
+    }();
+    return us;
+}
+
+namespace {
+struct PrtRbSite {
+    const char* file = nullptr;
+    u32 line = 0;
+    u32 bucket = 0;
+    u64 count = 0;
+    u64 us = 0;
+    u64 max_us = 0;
+};
+struct PrtRbWaitTable {
+    std::mutex mutex;
+    std::vector<PrtRbSite> sites;
+    s64 window_start_ns = 0;
+    u64 fences = 0;
+    u64 us = 0;
+};
+PrtRbWaitTable& RbWait() {
+    static auto* table = new PrtRbWaitTable();
+    return *table;
+}
+std::atomic<u64> g_rb_batch_tick{~u64{0}}; // PRT-RBBATCH: the tick the held batch rides
+std::atomic<s64> g_rb_batch_first_us{0};
+std::atomic<u64> g_rb_batch_held{0};
+std::atomic<u64> g_rb_batch_batches{0};
+std::atomic<u64> g_rb_batch_capped{0};
+
+s64 PrtRbNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+u32 PrtRbBucket(u64 bytes) {
+    return bytes == 0 ? 0u : bytes <= (4u << 10) ? 1u : bytes <= (64u << 10) ? 2u
+                                                  : bytes <= (1u << 20)      ? 3u
+                                                                              : 4u;
+}
+
+const char* PrtRbBucketText(u32 bucket) {
+    static constexpr const char* text[] = {"buffer only", "<=4 KB", "<=64 KB", "<=1 MB", ">1 MB"};
+    return text[bucket < 5 ? bucket : 4];
+}
+
+std::string PrtRbFile(const char* path) {
+    if (path == nullptr) {
+        return "?";
+    }
+    const char* name = path;
+    for (const char* c = path; *c; ++c) {
+        if (*c == '/' || *c == '\\') {
+            name = c + 1;
+        }
+    }
+    return name;
+}
+} // namespace
+
+// PRT-RBWAIT: one readback fence's data landed `us` after DeferFenceSignal (priority thread).
+static void PrtRbWaitNote(const char* file, u32 line, u64 bytes, u64 us) {
+    auto& table = RbWait();
+    const s64 now = PrtRbNowNs();
+    std::string report;
+    {
+        std::scoped_lock lock{table.mutex};
+        if (!PrtRbRaceNow()) {
+            table.sites.clear();
+            table.fences = table.us = 0;
+            table.window_start_ns = 0;
+            return;
+        }
+        const u32 bucket = PrtRbBucket(bytes);
+        PrtRbSite* site = nullptr;
+        for (auto& s : table.sites) {
+            if (s.file == file && s.line == line && s.bucket == bucket) {
+                site = &s;
+                break;
+            }
+        }
+        if (site == nullptr) {
+            if (table.sites.size() < 64) {
+                table.sites.push_back(PrtRbSite{file, line, bucket});
+            }
+            site = &table.sites.back();
+        }
+        ++site->count;
+        site->us += us;
+        site->max_us = std::max(site->max_us, us);
+        ++table.fences;
+        table.us += us;
+        if (table.window_start_ns == 0) {
+            table.window_start_ns = now;
+        }
+        if (now - table.window_start_ns >= 10'000'000'000ll) {
+            std::vector<PrtRbSite> order = table.sites;
+            std::sort(order.begin(), order.end(),
+                      [](const PrtRbSite& a, const PrtRbSite& b) { return a.us > b.us; });
+            std::string top;
+            for (size_t i = 0; i < order.size() && i < 5; ++i) {
+                top += fmt::format("{}{}:{} {} {}x {:.1f} ms (max {:.1f})", top.empty() ? "" : ", ",
+                                   PrtRbFile(order[i].file), order[i].line,
+                                   PrtRbBucketText(order[i].bucket), order[i].count,
+                                   double(order[i].us) / 1000.0, double(order[i].max_us) / 1000.0);
+            }
+            report = fmt::format(
+                "PRT-RBWAIT [{}]: last {:.1f} s in a race: {} readback fences, {:.1f} ms from fence "
+                "to data landed; top 5: {}{}",
+                Common::PrtHitch::LocalClock(), double(now - table.window_start_ns) / 1e9,
+                table.fences, double(table.us) / 1000.0, top,
+                PrtReadbackBatchUs() != 0
+                    ? fmt::format("; PRT-RBBATCH: {} fences held in {} batches, {} at the {} us cap",
+                                  g_rb_batch_held.exchange(0), g_rb_batch_batches.exchange(0),
+                                  g_rb_batch_capped.exchange(0), PrtReadbackBatchUs())
+                    : std::string{});
+            table.sites.clear();
+            table.fences = table.us = 0;
+            table.window_start_ns = now;
+        }
+    }
+    if (!report.empty()) {
+        LOG_WARNING(Render_Vulkan, "{}", report);
+    }
+}
+
 void Rasterizer::PrtFenceBatchReport(s64 now_us) {
     s64 last = prt_fence_batch_report_us.load(std::memory_order_relaxed);
     if (last == 0) {
@@ -3371,7 +3553,7 @@ void Rasterizer::OnRecorderIdle() {
 
 bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
                                   bool compute_queue, std::span<const u8> value,
-                                  bool flush) {
+                                  bool flush, std::source_location loc) {
     // Hardware writes a fence when the work before it has finished. With readbacks pending,
     // signal after the GPU completes instead of draining the GPU now. A later write to an address
     // that already has a deferred write is deferred too, so that address keeps its order;
@@ -3502,6 +3684,25 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     if (brings_data) {
         ++readback_fences;
     }
+    // PRT-RBWAIT / PRT-RBBATCH (Round 20): this fence's readback bytes, and whether its label lies
+    // inside one of its readback targets (never held then).
+    u64 rb_bytes = 0;
+    bool label_in_target = false;
+    for (const auto& readback : readbacks) {
+        rb_bytes += readback.size;
+        label_in_target = label_in_target || (address >= readback.address &&
+                                              address < readback.address + readback.size);
+    }
+    for (const auto& readback : async_readbacks) {
+        if (readback) {
+            rb_bytes += readback->size;
+            label_in_target = label_in_target || (address >= readback->address &&
+                                                  address < readback->address + readback->size);
+        }
+    }
+    const s64 rb_from_ns = brings_data && PrtRbWaitOn() ? PrtRbNowNs() : 0;
+    const char* const rb_file = loc.file_name();
+    const u32 rb_line = static_cast<u32>(loc.line());
     {
         std::scoped_lock lk{deferred_fences_mutex};
         ++deferred_fence_addresses[address];
@@ -3527,9 +3728,14 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
          deferred_at,
 #endif
          brings_data, readbacks = std::move(readbacks),
-         async_readbacks = std::move(async_readbacks), signal = std::move(signal)]() mutable {
+         async_readbacks = std::move(async_readbacks), signal = std::move(signal), rb_from_ns,
+         rb_file, rb_line, rb_bytes]() mutable {
             texture_cache.CompleteReadbacks(readbacks);
             buffer_cache.CompleteAsyncReadbacks(async_readbacks);
+            if (rb_from_ns != 0) { // PRT-RBWAIT (Round 20)
+                PrtRbWaitNote(rb_file, rb_line, rb_bytes,
+                              u64(std::max<s64>(PrtRbNowNs() - rb_from_ns, 0) / 1000));
+            }
 #ifdef RYTY_GPU
             Common::ScopedMappingWritebackToken mapping_scope{mapping_token};
 #endif
@@ -3592,6 +3798,26 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
             ++prt_fence_batch_held;
         }
         PrtFenceBatchReport(now_us);
+    }
+    // PRT-RBBATCH (Round 20, RYGT_READBACK_BATCH): see PrtReadbackBatchUs for the guard.
+    if (submit_now && readbacks_pending && brings_data && !flush && !hold_flush &&
+        !address_pending && !label_in_target && PrtReadbackBatchUs() != 0 && liverpool &&
+        liverpool->Pipelined() && !Gt7SpunLabelAny(address)) {
+        const u64 tick = scheduler.CurrentTick();
+        const s64 now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (g_rb_batch_tick.exchange(tick, std::memory_order_acq_rel) != tick) {
+            // A submit since the last held fence: this one opens a new batch.
+            g_rb_batch_first_us.store(now_us, std::memory_order_relaxed);
+            ++g_rb_batch_batches;
+        }
+        if (now_us - g_rb_batch_first_us.load(std::memory_order_relaxed) <
+            s64(PrtReadbackBatchUs())) {
+            submit_now = false;
+            ++g_rb_batch_held;
+        } else {
+            ++g_rb_batch_capped; // held long enough: the batch submits with this fence
+        }
     }
     if (submit_now) {
         scheduler.Flush();

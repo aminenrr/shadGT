@@ -649,6 +649,9 @@ private:
     /// Round 18 (pr-tests): PRT-DRVSEG segment files + index, PRT-DRVHIT / PRT-DRVSAVE timer.
     void PrtCreateDriverSegments(const std::filesystem::path& base);
     void PrtSaveDriverSegments(bool wait, const char* why);
+    /// PRT-DRVSEAL drain (pr-tests, Round 20): seals a segment on the writer thread once no
+    /// create uses it (new creates go to a fresh open segment first).
+    void PrtStartDrainSeal(u32 id, const char* why);
     void PrtDriverCacheExit();
     void PrtStartDriverCacheTimer();
     void PrtDrvTimer(std::stop_token stop);

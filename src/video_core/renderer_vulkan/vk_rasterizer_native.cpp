@@ -25473,6 +25473,30 @@ void NativeRenderer::EvictImages() {
         static u32 head_shard = 0;
         static std::unordered_map<u64, HeadEvicted> head_evicted; // address ^ size << 40
         static auto head_logged = std::chrono::steady_clock::now();
+        // PRT-VRAMHEAD reload backoff (pr-tests, Round 20, RYGT_VRAM_HEAD_BACKOFF, GT7 on; 0 = off):
+        // r19-1b let go and made again up to 567 MB of textures in 10 s (thrash). A texture let go
+        // and made again within 10 s is kept (not let go early again) for the rest of the race;
+        // when the reloads of a 10 s window pass 30% of the MB let go, the eviction rate halves
+        // (again each such window, down to an eighth), back to normal after 30 s without one.
+        static const bool head_backoff = [] {
+            const char* env = std::getenv("RYGT_VRAM_HEAD_BACKOFF");
+            if (env && *env) {
+                return env[0] != '0';
+            }
+            return Common::IsGt7();
+        }();
+        static std::unordered_set<u64> head_kept; // address ^ size << 40, this race
+        static u64 head_kept_now = 0, head_kept_bytes = 0;
+        static u32 head_backoff_level = 0;   // rate >> level
+        static u32 head_quiet_windows = 0;   // 10 s windows without a thrash
+        static u64 head_window_frames = 600; // frames in the last 10 s window
+        static u64 head_window_start_frame = frame;
+        static bool head_was_racing = false;
+        const bool head_racing = RytyRaceRunning();
+        if (head_was_racing && !head_racing && !head_kept.empty()) {
+            head_kept.clear(); // the race ended: kept only for the rest of that race
+        }
+        head_was_racing = head_racing;
         if (frame >= head_checked + 10) {
             head_checked = frame;
             head_budget = r.instance.GetTotalMemoryBudget();
@@ -25486,7 +25510,8 @@ void NativeRenderer::EvictImages() {
             const double closeness =
                 std::min(1.0, double(head_used - target) / double(std::max<u64>(headroom, 1)));
             const u64 idle_frames = std::max<u64>(30, KeepFrames - u64(closeness * 90.0));
-            const u32 per_frame = 4u + u32(closeness * 60.0);
+            const u32 per_frame =
+                std::max<u32>(1u, (4u + u32(closeness * 60.0)) >> head_backoff_level);
             if (frame > idle_frames) {
                 const auto on_head_evict = [&](Native::ImageEntry& entry) {
                     const u64 size = std::max<u64>(entry.info.guest_size, 1);
@@ -25500,7 +25525,11 @@ void NativeRenderer::EvictImages() {
                 registry->Evict(frame - idle_frames, on_head_evict, [&](Native::ImageEntry& entry) {
                     // The kept textures go too once VRAM is a quarter into the headroom.
                     return !entry.from_cpu || !entry.image || !loaded_texture(entry) ||
-                           (closeness < 0.25 && kept_textures.contains(&entry)) || keep(entry);
+                           (closeness < 0.25 && kept_textures.contains(&entry)) ||
+                           (!head_kept.empty() &&
+                            head_kept.contains(entry.info.guest_address ^
+                                               (std::max<u64>(entry.info.guest_size, 1) << 40))) ||
+                           keep(entry);
                 }, per_frame);
             }
         }
@@ -25515,6 +25544,14 @@ void NativeRenderer::EvictImages() {
                 if (it != head_evicted.end() && entry.made_frame >= it->second.frame) {
                     ++head_reloads;
                     head_reload_bytes += size;
+                    // Round 20: made again within 10 s (frames of the last 10 s window): kept for
+                    // the rest of the race.
+                    if (head_backoff && head_racing &&
+                        entry.made_frame - it->second.frame <= head_window_frames &&
+                        head_kept.size() < 65536 && head_kept.insert(it->first).second) {
+                        ++head_kept_now;
+                        head_kept_bytes += size;
+                    }
                     head_evicted.erase(it);
                 }
             });
@@ -25527,18 +25564,39 @@ void NativeRenderer::EvictImages() {
         const auto head_now = std::chrono::steady_clock::now();
         if (head_now - head_logged >= std::chrono::seconds{10}) {
             head_logged = head_now;
+            head_window_frames = std::max<u64>(frame - head_window_start_frame, 1);
+            head_window_start_frame = frame;
+            // Round 20: reloads past 30% of the MB let go halve the rate; 30 s quiet: normal.
+            const char* backoff_note = "";
+            if (head_backoff) {
+                if (head_bytes != 0 && head_reload_bytes * 10 > head_bytes * 3) {
+                    head_quiet_windows = 0;
+                    if (head_backoff_level < 3) {
+                        ++head_backoff_level;
+                        backoff_note = ", reloads over 30%: rate halved";
+                    }
+                } else if (head_backoff_level != 0 && ++head_quiet_windows >= 3) {
+                    head_backoff_level = 0;
+                    head_quiet_windows = 0;
+                    backoff_note = ", 30 s quiet: rate back to normal";
+                }
+            }
             if (head_count != 0 || head_reloads != 0 || RytyRaceRunning()) {
                 LOG_WARNING(Render_Vulkan,
                             "PRT-VRAMHEAD [{}]: VRAM {} of {} MB (peak {} MB), headroom target {} "
                             "MB; last 10 s: {} idle textures let go early ({:.0f} MB), over budget "
-                            "at {} of {} checks, {} let go textures made again ({:.0f} MB){}",
+                            "at {} of {} checks, {} let go textures made again ({:.0f} MB), {} kept "
+                            "after reload ({:.0f} MB; {} kept this race), rate 1/{}{}{}",
                             Common::PrtHitch::LocalClock(), head_used >> 20, head_budget >> 20,
                             head_peak >> 20, target >> 20, head_count, head_bytes / 1048576.0,
                             head_over, head_checks, head_reloads, head_reload_bytes / 1048576.0,
+                            head_kept_now, head_kept_bytes / 1048576.0, head_kept.size(),
+                            1u << head_backoff_level, backoff_note,
                             RytyRaceRunning() ? " (in a race)" : "");
             }
             head_checks = head_over = head_count = head_bytes = 0;
             head_reloads = head_reload_bytes = head_peak = 0;
+            head_kept_now = head_kept_bytes = 0;
         }
     }
     if (RecycleFrameTextures()) {

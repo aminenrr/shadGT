@@ -1130,6 +1130,20 @@ extern "C" __declspec(dllexport) int RytyGpuNeoSupported() {
     return 1;
 }
 
+namespace Vulkan {
+void PrtDrvTrackNoteGuestFile(const char* path); // PRT-DRVTRACK, vk_pipeline_cache.cpp
+}
+
+// PRT-DRVTRACK (pr-tests, Round 20, RYGT_DRIVER_CACHE_TRACK): RyGT's libkernel passes each guest
+// file the game opens for reading; a course path names the track whose pipelines get their own
+// driver cache segments.
+extern "C" __declspec(dllexport) void RytyGpuNoteGuestFile(const char* path) noexcept {
+    try {
+        Vulkan::PrtDrvTrackNoteGuestFile(path);
+    } catch (...) {
+    }
+}
+
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {

@@ -9,6 +9,7 @@
 #include "common/recycling_pool.h"
 
 #include <optional>
+#include <source_location>
 #include <span>
 
 #include <array>
@@ -315,9 +316,11 @@ public:
     /// Defers a graphics fence signal until the GPU completes when readbacks are pending or
     /// another fence is already deferred. Returns false if the caller should signal now.
     /// value: the bytes the fence will write, when known when it is processed (PERF-014).
+    /// PRT-RBWAIT (pr-tests, Round 20): loc names the caller's site in the readback wait line.
     bool DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
                           bool compute_queue = false, std::span<const u8> value = {},
-                          bool flush = true);
+                          bool flush = true,
+                          std::source_location loc = std::source_location::current());
     /// D5: submits fences deferred without a submit of their own (recorder out of work).
     void FlushDeferredFences();
     void PrtFenceBatchReport(s64 now_us); // PRT-FENCEBATCH

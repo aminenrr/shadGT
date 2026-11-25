@@ -17,6 +17,25 @@ namespace Vulkan {
 bool PrtDrvHitOn();
 void PrtDrvHitRecord(vk::PipelineCache cache, const vk::PipelineCreationFeedback& feedback);
 
+// PRT-DRVSEAL drain (pr-tests, Round 20, RYGT_DRIVER_CACHE_SEAL_DRAIN, GT7 on): creates in flight
+// per driver cache segment. Begin counts a create on that cache (a slot index, -1 when not
+// counted) and waits while the segment's data is being read for its seal; End uncounts it.
+int PrtDrvInflightBegin(vk::PipelineCache cache);
+// PRT-DRVTRACK (pr-tests, Round 20): a guest file the game opened for reading (RyGT libkernel,
+// through the RytyGpuNoteGuestFile export); a course path names the track being loaded.
+void PrtDrvTrackNoteGuestFile(const char* path);
+void PrtDrvInflightEnd(int slot);
+
+struct PrtDrvInflightScope {
+    int slot;
+    explicit PrtDrvInflightScope(vk::PipelineCache cache) : slot{PrtDrvInflightBegin(cache)} {}
+    ~PrtDrvInflightScope() {
+        PrtDrvInflightEnd(slot);
+    }
+    PrtDrvInflightScope(const PrtDrvInflightScope&) = delete;
+    PrtDrvInflightScope& operator=(const PrtDrvInflightScope&) = delete;
+};
+
 // One create's feedback. Chain() returns a copy of the create info with the feedback struct in
 // front of its pNext chain (unchanged when PRT-DRVHIT is off); Done() counts the answer. The probe
 // must outlive the create call and must not be moved after Chain().
@@ -26,9 +45,23 @@ struct PrtDrvHitProbe {
     vk::PipelineCreationFeedbackCreateInfo info{};
     vk::PipelineCache cache{};
     bool chained = false;
+    int inflight_slot = -1; // PRT-DRVSEAL drain (Round 20): counted from Chain() to the end
+
+    PrtDrvHitProbe() = default;
+    ~PrtDrvHitProbe() {
+        PrtDrvInflightEnd(inflight_slot);
+    }
+    PrtDrvHitProbe(const PrtDrvHitProbe&) = delete;
+    PrtDrvHitProbe& operator=(const PrtDrvHitProbe&) = delete;
+
+    void CountInflight(vk::PipelineCache cache_) {
+        PrtDrvInflightEnd(inflight_slot);
+        inflight_slot = PrtDrvInflightBegin(cache_);
+    }
 
     vk::GraphicsPipelineCreateInfo Chain(const vk::GraphicsPipelineCreateInfo& create_info,
                                          vk::PipelineCache cache_) {
+        CountInflight(cache_);
         vk::GraphicsPipelineCreateInfo out = create_info;
         if (!PrtDrvHitOn()) {
             return out;
@@ -48,6 +81,7 @@ struct PrtDrvHitProbe {
 
     vk::ComputePipelineCreateInfo Chain(const vk::ComputePipelineCreateInfo& create_info,
                                         vk::PipelineCache cache_) {
+        CountInflight(cache_);
         vk::ComputePipelineCreateInfo out = create_info;
         if (!PrtDrvHitOn()) {
             return out;

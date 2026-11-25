@@ -21,6 +21,7 @@
 
 #include <map>
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <array>
 #include <new>
@@ -2866,6 +2867,7 @@ static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
     };
     const auto start = std::chrono::steady_clock::now();
     VkPipeline pipeline = VK_NULL_HANDLE;
+    const PrtDrvInflightScope inflight{cache}; // PRT-DRVSEAL drain (pr-tests, Round 20)
     const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateGraphicsPipelines(
         device, static_cast<VkPipelineCache>(cache), 1, &info, nullptr, &pipeline);
     const double ms =
@@ -3978,6 +3980,159 @@ static bool PrtDrvSealEarlyOn() {
     return on;
 }
 
+// PRT-DRVSEAL drain (Round 20, RYGT_DRIVER_CACHE_SEAL_DRAIN, GT7 on; 0 = Round 19 seal): Round 19
+// run 1 hung at the splash: seg3 was read, saved and sealed while 34 prewarm creates still used its
+// VkPipelineCache, and none of them returned. Now new creates go to a fresh open segment first,
+// creates in flight are counted per segment, and the old segment is read only once its count is 0
+// (new creates on it wait for the read); 30 s without reaching 0: not read, tried again later.
+// Every other save of a segment reads it the same way (no switch). The early seal is started from
+// an estimate (pipelines in the segment times the average size of a sealed segment's pipeline),
+// so the driver is never asked its size while creates run.
+static bool PrtDrvSealDrainOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_SEAL_DRAIN"));
+    return on;
+}
+
+// PRT-DRVTRACK (Round 20, RYGT_DRIVER_CACHE_TRACK, GT7 on; 0 = off): new pipelines built while a
+// track is loaded (a course path the RyGT file layer saw, RytyGpuNoteGuestFile) go to that track's
+// own open segment; menu, shared and car pipelines (built out of a race, or known already) stay in
+// the common segments. A track's segments age out together (PRT-DRVSTALE, its counted sessions).
+static bool PrtDrvTrackOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_TRACK"));
+    return on;
+}
+
+namespace {
+struct PrtTrackSignal {
+    std::mutex mutex;
+    std::string current;                         // track id, empty = none
+    std::string from;                            // the path it came from (log)
+    std::chrono::steady_clock::time_point seen{}; // last course path of it
+    bool raced = false;                          // a race ran on it
+    std::unordered_set<std::string> folders;     // guest folders logged (diag, capped)
+};
+PrtTrackSignal& TrackSignal() {
+    static auto* signal = new PrtTrackSignal();
+    return *signal;
+}
+} // namespace
+
+// PRT-DRVTRACK: the track id in a guest path: the folder after a course folder ("crs", "course",
+// "courses", "track", "tracks"), or that file's name without its extension. Letters, digits,
+// '_' and '-' only, lower case, up to 32. Empty when the path names no course.
+static std::string PrtTrackFromPath(std::string_view path) {
+    std::vector<std::string> parts;
+    std::string part;
+    for (const char c : path) {
+        if (c == '/' || c == '\\') {
+            if (!part.empty()) {
+                parts.push_back(part);
+            }
+            part.clear();
+        } else {
+            part += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    }
+    if (!part.empty()) {
+        parts.push_back(part);
+    }
+    for (size_t i = 0; i + 1 < parts.size(); ++i) {
+        const std::string& folder = parts[i];
+        if (folder != "crs" && folder != "course" && folder != "courses" && folder != "track" &&
+            folder != "tracks") {
+            continue;
+        }
+        std::string id = parts[i + 1];
+        if (i + 2 == parts.size()) {
+            if (const auto dot = id.find('.'); dot != std::string::npos) {
+                id.resize(dot);
+            }
+        }
+        std::string clean;
+        for (const char c : id) {
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
+                clean += c;
+            }
+        }
+        if (clean.size() > 32) {
+            clean.resize(32);
+        }
+        if (clean.empty() || clean == "common" || clean == "share" || clean == "shared" ||
+            clean == "menu") {
+            return {};
+        }
+        return clean;
+    }
+    return {};
+}
+
+// PRT-DRVTRACK: every guest file the game opens for reading (RyGT libkernel sceKernelOpen).
+void PrtDrvTrackNoteGuestFile(const char* path) {
+    if (path == nullptr || !Common::IsGt7() || !PrtDrvTrackOn()) {
+        return;
+    }
+    const std::string_view view{path};
+    const std::string track = PrtTrackFromPath(view);
+    auto& signal = TrackSignal();
+    std::scoped_lock lock{signal.mutex};
+    if (track.empty()) {
+        // Diag: the first 40 guest folders read, to learn GT7's course path if none matches.
+        if (signal.folders.size() < 40) {
+            const auto slash = view.find_last_of("/\\");
+            std::string folder{slash == std::string_view::npos ? view : view.substr(0, slash)};
+            if (folder.size() > 96) {
+                folder.resize(96);
+            }
+            if (signal.folders.insert(folder).second) {
+                LOG_WARNING(Render_Vulkan, "PRT-DRVTRACK: guest folder read: {} ({} of 40 logged)",
+                            folder, signal.folders.size());
+            }
+        }
+        return;
+    }
+    signal.seen = std::chrono::steady_clock::now();
+    if (track != signal.current) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVTRACK: track {} loaded (from {}); its new pipelines go to its own "
+                    "driver cache segments",
+                    track, view.substr(0, std::min<size_t>(view.size(), 128)));
+        signal.current = track;
+        signal.from = std::string{view.substr(0, std::min<size_t>(view.size(), 128))};
+        signal.raced = false;
+    }
+}
+
+// PRT-DRVTRACK: the track new pipelines are tagged with now: the last loaded one, until the race
+// on it ends (back to the menus) or 5 minutes pass after its last course read with no race.
+static std::string PrtTrackActive() {
+    if (!PrtDrvTrackOn()) {
+        return {};
+    }
+    auto& signal = TrackSignal();
+    std::scoped_lock lock{signal.mutex};
+    if (signal.current.empty()) {
+        return {};
+    }
+    bool race = false;
+#ifdef RYTY_GPU
+    race = RytyRaceRunning();
+#endif
+    if (race) {
+        signal.raced = true;
+        return signal.current;
+    }
+    const bool stale = std::chrono::steady_clock::now() - signal.seen > std::chrono::minutes{5};
+    if (signal.raced || stale) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVTRACK: track {} {}; new pipelines go to the common segments",
+                    signal.current, signal.raced ? "race ended" : "not raced in 5 minutes");
+        signal.current.clear();
+        signal.raced = false;
+        return {};
+    }
+    return signal.current;
+}
+
 static bool PrtDrvMemOn() {
     static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_MEM_LOG"));
     return on;
@@ -4034,9 +4189,12 @@ bool PrtDrvHitOn() {
 }
 
 namespace {
-constexpr size_t PrtDrvHitSlots = 32;
+// Round 20: 64 (track segments, PRT-DRVTRACK, add files).
+constexpr size_t PrtDrvHitSlots = 64;
 struct PrtDrvHitSlot {
     std::atomic<u64> handle{0};
+    std::atomic<int> inflight{0};    // PRT-DRVSEAL drain (Round 20): creates on this cache now
+    std::atomic<bool> reading{false}; // PRT-DRVSEAL drain: its data is read for the seal
     std::atomic<u32> creates{0};
     std::atomic<u32> hits{0};
     std::atomic<u32> valid{0};
@@ -4136,6 +4294,43 @@ static void PrtDrvHitThreadReset() {
     t_drvhit_misses = 0;
 }
 
+// PRT-DRVSEAL drain (Round 20): on while driver cache segments are in use.
+static std::atomic<bool> g_prt_inflight_on{false};
+
+int PrtDrvInflightBegin(vk::PipelineCache cache) {
+    if (!g_prt_inflight_on.load(std::memory_order_acquire) || !cache) {
+        return -1;
+    }
+    auto& table = DrvHit();
+    const u64 bits = PrtCacheBits(cache);
+    const u32 used = table.used.load(std::memory_order_acquire);
+    for (u32 i = 0; i < used; ++i) {
+        PrtDrvHitSlot& slot = table.slots[i];
+        if (slot.handle.load(std::memory_order_relaxed) != bits) {
+            continue;
+        }
+        // Counted first, then the read flag looked at (the reader does the reverse), so a read
+        // and a create on the same cache never overlap.
+        slot.inflight.fetch_add(1);
+        while (slot.reading.load()) {
+            slot.inflight.fetch_sub(1);
+            while (slot.reading.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
+            slot.inflight.fetch_add(1);
+        }
+        return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void PrtDrvInflightEnd(int slot) {
+    if (slot < 0 || slot >= static_cast<int>(PrtDrvHitSlots)) {
+        return;
+    }
+    DrvHit().slots[slot].inflight.fetch_sub(1);
+}
+
 static double PrtPercent(u64 part, u64 whole) {
     return whole == 0 ? 0.0 : 100.0 * double(part) / double(whole);
 }
@@ -4222,6 +4417,9 @@ struct PrtSegment {
     vk::UniquePipelineCache owned; // empty for the start-up open segment (pipeline_cache owns it)
     vk::PipelineCache handle{};
     std::filesystem::path path;
+    std::string track;          // PRT-DRVTRACK (Round 20): empty = a common segment
+    bool sealing = false;       // PRT-DRVSEAL drain (Round 20): no longer open, seal waits
+    u32 assigned_since_save = 0; // Round 20: pipelines put in it since its last save
 };
 
 struct PrtSegEntry {
@@ -4257,6 +4455,9 @@ struct PrtSegState {
     std::atomic<u32> used_this_session{0};
     std::atomic<bool> content_session{false};
     bool exit_done = false;
+    // PRT-DRVTRACK (Round 20): each track's open segment (the common one is open_id).
+    std::unordered_map<std::string, u32> open_by_track;
+    bool seal_wanted = false; // PRT-DRVSEAL drain: a save found an open segment past its size
 };
 
 PrtSegState& Seg() {
@@ -4274,8 +4475,10 @@ PrtSegment* SegById(PrtSegState& state, u32 id) {
 }
 
 std::string SegLabel(const PrtSegment& seg) {
-    return fmt::format("seg{} {}{}{}", seg.id, seg.sealed ? "sealed" : "open",
-                       seg.migrated ? " migrated" : "", seg.dropped ? " dropped" : "");
+    return fmt::format("seg{} {}{}{}{}", seg.id,
+                       seg.sealed ? "sealed" : seg.sealing ? "sealing" : "open",
+                       seg.migrated ? " migrated" : "", seg.dropped ? " dropped" : "",
+                       seg.track.empty() ? std::string{} : " track " + seg.track);
 }
 } // namespace
 
@@ -4287,6 +4490,64 @@ static std::filesystem::path PrtSegPath(const std::filesystem::path& base, u32 i
     auto path = base;
     path += fmt::format(".seg{}", id);
     return path;
+}
+
+// Round 20: whether a segment is the open one of its track (common: open_id). Mutex held.
+static bool PrtSegIsOpen(const PrtSegState& state, const PrtSegment& seg) {
+    if (seg.sealed || seg.dropped || seg.sealing) {
+        return false;
+    }
+    if (seg.track.empty()) {
+        return seg.id == state.open_id;
+    }
+    const auto it = state.open_by_track.find(seg.track);
+    return it != state.open_by_track.end() && it->second == seg.id;
+}
+
+// Round 20: a new empty open segment for a track (empty = common), registered as its open one.
+// Mutex held. nullptr when the driver gives no cache.
+static PrtSegment* PrtSegNewOpenLocked(PrtSegState& state, const std::string& track) {
+    auto fresh = std::make_unique<PrtSegment>();
+    fresh->id = state.next_id++;
+    fresh->created_session = state.session;
+    fresh->path = PrtSegPath(state.base, fresh->id);
+    fresh->track = track;
+    auto [result, cache] = state.device.createPipelineCacheUnique({});
+    if (result != vk::Result::eSuccess) {
+        --state.next_id;
+        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: no new segment ({})", vk::to_string(result));
+        return nullptr;
+    }
+    std::error_code ec;
+    std::filesystem::remove(fresh->path, ec); // a stray file of that name is not ours
+    fresh->owned = std::move(cache);
+    fresh->handle = *fresh->owned;
+    fresh->hit_slot = PrtDrvHitRegister(fresh->handle, SegLabel(*fresh));
+    if (track.empty()) {
+        state.open_id = fresh->id;
+    } else {
+        state.open_by_track[track] = fresh->id;
+        LOG_WARNING(Render_Vulkan, "PRT-DRVTRACK: seg{} is the open segment of track {}",
+                    fresh->id, track);
+    }
+    PrtSegment* made = fresh.get();
+    state.segs.push_back(std::move(fresh));
+    return made;
+}
+
+// Round 20: the open segment of a track (empty = common), made when it has none. Mutex held.
+static PrtSegment* PrtSegOpenForLocked(PrtSegState& state, const std::string& track) {
+    if (track.empty()) {
+        PrtSegment* open = SegById(state, state.open_id);
+        return open && !open->dropped && !open->sealed && !open->sealing ? open : nullptr;
+    }
+    if (const auto it = state.open_by_track.find(track); it != state.open_by_track.end()) {
+        if (PrtSegment* seg = SegById(state, it->second);
+            seg && !seg->dropped && !seg->sealed && !seg->sealing) {
+            return seg;
+        }
+    }
+    return PrtSegNewOpenLocked(state, track);
 }
 
 // PRT-DRVSAFE: written beside the file, verified and renamed over it, so a crash or a power cut
@@ -4335,17 +4596,20 @@ static std::string PrtSegIndexText(PrtSegState& state) {
         if (seg->dropped) {
             continue;
         }
-        // The judged field holds the percent rule it was kept by (Round 18 wrote 1).
-        text += fmt::format("S {} {} {} {} {} {}\n", seg->id, seg->sealed ? 1 : 0,
+        // The judged field holds the percent rule it was kept by (Round 18 wrote 1). Round 20:
+        // the track (PRT-DRVTRACK) last, "-" for a common segment.
+        text += fmt::format("S {} {} {} {} {} {} {}\n", seg->id, seg->sealed ? 1 : 0,
                             seg->migrated ? 1 : 0, seg->judged ? std::max<u32>(seg->judged_pct, 1) : 0,
-                            seg->created_session, seg->bytes);
+                            seg->created_session, seg->bytes,
+                            seg->track.empty() ? std::string{"-"} : seg->track);
     }
     for (const auto& [hash, entry] : state.map) {
         const PrtSegment* seg = SegById(state, entry.seg);
         if (!seg || seg->dropped || entry.assign_gen >= seg->saved_gen) {
             continue;
         }
-        text += fmt::format("P {:016x} {} {}\n", hash, entry.seg, entry.last_used);
+        text += fmt::format("P {:016x} {} {} {}\n", hash, entry.seg, entry.last_used,
+                            seg->track.empty() ? std::string{"-"} : seg->track);
     }
     return text;
 }
@@ -4425,50 +4689,16 @@ static u32 PrtSegDropLocked(PrtSegState& state, PrtSegment& seg, u32 window) {
     return used;
 }
 
-// Seals the open segment once its saved data passed the segment size and opens a new one.
-// Pipelines put in it after the snapshot started (assign_gen > gen) are not in its file: they move
-// to the new open segment. With the cap full, PRT-DRVSTALE drops the least used sealed segment.
-// The state's mutex is held.
-static void PrtSegSealLocked(PrtSegState& state, PrtSegment& seg, u32 gen) {
-    seg.sealed = true;
-    auto fresh = std::make_unique<PrtSegment>();
-    fresh->id = state.next_id++;
-    fresh->created_session = state.session;
-    fresh->path = PrtSegPath(state.base, fresh->id);
-    auto [result, cache] = state.device.createPipelineCacheUnique({});
-    if (result != vk::Result::eSuccess) {
-        seg.sealed = false; // keep it open; tried again at the next save
-        --state.next_id;
-        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: no new segment ({}); seg{} stays open",
-                    vk::to_string(result), seg.id);
-        return;
-    }
-    fresh->owned = std::move(cache);
-    fresh->handle = *fresh->owned;
-    fresh->hit_slot = PrtDrvHitRegister(fresh->handle, fmt::format("seg{} open", fresh->id));
-    u32 moved = 0;
-    for (auto& [hash, entry] : state.map) {
-        if (entry.seg == seg.id && entry.assign_gen > gen) {
-            entry.seg = fresh->id;
-            ++moved;
-        }
-    }
-    PrtDrvHitRelabel(seg.hit_slot, SegLabel(seg));
-    const u32 old_open = seg.id;
-    state.open_id = fresh->id;
-    LOG_WARNING(Render_Vulkan,
-                "PRT-DRVSEG: seg{} sealed at {} MB (limit {} MB): loaded every start, never saved "
-                "again; seg{} is the open segment now ({} pipelines built after the save moved "
-                "to it)",
-                old_open, seg.bytes >> 20, PrtDrvSegBytes() >> 20, fresh->id, moved);
-    state.segs.push_back(std::move(fresh));
+// Over the cap of common segments (track segments age out by their own sessions, PRT-DRVTRACK),
+// PRT-DRVSTALE drops the least used common sealed segment, never keep_id. Mutex held.
+static void PrtSegCapLocked(PrtSegState& state, u32 keep_id) {
     const u32 cap = PrtDrvSegMax();
     if (cap == 0) {
         return;
     }
     u32 live = 0;
     for (const auto& s : state.segs) {
-        live += s->dropped ? 0 : 1;
+        live += !s->dropped && s->track.empty() ? 1 : 0;
     }
     if (live <= cap) {
         return;
@@ -4479,7 +4709,7 @@ static void PrtSegSealLocked(PrtSegState& state, PrtSegment& seg, u32 gen) {
     PrtSegment* victim = nullptr;
     double victim_share = 2.0;
     for (auto& s : state.segs) {
-        if (s->dropped || !s->sealed || s->id == old_open) {
+        if (s->dropped || !s->sealed || s->id == keep_id || !s->track.empty()) {
             continue;
         }
         const auto [total, recent] = PrtSegRecentUse(state, s->id, window);
@@ -4501,14 +4731,205 @@ static void PrtSegSealLocked(PrtSegState& state, PrtSegment& seg, u32 gen) {
                 live, cap, victim->id, victim->bytes >> 20, total, recent, window);
 }
 
+// Seals the open segment once its saved data passed the segment size and opens a new one.
+// Pipelines put in it after the snapshot started (assign_gen > gen) are not in its file: they move
+// to the new open segment. With the cap full, PRT-DRVSTALE drops the least used sealed segment.
+// The state's mutex is held. Round 20: the new open segment is of the same track.
+static void PrtSegSealLocked(PrtSegState& state, PrtSegment& seg, u32 gen) {
+    seg.sealed = true;
+    PrtSegment* fresh = PrtSegNewOpenLocked(state, seg.track);
+    if (!fresh) {
+        seg.sealed = false; // keep it open; tried again at the next save
+        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: seg{} stays open", seg.id);
+        return;
+    }
+    u32 moved = 0;
+    for (auto& [hash, entry] : state.map) {
+        if (entry.seg == seg.id && entry.assign_gen > gen) {
+            entry.seg = fresh->id;
+            ++moved;
+        }
+    }
+    PrtDrvHitRelabel(seg.hit_slot, SegLabel(seg));
+    LOG_WARNING(Render_Vulkan,
+                "PRT-DRVSEG: seg{} sealed at {} MB (limit {} MB): loaded every start, never saved "
+                "again; seg{} is the open segment now ({} pipelines built after the save moved "
+                "to it){}",
+                seg.id, seg.bytes >> 20, PrtDrvSegBytes() >> 20, fresh->id, moved,
+                seg.track.empty() ? std::string{} : " (track " + seg.track + ")");
+    PrtSegCapLocked(state, seg.id);
+}
+
+// PRT-DRVSEAL drain (Round 20): waits until no create uses the cache of hit slot `slot` and sets
+// its read flag (new creates on it wait). False after `timeout`. A cache without a slot (the table
+// is full) cannot be counted: read as in Round 19.
+static bool PrtDrainAcquire(int slot, std::chrono::milliseconds timeout) {
+    if (slot < 0) {
+        return true;
+    }
+    auto& entry = DrvHit().slots[slot];
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        if (entry.inflight.load() == 0) {
+            entry.reading.store(true);
+            if (entry.inflight.load() == 0) {
+                return true;
+            }
+            entry.reading.store(false);
+        }
+        if (std::chrono::steady_clock::now() - start >= timeout) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+}
+
+static void PrtDrainRelease(int slot) {
+    if (slot >= 0) {
+        DrvHit().slots[slot].reading.store(false);
+    }
+}
+
+static int PrtInflightOf(int slot) {
+    return slot >= 0 ? DrvHit().slots[slot].inflight.load() : 0;
+}
+
+// PRT-DRVSEAL drain (Round 20): seals segment `id`. New creates go to a fresh open segment of its
+// track first (once: a seal tried again keeps the one it got); then, once its creates in flight
+// reach 0, it is read, saved and sealed. False when it was not (drain timeout, read or write
+// failed): it stays "sealing" (not open, never given to a new pipeline) and is tried again.
+static bool PrtDrainAndSeal(u32 id, std::chrono::milliseconds timeout, const char* why) {
+    auto& state = Seg();
+    vk::PipelineCache cache{};
+    std::filesystem::path path;
+    int slot = -1;
+    u32 fresh_id = 0;
+    std::string track;
+    int at_switch = 0;
+    {
+        std::scoped_lock lock{state.mutex};
+        PrtSegment* seg = SegById(state, id);
+        if (!seg || seg->dropped || seg->sealed) {
+            return false;
+        }
+        if (!seg->sealing) {
+            seg->sealing = true;
+            PrtSegment* fresh = PrtSegNewOpenLocked(state, seg->track);
+            if (!fresh) {
+                seg->sealing = false;
+                return false;
+            }
+            fresh_id = fresh->id;
+        } else if (PrtSegment* open = PrtSegOpenForLocked(state, seg->track)) {
+            fresh_id = open->id;
+        }
+        cache = seg->handle;
+        path = seg->path;
+        slot = seg->hit_slot;
+        track = seg->track;
+        at_switch = PrtInflightOf(slot);
+        PrtDrvHitRelabel(seg->hit_slot, SegLabel(*seg));
+    }
+    const auto drain_start = std::chrono::steady_clock::now();
+    if (!PrtDrainAcquire(slot, timeout)) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVSEAL: seg{} still has {} creates in flight after {} ms ({} at the "
+                    "switch; {}): not read, the seal is tried again later; new pipelines go to "
+                    "seg{}",
+                    id, PrtInflightOf(slot), timeout.count(), at_switch, why, fresh_id);
+        return false;
+    }
+    const auto read_start = std::chrono::steady_clock::now();
+    std::vector<u8> data;
+    try {
+        data = ReadDriverCacheSnapshot(state.device, cache);
+    } catch (...) {
+        data.clear();
+    }
+    PrtDrainRelease(slot);
+    const auto read_end = std::chrono::steady_clock::now();
+    const auto ms = [](auto from, auto to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    if (data.empty() || !PrtWriteFileSafe(path, data, true)) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVSEAL: seg{} drained in {:.0f} ms but {}; the seal is tried again "
+                    "later",
+                    id, ms(drain_start, read_start),
+                    data.empty() ? "no snapshot was read" : "the write failed");
+        return false;
+    }
+    const size_t size = data.size();
+    data.clear();
+    data.shrink_to_fit();
+    {
+        std::scoped_lock lock{state.mutex};
+        PrtSegment* seg = SegById(state, id);
+        if (!seg || seg->dropped) {
+            return false;
+        }
+        seg->bytes = size;
+        seg->sealed = true;
+        seg->sealing = false;
+        // No pipeline is put in it any more and none was being created when it was read.
+        seg->saved_gen = std::numeric_limits<u32>::max();
+        PrtDrvHitRelabel(seg->hit_slot, SegLabel(*seg));
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVSEAL: seg{} drained in {:.0f} ms ({} creates in flight at the switch), "
+                    "saved {} MB (read {:.0f} ms, written {:.0f} ms) and sealed ({}); seg{} is the "
+                    "open segment{}",
+                    id, ms(drain_start, read_start), at_switch, size >> 20,
+                    ms(read_start, read_end), ms(read_end, std::chrono::steady_clock::now()), why,
+                    fresh_id, track.empty() ? std::string{} : " of track " + track);
+        PrtSegCapLocked(state, id);
+    }
+    PrtSegWriteIndex();
+    return true;
+}
+
+// Round 20: the average bytes of one pipeline in the sealed, not imported segments (64 KB with
+// none) and the pipelines of each segment. Mutex held.
+static u64 PrtSegAvgEntryBytesLocked(PrtSegState& state, std::unordered_map<u32, u64>& counts) {
+    counts.clear();
+    for (const auto& [hash, entry] : state.map) {
+        ++counts[entry.seg];
+    }
+    u64 bytes = 0, entries = 0;
+    for (const auto& seg : state.segs) {
+        if (!seg->sealed || seg->dropped || seg->migrated || seg->bytes == 0) {
+            continue;
+        }
+        if (const auto it = counts.find(seg->id); it != counts.end() && it->second != 0) {
+            bytes += seg->bytes;
+            entries += it->second;
+        }
+    }
+    return entries != 0 ? std::max<u64>(bytes / entries, 1024) : u64{64} << 10;
+}
+
 // The cache a pipeline is created with: its own segment's when the index knows it, else (with
 // imported shards) the shard the old hash rule picks, else the open segment.
 static vk::PipelineCache PrtSegCacheFor(u64 hash) {
+    // PRT-DRVTRACK (Round 20): the track a new pipeline is tagged with, read before the lock.
+    const std::string track = PrtTrackActive();
     auto& state = Seg();
     std::scoped_lock lock{state.mutex};
     const auto it = state.map.find(hash);
     if (it != state.map.end()) {
         if (PrtSegment* seg = SegById(state, it->second.seg); seg && !seg->dropped) {
+            if (seg->sealing) {
+                // PRT-DRVSEAL drain (Round 20): a segment waiting for its seal gets no create;
+                // the pipeline goes to the open segment of its track.
+                if (PrtSegment* open = PrtSegOpenForLocked(state, seg->track)) {
+                    it->second.seg = open->id;
+                    it->second.assign_gen = state.save_gen;
+                    it->second.on_disk = false;
+                    ++open->assigned_since_save;
+                    ++state.open_assigned_since_save;
+                    state.last_assign = std::chrono::steady_clock::now();
+                    return open->handle;
+                }
+            }
             return seg->handle;
         }
         state.map.erase(it);
@@ -4523,13 +4944,17 @@ static vk::PipelineCache PrtSegCacheFor(u64 hash) {
             return seg->handle;
         }
     }
-    PrtSegment* open = SegById(state, state.open_id);
+    PrtSegment* open = PrtSegOpenForLocked(state, track);
+    if (!open && !track.empty()) {
+        open = PrtSegOpenForLocked(state, std::string{});
+    }
     if (!open) {
         return {};
     }
     const u32 last_used = state.used_before_entry.erase(hash) != 0 ? state.session + 1 : 0;
     state.map[hash] =
         PrtSegEntry{.seg = open->id, .last_used = last_used, .assign_gen = state.save_gen};
+    ++open->assigned_since_save;
     ++state.open_assigned_since_save;
     state.last_assign = std::chrono::steady_clock::now();
     return open->handle;
@@ -4564,12 +4989,15 @@ static void PrtSegAfterCreate(u64 hash) {
             return;
         }
     }
-    if (!SegById(state, state.open_id)) {
+    // Round 20: the open segment of the same track (PRT-DRVTRACK).
+    PrtSegment* open = PrtSegOpenForLocked(state, seg->track);
+    if (!open) {
         return;
     }
-    it->second.seg = state.open_id;
+    it->second.seg = open->id;
     it->second.assign_gen = state.save_gen;
     it->second.on_disk = false;
+    ++open->assigned_since_save;
     ++state.open_assigned_since_save;
     state.last_assign = std::chrono::steady_clock::now();
     state.moved_on_miss.fetch_add(1, std::memory_order_relaxed);
@@ -4657,6 +5085,7 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
         u32 judged_pct;
         u32 created;
         u64 bytes;
+        std::string track; // PRT-DRVTRACK (Round 20): empty = common (older indexes: all common)
     };
     std::vector<IndexSeg> listed;
     bool have_index = false;
@@ -4696,6 +5125,10 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
                                                      static_cast<u32>(judged) >=
                                                          PrtDrvMigratePercent());
                         seg.judged_pct = seg.judged ? static_cast<u32>(judged) : 0;
+                        std::string track;
+                        if (fields >> track && track != "-") {
+                            seg.track = track;
+                        }
                         listed.push_back(seg);
                     }
                 } else if (tag == "P") {
@@ -4776,7 +5209,7 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
                 break;
             }
             const u64 bytes = std::filesystem::file_size(target, ec);
-            listed.push_back(IndexSeg{index, true, true, false, 0, 0, ec ? 0 : bytes});
+            listed.push_back(IndexSeg{index, true, true, false, 0, 0, ec ? 0 : bytes, {}});
             LOG_WARNING(Render_Vulkan, "PRT-DRVMIGRATE: {} ({} MB) imported as sealed seg{}; "
                                        "dropped once after a session if under {}% driver hits",
                         sources[index].filename().string(), (ec ? 0 : bytes) >> 20, index,
@@ -4811,11 +5244,15 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
         seg->created_session = listed_seg.created;
         seg->path = PrtSegPath(base, seg->id);
         seg->saved_gen = 1;
-        const bool is_open = !seg->sealed && seg->id == state.open_id;
+        seg->track = listed_seg.track;
+        // Round 20: a track's first unsealed segment is its open one (PRT-DRVTRACK).
+        const bool is_open =
+            !seg->sealed && (seg->track.empty() ? seg->id == state.open_id
+                                                : !state.open_by_track.contains(seg->track));
         if (!seg->sealed && !is_open) {
             seg->sealed = true; // an open segment the index no longer names as open
         }
-        open_listed = open_listed || is_open;
+        open_listed = open_listed || (is_open && seg->track.empty());
         const char* problem = nullptr;
         std::vector<u8> data;
         u64 file_bytes = 0;
@@ -4848,6 +5285,8 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
             data.clear();
         }
         vk::UniquePipelineCache cache;
+        const u64 ram_before = PrtProcessMemoryMb().first; // Round 20: RAM per segment
+        u64 ram_after = ram_before;
         if (!problem) {
             auto [result, made] = device.createPipelineCacheUnique(vk::PipelineCacheCreateInfo{
                 .initialDataSize = data.size(),
@@ -4858,6 +5297,7 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
                 data.clear();
             } else {
                 cache = std::move(made);
+                ram_after = PrtProcessMemoryMb().first;
             }
         }
         if (problem) {
@@ -4874,8 +5314,8 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
                     ++it;
                 }
             }
-            if (!is_open) {
-                continue;
+            if (!is_open || !seg->track.empty()) {
+                continue; // Round 20: a track's open segment is made again when it is raced
             }
             // The open segment starts empty under the same id.
             auto [result, made] = device.createPipelineCacheUnique({});
@@ -4888,14 +5328,21 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
         PrtLogDriverLoad(device, *cache, seg->path, file_bytes, data.size());
         given_total += data.size();
         seg->bytes = file_bytes;
-        loaded_text += fmt::format("{}seg{} {} {} MB", loaded_text.empty() ? "" : ", ", seg->id,
+        // Round 20: the RAM the driver took for it, and its track (PRT-DRVTRACK).
+        loaded_text += fmt::format("{}seg{} {}{} {} MB (+{} MB RAM)",
+                                   loaded_text.empty() ? "" : ", ", seg->id,
                                    seg->sealed ? (seg->migrated ? "sealed migrated" : "sealed")
                                                : "open",
-                                   file_bytes >> 20);
-        if (is_open) {
+                                   seg->track.empty() ? std::string{} : " track " + seg->track,
+                                   file_bytes >> 20,
+                                   ram_after > ram_before ? ram_after - ram_before : 0);
+        if (is_open && seg->track.empty()) {
             pipeline_cache = std::move(cache);
             seg->handle = *pipeline_cache;
         } else {
+            if (is_open) {
+                state.open_by_track[seg->track] = seg->id;
+            }
             seg->owned = std::move(cache);
             seg->handle = *seg->owned;
         }
@@ -4937,14 +5384,25 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
     driver_cache_path = SegById(state, state.open_id)->path;
     state.last_save = std::chrono::steady_clock::now();
     state.active.store(true, std::memory_order_release);
+    g_prt_inflight_on.store(PrtDrvSealDrainOn(), std::memory_order_release); // Round 20
     const u32 cap = PrtDrvSegMax();
+    // PRT-DRVTRACK (Round 20): every track's segments load for now (each one's RAM is above).
+    u32 track_segs = 0;
+    std::unordered_set<std::string> tracks;
+    for (const auto& seg : state.segs) {
+        if (!seg->track.empty()) {
+            ++track_segs;
+            tracks.insert(seg->track);
+        }
+    }
     LOG_WARNING(Render_Vulkan,
                 "PRT-DRVSEG: driver cache in segments of {} MB, {} ({}); index {} pipelines; "
                 "{} MB given to the driver; segment cap {}; session {}; {} pipelines of the index "
-                "not loaded (built again at the splash)",
+                "not loaded (built again at the splash); {} track segments of {} tracks loaded "
+                "(all tracks for now)",
                 PrtDrvSegBytes() >> 20, loaded_text, state.segs.size(), state.map.size(),
                 given_total >> 20, cap == 0 ? std::string{"none (Unlimited)"} : std::to_string(cap),
-                state.session, state.unverified.size());
+                state.session, state.unverified.size(), track_segs, tracks.size());
     // The old single file is not read with segments on (it was imported when there were no
     // shards); a leftover one beside imported shards goes, as PRT-DRVSINGLE did. Round 19: only
     // the plain <cache>.vkpipelinecache, never a .segN or .segindex file.
@@ -4963,8 +5421,9 @@ void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base_in
     }
 }
 
-// PRT-DRVSEG save: only the open segment, read and written off the GPU thread (PERF-036), then
-// the index. A segment whose saved data passed the segment size is sealed.
+// PRT-DRVSEG save: only the open segments (Round 20: the common one and each track's), read and
+// written off the GPU thread (PERF-036), then the index. A segment whose saved data passed the
+// segment size is sealed (with PRT-DRVSEAL drain out of exit: by the timer, drained).
 void PipelineCache::PrtSaveDriverSegments(bool wait, const char* why) {
     auto& state = Seg();
     if (!wait && driver_cache_writing.load()) {
@@ -4973,24 +5432,43 @@ void PipelineCache::PrtSaveDriverSegments(bool wait, const char* why) {
     if (driver_cache_writer.joinable()) {
         driver_cache_writer.join();
     }
-    vk::PipelineCache cache{};
-    std::filesystem::path path;
+    struct SaveItem {
+        vk::PipelineCache cache;
+        std::filesystem::path path;
+        u32 id;
+        int slot;
+        std::string track;
+    };
+    std::vector<SaveItem> items;
+    std::vector<u32> sealing; // PRT-DRVSEAL drain: seals that wait, tried once more at exit
     u32 gen = 0;
-    u32 id = 0;
-    bool dirty = false;
     const bool new_pipelines = num_new_pipelines != pipelines_at_driver_save;
+    const bool requested = std::string_view{why} == "requested";
     {
         std::scoped_lock lock{state.mutex};
-        PrtSegment* open = SegById(state, state.open_id);
-        if (!open) {
+        if (!SegById(state, state.open_id)) {
             return;
         }
-        // Unchanged since its last save (or load): only the index (usage) is written.
-        dirty = state.open_assigned_since_save != 0 || open->saved_gen == 0 || new_pipelines ||
-                std::string_view{why} == "requested";
-        cache = open->handle;
-        path = open->path;
-        id = open->id;
+        for (auto& seg : state.segs) {
+            if (seg->dropped) {
+                continue;
+            }
+            if (seg->sealing) {
+                sealing.push_back(seg->id);
+                continue;
+            }
+            if (!PrtSegIsOpen(state, *seg)) {
+                continue;
+            }
+            // Unchanged since its last save (or load): only the index (usage) is written.
+            const bool common = seg->id == state.open_id;
+            const bool dirty = seg->assigned_since_save != 0 || seg->saved_gen == 0 ||
+                               (common && (new_pipelines || requested));
+            seg->assigned_since_save = 0;
+            if (dirty) {
+                items.push_back(SaveItem{seg->handle, seg->path, seg->id, seg->hit_slot, seg->track});
+            }
+        }
         gen = state.save_gen++;
         state.open_assigned_since_save = 0;
         state.seal_check_at = 1000; // PRT-DRVSEAL
@@ -5000,7 +5478,8 @@ void PipelineCache::PrtSaveDriverSegments(bool wait, const char* why) {
     driver_cache_saved_at = std::chrono::steady_clock::now();
     const vk::Device device = instance.GetDevice();
     driver_cache_writing = true;
-    driver_cache_writer = std::jthread([this, device, cache, path, gen, id, dirty, why] {
+    driver_cache_writer = std::jthread([this, device, items = std::move(items),
+                                        sealing = std::move(sealing), gen, wait, why] {
         SCOPE_EXIT {
             driver_cache_writing = false;
         };
@@ -5008,36 +5487,66 @@ void PipelineCache::PrtSaveDriverSegments(bool wait, const char* why) {
         auto& state = Seg();
         try {
             Common::RecoverableScope recoverable;
-            if (dirty) {
+            // PRT-DRVSEAL drain (Round 20): at exit a seal that waited is tried once more.
+            if (wait && PrtDrvSealDrainOn()) {
+                for (const u32 id : sealing) {
+                    PrtDrainAndSeal(id, std::chrono::seconds{5}, "exit");
+                }
+            }
+            const bool drain = PrtDrvSealDrainOn();
+            for (const auto& item : items) {
+                // PRT-DRVSEAL drain (Round 20): read only while no create uses it.
+                const auto timeout = wait ? std::chrono::milliseconds{5000}
+                                          : std::chrono::milliseconds{30000};
+                if (drain && !PrtDrainAcquire(item.slot, timeout)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-DRVSEAL: open seg{} still has {} creates in flight after {} "
+                                "ms: not saved this time ({})",
+                                item.id, PrtInflightOf(item.slot), timeout.count(), why);
+                    continue;
+                }
                 const auto start = std::chrono::steady_clock::now();
-                auto data = ReadDriverCacheSnapshot(device, cache);
+                std::vector<u8> data;
+                try {
+                    data = ReadDriverCacheSnapshot(device, item.cache);
+                } catch (...) {
+                    data.clear();
+                }
+                if (drain) {
+                    PrtDrainRelease(item.slot);
+                }
                 const auto read_end = std::chrono::steady_clock::now();
-                if (!data.empty()) {
-                    const size_t size = data.size();
-                    // PRT-DRVSAFE: temp file, verified, renamed (as every driver cache save).
-                    if (PrtWriteFileSafe(path, data, true)) {
-                        std::scoped_lock lock{state.mutex};
-                        if (PrtSegment* seg = SegById(state, id); seg && !seg->dropped) {
-                            seg->saved_gen = gen + 1;
-                            seg->bytes = size;
-                            if (!seg->sealed && seg->id == state.open_id &&
-                                size >= PrtDrvSegBytes()) {
+                if (data.empty()) {
+                    continue;
+                }
+                const size_t size = data.size();
+                // PRT-DRVSAFE: temp file, verified, renamed (as every driver cache save).
+                if (PrtWriteFileSafe(item.path, data, true)) {
+                    std::scoped_lock lock{state.mutex};
+                    if (PrtSegment* seg = SegById(state, item.id); seg && !seg->dropped) {
+                        seg->saved_gen = gen + 1;
+                        seg->bytes = size;
+                        if (PrtSegIsOpen(state, *seg) && size >= PrtDrvSegBytes()) {
+                            if (!wait && drain && PrtDrvSealEarlyOn()) {
+                                state.seal_wanted = true; // the timer seals it, drained
+                            } else {
                                 PrtSegSealLocked(state, *seg, gen);
                             }
                         }
-                    } else {
-                        LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: segment write, flush or "
-                                                   "verification failed; keeping previous file");
                     }
-                    LOG_WARNING(Render_Vulkan,
-                                "PRT-DRVSAVE: open seg{} saved ({}): {} MB, read {:.0f} ms, "
-                                "written {:.0f} ms",
-                                id, why, size >> 20,
-                                std::chrono::duration<double, std::milli>(read_end - start).count(),
-                                std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - read_end)
-                                    .count());
+                } else {
+                    LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: segment write, flush or "
+                                               "verification failed; keeping previous file");
                 }
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-DRVSAVE: open seg{} saved ({}): {} MB, read {:.0f} ms, "
+                            "written {:.0f} ms{}",
+                            item.id, why, size >> 20,
+                            std::chrono::duration<double, std::milli>(read_end - start).count(),
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - read_end)
+                                .count(),
+                            item.track.empty() ? std::string{} : " (track " + item.track + ")");
             }
             PrtSegWriteIndex();
         } catch (const std::exception& error) {
@@ -5047,6 +5556,29 @@ void PipelineCache::PrtSaveDriverSegments(bool wait, const char* why) {
     if (wait) {
         driver_cache_writer.join();
     }
+}
+
+// PRT-DRVSEAL drain (Round 20): the seal runs on the writer thread, so the caller never waits.
+void PipelineCache::PrtStartDrainSeal(u32 id, const char* why) {
+    if (driver_cache_writing.load()) {
+        return;
+    }
+    if (driver_cache_writer.joinable()) {
+        driver_cache_writer.join();
+    }
+    driver_cache_writing = true;
+    driver_cache_writer = std::jthread([this, id, why] {
+        SCOPE_EXIT {
+            driver_cache_writing = false;
+        };
+        Common::SetCurrentThreadName("shadGT:DriverCacheSeal");
+        try {
+            Common::RecoverableScope recoverable;
+            PrtDrainAndSeal(id, std::chrono::seconds{30}, why);
+        } catch (const std::exception& error) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVSEAL: seal of seg{} failed: {}", id, error.what());
+        }
+    });
 }
 
 // Exit, once: the hit and memory lines, the session count, PRT-DRVMIGRATE's judgement and
@@ -5117,8 +5649,9 @@ void PipelineCache::PrtDriverCacheExit() {
     const u32 window = PrtDrvStaleSessions();
     if (counted && window != 0) {
         for (auto& seg : state.segs) {
+            // Round 20: a track's segments age out together (PRT-DRVTRACK, below).
             if (!seg->sealed || seg->dropped || (seg->migrated && !seg->judged) ||
-                seg->created_session + window > state.session) {
+                seg->created_session + window > state.session || !seg->track.empty()) {
                 continue;
             }
             const auto [total, recent] = PrtSegRecentUse(state, seg->id, window);
@@ -5133,20 +5666,64 @@ void PipelineCache::PrtDriverCacheExit() {
                         seg->id, seg->bytes >> 20, total, window, recent);
         }
     }
+    // PRT-DRVTRACK (Round 20): a track none of whose pipelines the game used in the last N
+    // counted sessions, its segments all at least N sessions old, is dropped as a unit; the next
+    // race there builds its pipelines again into new segments of that track.
+    if (counted && window != 0) {
+        struct TrackUse {
+            u32 oldest = ~0u;
+            u32 segments = 0;
+            u32 pipelines = 0;
+            u64 bytes = 0;
+            bool used = false;
+        };
+        std::unordered_map<std::string, TrackUse> track_use;
+        for (const auto& seg : state.segs) {
+            if (seg->dropped || seg->track.empty()) {
+                continue;
+            }
+            auto& use = track_use[seg->track];
+            const auto [total, recent] = PrtSegRecentUse(state, seg->id, window);
+            use.oldest = std::min(use.oldest, seg->created_session);
+            ++use.segments;
+            use.pipelines += total;
+            use.bytes += seg->bytes;
+            use.used = use.used || recent != 0;
+        }
+        for (const auto& [track, use] : track_use) {
+            if (use.used || use.oldest + window > state.session) {
+                continue;
+            }
+            for (auto& seg : state.segs) {
+                if (!seg->dropped && seg->track == track) {
+                    PrtSegDropLocked(state, *seg, window);
+                }
+            }
+            state.open_by_track.erase(track);
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-DRVTRACK: track {} not raced in the last {} counted sessions: its {} "
+                        "segments ({} MB, {} pipelines) dropped together",
+                        track, window, use.segments, use.bytes >> 20, use.pipelines);
+        }
+    }
     u32 sealed = 0;
+    u32 open_count = 0;
+    u32 track_count = 0;
     u64 bytes = 0;
     for (const auto& seg : state.segs) {
         if (!seg->dropped) {
             sealed += seg->sealed ? 1 : 0;
+            open_count += seg->sealed ? 0 : 1;
+            track_count += seg->track.empty() ? 0 : 1;
             bytes += seg->bytes;
         }
     }
     LOG_WARNING(Render_Vulkan,
-                "PRT-DRVSEG: exit: {} sealed + 1 open segment, {} MB on disk before this save, "
-                "{} pipelines in the index, {} used by the game this session, {} moved to the "
-                "open segment after a driver miss; session {} ({})",
-                sealed, bytes >> 20, state.map.size(), state.used_this_session.load(),
-                state.moved_on_miss.load(), state.session,
+                "PRT-DRVSEG: exit: {} sealed + {} open segments ({} of them track segments), {} "
+                "MB on disk before this save, {} pipelines in the index, {} used by the game this "
+                "session, {} moved to the open segment after a driver miss; session {} ({})",
+                sealed, open_count, track_count, bytes >> 20, state.map.size(),
+                state.used_this_session.load(), state.moved_on_miss.load(), state.session,
                 counted ? "counted: a race or Scapes loaded" : "not counted: no race or Scapes");
 }
 
@@ -5203,9 +5780,69 @@ void PipelineCache::PrtDrvTimer(std::stop_token stop) {
             state.content_session.store(true, std::memory_order_relaxed);
         }
 #endif
+        // PRT-DRVSEAL drain (Round 20): out of a race, an open segment estimated past the segment
+        // size (its pipelines times the average size of a sealed one's, or its last saved size)
+        // is sealed on the writer thread once its creates are done; a seal that waited is tried
+        // again every 10 s. The driver is not asked a size while creates run.
+        if (PrtDrvSealEarlyOn() && PrtDrvSealDrainOn() && !in_race &&
+            !driver_cache_writing.load() && now - last_seal_check >= 10s) {
+            u32 target = 0;
+            bool found = false;
+            const char* why = "segment full";
+            u64 estimate = 0;
+            {
+                std::scoped_lock lock{state.mutex};
+                for (const auto& seg : state.segs) {
+                    if (seg->sealing && !seg->dropped) {
+                        target = seg->id;
+                        found = true;
+                        why = "tried again";
+                        break;
+                    }
+                }
+                if (!found && (state.open_assigned_since_save >= state.seal_check_at ||
+                               state.seal_wanted)) {
+                    state.seal_check_at = state.open_assigned_since_save + 1000;
+                    state.seal_wanted = false;
+                    std::unordered_map<u32, u64> counts;
+                    const u64 average = PrtSegAvgEntryBytesLocked(state, counts);
+                    for (const auto& seg : state.segs) {
+                        if (!PrtSegIsOpen(state, *seg)) {
+                            continue;
+                        }
+                        const auto it = counts.find(seg->id);
+                        const u64 held =
+                            std::max<u64>(seg->bytes, (it != counts.end() ? it->second : 0) * average);
+                        if (held >= PrtDrvSegBytes()) {
+                            target = seg->id;
+                            found = true;
+                            estimate = held;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (found) {
+                last_seal_check = now;
+                std::unique_lock lookup{lookup_mutex, std::try_to_lock};
+                if (lookup.owns_lock()) {
+                    if (estimate != 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRT-DRVSEAL: open seg{} holds about {} MB (segment size {} "
+                                    "MB): new pipelines go to a fresh segment, seg{} is sealed "
+                                    "once its creates are done",
+                                    target, estimate >> 20, PrtDrvSegBytes() >> 20, target);
+                    }
+                    PrtStartDrainSeal(target, why);
+                    continue;
+                }
+                std::scoped_lock lock{state.mutex};
+                state.seal_wanted = state.seal_wanted || estimate != 0; // next second
+            }
+        }
         // PRT-DRVSEAL (Round 19): a long splash rebuild seals the open segment at its size.
-        if (PrtDrvSealEarlyOn() && !in_race && !driver_cache_writing.load() &&
-            now - last_seal_check >= 10s) {
+        if (PrtDrvSealEarlyOn() && !PrtDrvSealDrainOn() && !in_race &&
+            !driver_cache_writing.load() && now - last_seal_check >= 10s) {
             vk::PipelineCache open_cache{};
             u32 open_id = 0;
             {
