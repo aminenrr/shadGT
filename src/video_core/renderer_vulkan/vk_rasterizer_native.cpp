@@ -202,6 +202,10 @@ bool RaceCarStopped();  // the car stands still (WIDE-005)
 
 namespace Vulkan {
 
+// PRT-DRVSTALE (pr-tests, Round 18): a Scapes or replay photo draw (PRT-PHOTOWIN) was seen this
+// session, so the session counts for the driver cache segments' usage (vk_pipeline_cache.cpp).
+std::atomic<bool> g_prt_photo_draw_seen{false};
+
 struct NativeRenderer::PendingLinearDownload {
     std::vector<VideoCore::DirectMemory::LeasedPart> imports;
     std::vector<Native::LinearDownloadCopy> copies;
@@ -8368,6 +8372,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                                     address, width, height, photo_window, frame);
                     }
                     photo_window_from = frame;
+                    g_prt_photo_draw_seen.store(true, std::memory_order_relaxed);
                 }
                 one_off_photo_output = true;
                 static std::atomic<u32> photo_logged{};

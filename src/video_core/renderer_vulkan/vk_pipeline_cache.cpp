@@ -43,6 +43,7 @@
 #include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h> // PRT-DRVMEM (pr-tests, Round 18)
 #endif
 
 #include "common/diagnostics.h"
@@ -3643,13 +3644,14 @@ static bool QuarantineRejectedDriverCache(const std::filesystem::path& source,
 // Preserve any cache that could not be verified or safely quarantined this run.
 static std::atomic<bool> rejected_driver_cache{false};
 
+// Round 18: the shards are the fallback, off unless set (2 to 8); set, they turn PRT-DRVSEG off.
 static u32 PrtDriverShardCount() {
     static const u32 count = [] {
         const char* env = std::getenv("RYGT_DRIVER_CACHE_SHARDS");
         if (env && *env) {
             return std::min<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 8);
         }
-        return Common::IsGt7() ? 2u : 0u;
+        return 0u;
     }();
     return count >= 2 ? count : 0;
 }
@@ -3833,8 +3835,28 @@ void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& single_pa
 }
 
 
-// PRT-DRVHIT (pr-tests, Round 18, RYGT_DRIVER_CACHE_HIT_LOG, GT7 on): driver cache hits per cache
-// file from pipeline creation feedback, logged every 10 s and at exit.
+// ---------------------------------------------------------------------------------------------
+// Round 18 (pr-tests): permanent GT7 driver cache. Each part has its own switch, GT7 only:
+//   PRT-DRVHIT       RYGT_DRIVER_CACHE_HIT_LOG     driver cache hits per file (creation feedback)
+//   PRT-DRVSEG       RYGT_DRIVER_CACHE_SEGMENTS    segment files + index instead of shards and
+//                                                  rotation (RYGT_DRIVER_CACHE_SEG_MB, _SEG_MAX)
+//   PRT-DRVSTALE     RYGT_DRIVER_CACHE_STALE       drops a mostly unused sealed segment
+//   PRT-SPLASHVERIFY RYGT_SPLASH_VERIFY            prewarm.built trusted only for loaded segments
+//   PRT-DRVMIGRATE   RYGT_DRIVER_CACHE_MIGRATE     .shard0/.shard1 become sealed segments 0 and 1
+//   PRT-DRVMEM       RYGT_DRIVER_CACHE_MEM_LOG     process memory after the load and at exit
+//   PRT-DRVSAFE      RYGT_DRIVER_CACHE_SAFE_WRITE  index written to a temp file, then renamed
+//   PRT-DRVSAVE      RYGT_DRIVER_CACHE_IDLE_SAVE   open segment also saved when idle in menus
+// The old shards (RYGT_DRIVER_CACHE_SHARDS) stay as a fallback, off by default; setting them
+// turns PRT-DRVSEG off, so only one of the two paths runs.
+// ---------------------------------------------------------------------------------------------
+
+#ifdef RYTY_GPU
+extern std::atomic<bool> g_prt_photo_draw_seen; // PRT-PHOTOWIN, vk_rasterizer_native.cpp
+#endif
+static std::vector<u8> ReadDriverCacheSnapshot(vk::Device device, vk::PipelineCache cache);
+// PRT-DRVSAVE: why the next save runs (log only), set by the caller on its own thread.
+static thread_local const char* t_prt_save_reason = nullptr;
+
 // "0" turns a switch off, anything else on; unset: on in GT7 only.
 static bool PrtGt7Flag(const char* env) {
     if (env && *env) {
@@ -3846,6 +3868,116 @@ static bool PrtGt7Flag(const char* env) {
 static bool PrtDrvHitSwitchOn() {
     static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_HIT_LOG"));
     return on;
+}
+
+static bool PrtDrvSegOn() {
+    static const bool on = [] {
+        // The fallback: shards asked for by hand turn the segments off (never both).
+        const char* shards = std::getenv("RYGT_DRIVER_CACHE_SHARDS");
+        if (shards && *shards && std::strtoul(shards, nullptr, 10) >= 2) {
+            return false;
+        }
+        return PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_SEGMENTS"));
+    }();
+    return on;
+}
+
+static u64 PrtDrvSegBytes() {
+    static const u64 bytes = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_SEG_MB");
+        u64 mb = VideoCore::CurrentTitleDefaults().driver_cache_segment_mb;
+        if (env && *env) {
+            mb = std::strtoull(env, nullptr, 10);
+        }
+        return std::clamp<u64>(mb == 0 ? 600 : mb, 64, 4096) << 20;
+    }();
+    return bytes;
+}
+
+// 0 = no cap. Launcher "Unlimited" (SHADGT_DRIVER_CACHE_MAX_MB=-1) has no cap unless
+// RYGT_DRIVER_CACHE_SEG_MAX is set.
+static u32 PrtDrvSegMax() {
+    static const u32 count = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_SEG_MAX");
+        if (env && *env) {
+            const long value = std::strtol(env, nullptr, 10);
+            return value <= 0 ? 0u : std::max<u32>(2u, static_cast<u32>(value));
+        }
+        const char* max_mb = std::getenv("SHADGT_DRIVER_CACHE_MAX_MB");
+        if (max_mb && *max_mb && std::strtoll(max_mb, nullptr, 10) < 0) {
+            return 0u;
+        }
+        return VideoCore::CurrentTitleDefaults().driver_cache_segment_max;
+    }();
+    return count;
+}
+
+static u32 PrtDrvStaleSessions() {
+    static const u32 sessions = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_STALE");
+        if (env && *env) {
+            return static_cast<u32>(std::strtoul(env, nullptr, 10));
+        }
+        return Common::IsGt7() ? 5u : 0u;
+    }();
+    return sessions;
+}
+
+static bool PrtSplashVerifyOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_SPLASH_VERIFY"));
+    return on;
+}
+
+static bool PrtDrvMigrateOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_MIGRATE"));
+    return on;
+}
+
+static bool PrtDrvMemOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_MEM_LOG"));
+    return on;
+}
+
+static bool PrtDrvSafeWriteOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_SAFE_WRITE"));
+    return on;
+}
+
+static bool PrtDrvIdleSaveOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_IDLE_SAVE"));
+    return on;
+}
+
+// PRT-DRVMEM: process private bytes and working set in MB (Windows only; 0 elsewhere).
+static std::pair<u64, u64> PrtProcessMemoryMb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                sizeof(counters))) {
+        return {u64(counters.PrivateUsage) >> 20, u64(counters.WorkingSetSize) >> 20};
+    }
+#endif
+    return {0, 0};
+}
+
+static void PrtLogDriverMemory(const char* when, u64 before_private_mb = ~u64{0}) {
+    if (!PrtDrvMemOn()) {
+        return;
+    }
+#ifdef _WIN32
+    const auto [private_mb, working_mb] = PrtProcessMemoryMb();
+    LOG_WARNING(Render_Vulkan, "PRT-DRVMEM: {}: process private {} MB, working set {} MB{}", when,
+                private_mb, working_mb,
+                before_private_mb == ~u64{0}
+                    ? std::string{}
+                    : fmt::format(" (private {} MB before the load, +{} MB)", before_private_mb,
+                                  private_mb > before_private_mb ? private_mb - before_private_mb
+                                                                 : 0));
+#else
+    LOG_WARNING(Render_Vulkan, "PRT-DRVMEM: {}: not measured on this platform", when);
+#endif
 }
 
 // ---- PRT-DRVHIT -----------------------------------------------------------------------------
@@ -4025,32 +4157,909 @@ static void PrtDrvHitLog(bool at_exit) {
     }
 }
 
-void PipelineCache::PrtStartDriverCacheTimer() {
-    if (pipeline_cache) {
-        PrtDrvHitRegister(*pipeline_cache, prt_driver_shards.empty() ? std::string{"single file"}
-                                                                     : std::string{"shard0"});
+// ---- PRT-DRVSEG -----------------------------------------------------------------------------
+
+namespace {
+constexpr u64 PrtComputeHashSalt = 0x9e3779b97f4a7c15ull; // compute keys apart from graphics keys
+
+struct PrtSegment {
+    u32 id = 0;
+    bool sealed = false;
+    bool migrated = false; // PRT-DRVMIGRATE: an imported shard
+    bool judged = false;   // PRT-DRVMIGRATE: its hit rate was looked at
+    u32 created_session = 0;
+    u64 bytes = 0;         // the file's size at the last load or save
+    bool dropped = false;  // this session; its file goes at the next index write
+    bool file_deleted = false;
+    u32 saved_gen = 0;     // entries with assign_gen below this are in the file
+    int hit_slot = -1;
+    vk::UniquePipelineCache owned; // empty for the start-up open segment (pipeline_cache owns it)
+    vk::PipelineCache handle{};
+    std::filesystem::path path;
+};
+
+struct PrtSegEntry {
+    u32 seg = 0;
+    u32 last_used = 0;   // counted session it was last used in (0 = not by the game yet)
+    u32 assign_gen = 0;  // save generation it was put in its segment
+};
+
+struct PrtSegState {
+    std::mutex mutex;
+    std::atomic<bool> active{false};
+    vk::Device device{};
+    std::filesystem::path base;
+    std::filesystem::path index_path;
+    std::string identity;         // vendor, device, driver version and pipeline cache UUID
+    u32 session = 0;              // counted sessions (a race or Scapes loaded), from the index
+    u32 open_id = 0;
+    u32 next_id = 0;
+    u32 migrated_mod = 0;         // PRT-DRVMIGRATE: old shard count, the old hash % rule
+    u32 save_gen = 1;
+    u32 open_assigned_since_save = 0;
+    std::chrono::steady_clock::time_point last_assign{};
+    std::chrono::steady_clock::time_point last_save{};
+    std::vector<std::unique_ptr<PrtSegment>> segs;
+    std::unordered_map<u64, PrtSegEntry> map;
+    // PRT-SPLASHVERIFY: why a pipeline of the index is not in a loaded segment this start.
+    std::unordered_map<u64, const char*> unverified;
+    // PRT-DRVSTALE: used by the game before its build put it in a segment.
+    std::unordered_set<u64> used_before_entry;
+    std::atomic<u32> moved_on_miss{0};
+    std::atomic<u32> used_this_session{0};
+    std::atomic<bool> content_session{false};
+    bool exit_done = false;
+};
+
+PrtSegState& Seg() {
+    static auto* state = new PrtSegState();
+    return *state;
+}
+
+PrtSegment* SegById(PrtSegState& state, u32 id) {
+    for (auto& seg : state.segs) {
+        if (seg->id == id) {
+            return seg.get();
+        }
     }
-    for (size_t i = 0; i < prt_driver_shards.size(); ++i) {
-        PrtDrvHitRegister(*prt_driver_shards[i].cache, fmt::format("shard{}", i + 1));
-    }
-    if (PrtDrvHitOn() && !prt_drv_timer.joinable()) {
-        prt_drv_timer = std::jthread([this](std::stop_token stop) { PrtDrvTimer(stop); });
+    return nullptr;
+}
+
+std::string SegLabel(const PrtSegment& seg) {
+    return fmt::format("seg{} {}{}{}", seg.id, seg.sealed ? "sealed" : "open",
+                       seg.migrated ? " migrated" : "", seg.dropped ? " dropped" : "");
+}
+} // namespace
+
+static bool PrtSegActive() {
+    return Seg().active.load(std::memory_order_acquire);
+}
+
+static std::filesystem::path PrtSegPath(const std::filesystem::path& base, u32 id) {
+    auto path = base;
+    path += fmt::format(".seg{}", id);
+    return path;
+}
+
+// PRT-DRVSAFE: written beside the file, verified and renamed over it, so a crash or a power cut
+// mid-write leaves the previous file. RYGT_DRIVER_CACHE_SAFE_WRITE=0 writes the index in place.
+static bool PrtWriteFileSafe(const std::filesystem::path& path, std::span<const u8> data,
+                             bool safe) {
+    try {
+        Common::RecoverableScope recoverable;
+        if (!safe) {
+            return WriteVerifiedDriverCacheFile(path, data);
+        }
+        auto temp = path;
+        temp += ".tmp";
+        if (!WriteVerifiedDriverCacheFile(temp, data)) {
+            return false;
+        }
+#ifdef _WIN32
+        return MoveFileExW(temp.c_str(), path.c_str(),
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+        std::error_code ec;
+        std::filesystem::rename(temp, path, ec);
+        return !ec;
+#endif
+    } catch (...) {
+        return false;
     }
 }
 
-// Exit, once: the session's hit line.
+// The index text; the state's mutex is held. An entry is written only when its pipeline is in
+// its segment's file (sealed, or saved after it was put there), so SPLASHVERIFY never trusts a
+// pipeline a crash lost.
+static std::string PrtSegIndexText(PrtSegState& state) {
+    std::string text;
+    text.reserve(64 + state.map.size() * 32);
+    text += "PRT-DRVSEG 1\n";
+    text += fmt::format("identity {}\n", state.identity);
+    text += fmt::format("session {}\nmigrated {}\nopen {}\nnext {}\n", state.session,
+                        state.migrated_mod, state.open_id, state.next_id);
+    for (const auto& seg : state.segs) {
+        if (seg->dropped) {
+            continue;
+        }
+        text += fmt::format("S {} {} {} {} {} {}\n", seg->id, seg->sealed ? 1 : 0,
+                            seg->migrated ? 1 : 0, seg->judged ? 1 : 0, seg->created_session,
+                            seg->bytes);
+    }
+    for (const auto& [hash, entry] : state.map) {
+        const PrtSegment* seg = SegById(state, entry.seg);
+        if (!seg || seg->dropped || entry.assign_gen >= seg->saved_gen) {
+            continue;
+        }
+        text += fmt::format("P {:016x} {} {}\n", hash, entry.seg, entry.last_used);
+    }
+    return text;
+}
+
+// Writes the index and deletes the files of dropped segments. Not on the GPU thread.
+static void PrtSegWriteIndex() {
+    auto& state = Seg();
+    std::string text;
+    std::vector<std::filesystem::path> delete_files;
+    size_t entries = 0;
+    {
+        std::scoped_lock lock{state.mutex};
+        text = PrtSegIndexText(state);
+        entries = state.map.size();
+        for (auto& seg : state.segs) {
+            if (seg->dropped && !seg->file_deleted) {
+                seg->file_deleted = true;
+                delete_files.push_back(seg->path);
+            }
+        }
+    }
+    const bool ok = PrtWriteFileSafe(
+        state.index_path,
+        std::span<const u8>{reinterpret_cast<const u8*>(text.data()), text.size()},
+        PrtDrvSafeWriteOn());
+    if (!ok) {
+        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: index {} could not be written; the previous one "
+                                   "stays",
+                    state.index_path.filename().string());
+        return;
+    }
+    // After the index no longer names them.
+    for (const auto& path : delete_files) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: {} {}", path.filename().string(),
+                    ec ? "could not be deleted: " + ec.message() : std::string{"deleted"});
+    }
+    (void)entries;
+}
+
+// PRT-DRVSTALE: the share of a segment's pipelines the game used in the last `window` counted
+// sessions; the state's mutex is held.
+static std::pair<u32, u32> PrtSegRecentUse(PrtSegState& state, u32 id, u32 window) {
+    u32 total = 0, recent = 0;
+    const u32 since = state.session + 1 > window ? state.session + 1 - window : 0;
+    for (const auto& [hash, entry] : state.map) {
+        if (entry.seg != id) {
+            continue;
+        }
+        ++total;
+        if (entry.last_used != 0 && entry.last_used >= since) {
+            ++recent;
+        }
+    }
+    return {total, recent};
+}
+
+// Drops a segment: its pipelines leave the index, so SPLASHVERIFY has the splash build the
+// recorded ones again next start. Its cache stays alive until exit (builds may hold it).
+// The state's mutex is held. Returns how many of its pipelines the game had used lately.
+static u32 PrtSegDropLocked(PrtSegState& state, PrtSegment& seg, u32 window) {
+    const u32 since = state.session + 1 > window ? state.session + 1 - window : 0;
+    u32 used = 0;
+    for (auto it = state.map.begin(); it != state.map.end();) {
+        if (it->second.seg == seg.id) {
+            if (it->second.last_used != 0 && it->second.last_used >= since) {
+                ++used;
+            }
+            it = state.map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    seg.dropped = true;
+    PrtDrvHitRelabel(seg.hit_slot, SegLabel(seg));
+    return used;
+}
+
+// Seals the open segment once its saved data passed the segment size and opens a new one.
+// Pipelines put in it after the snapshot started (assign_gen > gen) are not in its file: they move
+// to the new open segment. With the cap full, PRT-DRVSTALE drops the least used sealed segment.
+// The state's mutex is held.
+static void PrtSegSealLocked(PrtSegState& state, PrtSegment& seg, u32 gen) {
+    seg.sealed = true;
+    auto fresh = std::make_unique<PrtSegment>();
+    fresh->id = state.next_id++;
+    fresh->created_session = state.session;
+    fresh->path = PrtSegPath(state.base, fresh->id);
+    auto [result, cache] = state.device.createPipelineCacheUnique({});
+    if (result != vk::Result::eSuccess) {
+        seg.sealed = false; // keep it open; tried again at the next save
+        --state.next_id;
+        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: no new segment ({}); seg{} stays open",
+                    vk::to_string(result), seg.id);
+        return;
+    }
+    fresh->owned = std::move(cache);
+    fresh->handle = *fresh->owned;
+    fresh->hit_slot = PrtDrvHitRegister(fresh->handle, fmt::format("seg{} open", fresh->id));
+    u32 moved = 0;
+    for (auto& [hash, entry] : state.map) {
+        if (entry.seg == seg.id && entry.assign_gen > gen) {
+            entry.seg = fresh->id;
+            ++moved;
+        }
+    }
+    PrtDrvHitRelabel(seg.hit_slot, SegLabel(seg));
+    const u32 old_open = seg.id;
+    state.open_id = fresh->id;
+    LOG_WARNING(Render_Vulkan,
+                "PRT-DRVSEG: seg{} sealed at {} MB (limit {} MB): loaded every start, never saved "
+                "again; seg{} is the open segment now ({} pipelines built after the save moved "
+                "to it)",
+                old_open, seg.bytes >> 20, PrtDrvSegBytes() >> 20, fresh->id, moved);
+    state.segs.push_back(std::move(fresh));
+    const u32 cap = PrtDrvSegMax();
+    if (cap == 0) {
+        return;
+    }
+    u32 live = 0;
+    for (const auto& s : state.segs) {
+        live += s->dropped ? 0 : 1;
+    }
+    if (live <= cap) {
+        return;
+    }
+    // Least used sealed segment (share of pipelines used lately; the oldest on a tie). The
+    // segment just sealed is kept: its pipelines are this session's.
+    const u32 window = std::max<u32>(PrtDrvStaleSessions(), 1);
+    PrtSegment* victim = nullptr;
+    double victim_share = 2.0;
+    for (auto& s : state.segs) {
+        if (s->dropped || !s->sealed || s->id == old_open) {
+            continue;
+        }
+        const auto [total, recent] = PrtSegRecentUse(state, s->id, window);
+        const double share = total == 0 ? 0.0 : double(recent) / double(total);
+        if (share < victim_share) {
+            victim_share = share;
+            victim = s.get();
+        }
+    }
+    if (!victim) {
+        return;
+    }
+    const auto [total, recent] = PrtSegRecentUse(state, victim->id, window);
+    PrtSegDropLocked(state, *victim, window);
+    LOG_WARNING(Render_Vulkan,
+                "PRT-DRVSTALE: {} segments over the cap of {}: seg{} ({} MB, {} pipelines, {} used "
+                "in the last {} sessions) dropped; its used pipelines are built again by the "
+                "splash prewarm next start (PRT-SPLASHVERIFY)",
+                live, cap, victim->id, victim->bytes >> 20, total, recent, window);
+}
+
+// The cache a pipeline is created with: its own segment's when the index knows it, else (with
+// imported shards) the shard the old hash rule picks, else the open segment.
+static vk::PipelineCache PrtSegCacheFor(u64 hash) {
+    auto& state = Seg();
+    std::scoped_lock lock{state.mutex};
+    const auto it = state.map.find(hash);
+    if (it != state.map.end()) {
+        if (PrtSegment* seg = SegById(state, it->second.seg); seg && !seg->dropped) {
+            return seg->handle;
+        }
+        state.map.erase(it);
+    }
+    if (state.migrated_mod != 0) {
+        const u32 id = static_cast<u32>(hash % state.migrated_mod);
+        if (PrtSegment* seg = SegById(state, id); seg && seg->migrated && !seg->dropped) {
+            // In the shard's file already if the old rule put it there: counted as saved.
+            const u32 last_used =
+                state.used_before_entry.erase(hash) != 0 ? state.session + 1 : 0;
+            state.map[hash] = PrtSegEntry{.seg = id, .last_used = last_used, .assign_gen = 0};
+            return seg->handle;
+        }
+    }
+    PrtSegment* open = SegById(state, state.open_id);
+    if (!open) {
+        return {};
+    }
+    const u32 last_used = state.used_before_entry.erase(hash) != 0 ? state.session + 1 : 0;
+    state.map[hash] =
+        PrtSegEntry{.seg = open->id, .last_used = last_used, .assign_gen = state.save_gen};
+    ++state.open_assigned_since_save;
+    state.last_assign = std::chrono::steady_clock::now();
+    return open->handle;
+}
+
+// After a create on this thread: a pipeline its sealed segment did not have (PRT-DRVHIT: every
+// create of it missed) moves to the open segment, so it is saved there and hits from the next
+// start. Only while that segment hits in general (50+ creates, half or more hits): a driver that
+// never reports hits for some kind of create must not copy whole segments into the open one.
+static void PrtSegAfterCreate(u64 hash) {
+    const bool missed = t_drvhit_misses != 0 && t_drvhit_misses == t_drvhit_creates;
+    PrtDrvHitThreadReset();
+    if (!missed || !PrtSegActive()) {
+        return;
+    }
+    auto& state = Seg();
+    std::scoped_lock lock{state.mutex};
+    const auto it = state.map.find(hash);
+    if (it == state.map.end()) {
+        return;
+    }
+    PrtSegment* seg = SegById(state, it->second.seg);
+    if (!seg || !seg->sealed || seg->hit_slot < 0) {
+        return;
+    }
+    const auto& slot = DrvHit().slots[seg->hit_slot];
+    const u32 creates = slot.creates.load(std::memory_order_relaxed);
+    const u32 hits = slot.hits.load(std::memory_order_relaxed);
+    if (creates < 50 || hits * 2 < creates) {
+        return;
+    }
+    it->second.seg = state.open_id;
+    it->second.assign_gen = state.save_gen;
+    ++state.open_assigned_since_save;
+    state.last_assign = std::chrono::steady_clock::now();
+    state.moved_on_miss.fetch_add(1, std::memory_order_relaxed);
+}
+
+// PRT-DRVSTALE: the game used this pipeline this session.
+static void PrtSegMarkUsed(u64 hash) {
+    if (!PrtSegActive()) {
+        return;
+    }
+    auto& state = Seg();
+    std::scoped_lock lock{state.mutex};
+    const auto it = state.map.find(hash);
+    if (it == state.map.end()) {
+        // Its build comes next; PrtSegCacheFor takes the mark over.
+        if (state.used_before_entry.insert(hash).second) {
+            state.used_this_session.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    const u32 now = state.session + 1;
+    if (it->second.last_used != now) {
+        it->second.last_used = now;
+        state.used_this_session.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static u64 PrtSegBytesOnDisk() {
+    auto& state = Seg();
+    std::scoped_lock lock{state.mutex};
+    u64 total = 0;
+    for (const auto& seg : state.segs) {
+        if (!seg->dropped) {
+            total += seg->bytes;
+        }
+    }
+    return total;
+}
+
+// PRT-SPLASHVERIFY: whether a pipeline the launcher pass built is in a segment this start loaded;
+// else the reason.
+static const char* PrtSegUnverifiedReason(u64 hash) {
+    auto& state = Seg();
+    std::scoped_lock lock{state.mutex};
+    const auto it = state.map.find(hash);
+    if (it != state.map.end()) {
+        const PrtSegment* seg = SegById(state, it->second.seg);
+        return seg && !seg->dropped ? nullptr : "segment dropped";
+    }
+    const auto why = state.unverified.find(hash);
+    return why != state.unverified.end() ? why->second : "not in the index";
+}
+
+void PipelineCache::PrtCreateDriverSegments(const std::filesystem::path& base) {
+    auto& state = Seg();
+    const auto before_private = PrtProcessMemoryMb().first;
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    const vk::Device device = instance.GetDevice();
+    std::string uuid;
+    for (auto byte : props.pipelineCacheUUID) {
+        uuid += fmt::format("{:02x}", byte);
+    }
+    std::scoped_lock lock{state.mutex};
+    state.device = device;
+    state.base = base;
+    state.index_path = base;
+    state.index_path += ".segindex";
+    state.identity = fmt::format("{:04x}-{:04x}-{:08x}-{}", props.vendorID, props.deviceID,
+                                 props.driverVersion, uuid);
+    struct IndexSeg {
+        u32 id;
+        bool sealed, migrated, judged;
+        u32 created;
+        u64 bytes;
+    };
+    std::vector<IndexSeg> listed;
+    bool have_index = false;
+    bool identity_changed = false;
+    std::unordered_map<u64, PrtSegEntry> entries;
+    {
+        std::ifstream in{state.index_path};
+        std::string line;
+        if (in && std::getline(in, line) && line == "PRT-DRVSEG 1") {
+            have_index = true;
+            while (std::getline(in, line)) {
+                std::istringstream fields{line};
+                std::string tag;
+                fields >> tag;
+                if (tag == "identity") {
+                    std::string id;
+                    fields >> id;
+                    identity_changed = id != state.identity;
+                } else if (tag == "session") {
+                    fields >> state.session;
+                } else if (tag == "migrated") {
+                    fields >> state.migrated_mod;
+                } else if (tag == "open") {
+                    fields >> state.open_id;
+                } else if (tag == "next") {
+                    fields >> state.next_id;
+                } else if (tag == "S") {
+                    IndexSeg seg{};
+                    int sealed = 0, migrated = 0, judged = 0;
+                    if (fields >> seg.id >> sealed >> migrated >> judged >> seg.created >>
+                        seg.bytes) {
+                        seg.sealed = sealed != 0;
+                        seg.migrated = migrated != 0;
+                        seg.judged = judged != 0;
+                        listed.push_back(seg);
+                    }
+                } else if (tag == "P") {
+                    std::string hash_text;
+                    PrtSegEntry entry{};
+                    if (fields >> hash_text >> entry.seg >> entry.last_used) {
+                        entries[std::strtoull(hash_text.c_str(), nullptr, 16)] = entry;
+                    }
+                }
+            }
+        } else if (in) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: index {} unreadable, starting a new one",
+                        state.index_path.filename().string());
+        }
+    }
+    std::error_code ec;
+    if (have_index && identity_changed) {
+        // Same file names carry the driver and UUID, so this is a hand-copied cache: start clean.
+        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: index is from another GPU or driver; its {} "
+                                   "segments are not loaded (PRT-SPLASHVERIFY rebuilds at the "
+                                   "splash)",
+                    listed.size());
+        for (const auto& seg : listed) {
+            std::filesystem::remove(PrtSegPath(base, seg.id), ec);
+        }
+        for (const auto& [hash, entry] : entries) {
+            state.unverified[hash] = "driver or GPU changed";
+        }
+        listed.clear();
+        entries.clear();
+        state.session = 0;
+        state.migrated_mod = 0;
+        state.open_id = 0;
+        state.next_id = 0;
+    }
+    // No index: segment files left without one cannot be mapped and are not ours to load.
+    if (!have_index) {
+        for (u32 index = 0; index < 64; ++index) {
+            const auto stray = PrtSegPath(base, index);
+            if (std::filesystem::remove(stray, ec) && !ec) {
+                LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: {} has no index entry, deleted",
+                            stray.filename().string());
+            }
+        }
+    }
+    // PRT-DRVMIGRATE: no index yet: the old shards become sealed segments 0, 1, ... (renamed, not
+    // rebuilt), routed by the old hash % shard rule; the single old file the same way (rule % 1).
+    if (!have_index && PrtDrvMigrateOn()) {
+        u32 shards = 0;
+        for (u32 index = 0; index < 8; ++index) {
+            auto shard = base;
+            shard += fmt::format(".shard{}", index);
+            if (!std::filesystem::is_regular_file(shard, ec)) {
+                break;
+            }
+            ++shards;
+        }
+        std::vector<std::filesystem::path> sources;
+        for (u32 index = 0; index < shards; ++index) {
+            auto shard = base;
+            shard += fmt::format(".shard{}", index);
+            sources.push_back(shard);
+        }
+        if (sources.empty() && std::filesystem::is_regular_file(base, ec)) {
+            sources.push_back(base);
+        }
+        for (u32 index = 0; index < sources.size(); ++index) {
+            const auto target = PrtSegPath(base, index);
+            std::filesystem::remove(target, ec);
+            ec.clear();
+            std::filesystem::rename(sources[index], target, ec);
+            if (ec) {
+                LOG_WARNING(Render_Vulkan, "PRT-DRVMIGRATE: {} could not be renamed to {} ({}); "
+                                           "not imported",
+                            sources[index].filename().string(), target.filename().string(),
+                            ec.message());
+                sources.resize(index);
+                break;
+            }
+            const u64 bytes = std::filesystem::file_size(target, ec);
+            listed.push_back(IndexSeg{index, true, true, false, 0, ec ? 0 : bytes});
+            LOG_WARNING(Render_Vulkan, "PRT-DRVMIGRATE: {} ({} MB) imported as sealed seg{}; "
+                                       "dropped once after a session if under 10% driver hits",
+                        sources[index].filename().string(), (ec ? 0 : bytes) >> 20, index);
+        }
+        state.migrated_mod = static_cast<u32>(listed.size());
+        state.next_id = state.migrated_mod;
+        state.open_id = state.next_id; // a new open segment below
+    }
+    // Leftovers of the old rotation (FIX-SGT-010 .old, PRT-DRVKEEP) are never read here.
+    for (u32 index = 0; index < 8; ++index) {
+        auto old = base;
+        old += fmt::format(".shard{}.old", index);
+        if (std::filesystem::remove(old, ec) && !ec) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: {} deleted (old rotation leftover)",
+                        old.filename().string());
+        }
+    }
+    // Load every listed segment; a missing or rejected one is dropped and its pipelines are
+    // rebuilt at the splash (PRT-SPLASHVERIFY).
+    u64 given_total = 0;
+    std::string loaded_text;
+    std::unordered_set<u32> gone;
+    bool open_listed = false;
+    for (const auto& listed_seg : listed) {
+        auto seg = std::make_unique<PrtSegment>();
+        seg->id = listed_seg.id;
+        seg->sealed = listed_seg.sealed;
+        seg->migrated = listed_seg.migrated;
+        seg->judged = listed_seg.judged;
+        seg->created_session = listed_seg.created;
+        seg->path = PrtSegPath(base, seg->id);
+        seg->saved_gen = 1;
+        const bool is_open = !seg->sealed && seg->id == state.open_id;
+        if (!seg->sealed && !is_open) {
+            seg->sealed = true; // an open segment the index no longer names as open
+        }
+        open_listed = open_listed || is_open;
+        const char* problem = nullptr;
+        std::vector<u8> data;
+        u64 file_bytes = 0;
+        try {
+            Common::RecoverableScope recoverable;
+            if (!std::filesystem::exists(seg->path, ec)) {
+                problem = listed_seg.bytes != 0 || seg->sealed ? "segment file missing" : nullptr;
+            } else {
+                const Common::FS::IOFile file{seg->path, Common::FS::FileAccessMode::Read};
+                if (!file.IsOpen()) {
+                    problem = "segment file unreadable";
+                } else if (file.GetSize() > DriverCacheMaxBytes()) {
+                    problem = "segment file over SHADGT_DRIVER_CACHE_MAX_MB";
+                } else {
+                    file_bytes = file.GetSize();
+                    data.resize(file_bytes);
+                    if (file.Read(data) != data.size()) {
+                        problem = "segment file unreadable";
+                        data.clear();
+                    }
+                }
+            }
+        } catch (...) {
+            problem = "segment file unreadable";
+            data.clear();
+        }
+        // Header check before the driver sees it (vendor, device, UUID, header size).
+        if (!problem && !data.empty() && !PrtDriverCacheHeaderMatches(data, props)) {
+            problem = "segment header from another GPU or driver";
+            data.clear();
+        }
+        vk::UniquePipelineCache cache;
+        if (!problem) {
+            auto [result, made] = device.createPipelineCacheUnique(vk::PipelineCacheCreateInfo{
+                .initialDataSize = data.size(),
+                .pInitialData = data.data(),
+            });
+            if (result != vk::Result::eSuccess) {
+                problem = "segment rejected by the driver";
+                data.clear();
+            } else {
+                cache = std::move(made);
+            }
+        }
+        if (problem) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: seg{} ({}): {}; its pipelines are built again "
+                                       "at the splash (PRT-SPLASHVERIFY)",
+                        seg->id, seg->path.filename().string(), problem);
+            std::filesystem::remove(seg->path, ec);
+            gone.insert(seg->id);
+            for (auto it = entries.begin(); it != entries.end();) {
+                if (it->second.seg == seg->id) {
+                    state.unverified[it->first] = problem;
+                    it = entries.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (!is_open) {
+                continue;
+            }
+            // The open segment starts empty under the same id.
+            auto [result, made] = device.createPipelineCacheUnique({});
+            ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+                       vk::to_string(result));
+            cache = std::move(made);
+            seg->saved_gen = 0;
+            file_bytes = 0;
+        }
+        PrtLogDriverLoad(device, *cache, seg->path, file_bytes, data.size());
+        given_total += data.size();
+        seg->bytes = file_bytes;
+        loaded_text += fmt::format("{}seg{} {} {} MB", loaded_text.empty() ? "" : ", ", seg->id,
+                                   seg->sealed ? (seg->migrated ? "sealed migrated" : "sealed")
+                                               : "open",
+                                   file_bytes >> 20);
+        if (is_open) {
+            pipeline_cache = std::move(cache);
+            seg->handle = *pipeline_cache;
+        } else {
+            seg->owned = std::move(cache);
+            seg->handle = *seg->owned;
+        }
+        state.segs.push_back(std::move(seg));
+    }
+    if (!open_listed) {
+        auto seg = std::make_unique<PrtSegment>();
+        seg->id = std::max(state.open_id, state.next_id);
+        for (const auto& s : state.segs) {
+            seg->id = std::max(seg->id, s->id + 1);
+        }
+        seg->created_session = state.session;
+        seg->path = PrtSegPath(base, seg->id);
+        std::filesystem::remove(seg->path, ec); // a stray file of that name is not ours
+        auto [result, made] = device.createPipelineCacheUnique({});
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+                   vk::to_string(result));
+        pipeline_cache = std::move(made);
+        seg->handle = *pipeline_cache;
+        state.open_id = seg->id;
+        loaded_text += fmt::format("{}seg{} open new", loaded_text.empty() ? "" : ", ", seg->id);
+        state.segs.push_back(std::move(seg));
+    }
+    for (const auto& seg : state.segs) {
+        state.next_id = std::max(state.next_id, seg->id + 1);
+    }
+    // Entries of segments that are not there any more are not kept.
+    for (auto& [hash, entry] : entries) {
+        if (SegById(state, entry.seg)) {
+            state.map.emplace(hash, entry);
+        } else if (!state.unverified.contains(hash)) {
+            state.unverified[hash] = "segment missing";
+        }
+    }
+    for (auto& seg : state.segs) {
+        seg->hit_slot = PrtDrvHitRegister(seg->handle, SegLabel(*seg));
+    }
+    driver_cache_path = SegById(state, state.open_id)->path;
+    state.last_save = std::chrono::steady_clock::now();
+    state.active.store(true, std::memory_order_release);
+    const u32 cap = PrtDrvSegMax();
+    LOG_WARNING(Render_Vulkan,
+                "PRT-DRVSEG: driver cache in segments of {} MB, {} ({}); index {} pipelines; "
+                "{} MB given to the driver; segment cap {}; session {}; {} pipelines of the index "
+                "not loaded (built again at the splash)",
+                PrtDrvSegBytes() >> 20, loaded_text, state.segs.size(), state.map.size(),
+                given_total >> 20, cap == 0 ? std::string{"none (Unlimited)"} : std::to_string(cap),
+                state.session, state.unverified.size());
+    // The old single file is not read with segments on (it was imported when there were no
+    // shards); a leftover one beside imported shards goes, as PRT-DRVSINGLE did.
+    if (std::filesystem::is_regular_file(base, ec) && PrtDriverSingleDeleteOn()) {
+        const u64 bytes = std::filesystem::file_size(base, ec);
+        std::filesystem::remove(base, ec);
+        LOG_WARNING(Render_Vulkan, "PRT-DRVSEG: old single file {} ({} MB) {}",
+                    base.filename().string(), bytes >> 20,
+                    ec ? "could not be deleted: " + ec.message() : std::string{"deleted"});
+    }
+    if (PrtDrvMemOn()) {
+        // Outside the log helper's default so the before value shows.
+        PrtLogDriverMemory("after the driver cache load", before_private);
+    }
+}
+
+// PRT-DRVSEG save: only the open segment, read and written off the GPU thread (PERF-036), then
+// the index. A segment whose saved data passed the segment size is sealed.
+void PipelineCache::PrtSaveDriverSegments(bool wait, const char* why) {
+    auto& state = Seg();
+    if (!wait && driver_cache_writing.load()) {
+        return;
+    }
+    if (driver_cache_writer.joinable()) {
+        driver_cache_writer.join();
+    }
+    vk::PipelineCache cache{};
+    std::filesystem::path path;
+    u32 gen = 0;
+    u32 id = 0;
+    bool dirty = false;
+    const bool new_pipelines = num_new_pipelines != pipelines_at_driver_save;
+    {
+        std::scoped_lock lock{state.mutex};
+        PrtSegment* open = SegById(state, state.open_id);
+        if (!open) {
+            return;
+        }
+        // Unchanged since its last save (or load): only the index (usage) is written.
+        dirty = state.open_assigned_since_save != 0 || open->saved_gen == 0 || new_pipelines ||
+                std::string_view{why} == "requested";
+        cache = open->handle;
+        path = open->path;
+        id = open->id;
+        gen = state.save_gen++;
+        state.open_assigned_since_save = 0;
+        state.last_save = std::chrono::steady_clock::now();
+    }
+    pipelines_at_driver_save = num_new_pipelines;
+    driver_cache_saved_at = std::chrono::steady_clock::now();
+    const vk::Device device = instance.GetDevice();
+    driver_cache_writing = true;
+    driver_cache_writer = std::jthread([this, device, cache, path, gen, id, dirty, why] {
+        SCOPE_EXIT {
+            driver_cache_writing = false;
+        };
+        Common::SetCurrentThreadName("shadGT:DriverCacheSave");
+        auto& state = Seg();
+        try {
+            Common::RecoverableScope recoverable;
+            if (dirty) {
+                const auto start = std::chrono::steady_clock::now();
+                auto data = ReadDriverCacheSnapshot(device, cache);
+                const auto read_end = std::chrono::steady_clock::now();
+                if (!data.empty()) {
+                    const size_t size = data.size();
+                    // PRT-DRVSAFE: temp file, verified, renamed (as every driver cache save).
+                    if (PrtWriteFileSafe(path, data, true)) {
+                        std::scoped_lock lock{state.mutex};
+                        if (PrtSegment* seg = SegById(state, id); seg && !seg->dropped) {
+                            seg->saved_gen = gen + 1;
+                            seg->bytes = size;
+                            if (!seg->sealed && seg->id == state.open_id &&
+                                size >= PrtDrvSegBytes()) {
+                                PrtSegSealLocked(state, *seg, gen);
+                            }
+                        }
+                    } else {
+                        LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: segment write, flush or "
+                                                   "verification failed; keeping previous file");
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-DRVSAVE: open seg{} saved ({}): {} MB, read {:.0f} ms, "
+                                "written {:.0f} ms",
+                                id, why, size >> 20,
+                                std::chrono::duration<double, std::milli>(read_end - start).count(),
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - read_end)
+                                    .count());
+                }
+            }
+            PrtSegWriteIndex();
+        } catch (const std::exception& error) {
+            LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: segment save failed: {}", error.what());
+        }
+    });
+    if (wait) {
+        driver_cache_writer.join();
+    }
+}
+
+// Exit, once: the hit and memory lines, the session count, PRT-DRVMIGRATE's judgement and
+// PRT-DRVSTALE's drops, before the last save writes the index.
 void PipelineCache::PrtDriverCacheExit() {
     if (prt_drv_timer.joinable()) {
         prt_drv_timer.request_stop();
         prt_drv_timer.join();
     }
-    static std::atomic<bool> done{false};
-    if (done.exchange(true)) {
-        return;
+    auto& state = Seg();
+    {
+        std::scoped_lock lock{state.mutex};
+        if (state.exit_done) {
+            return;
+        }
+        state.exit_done = true;
     }
     PrtDrvHitLog(true);
+    PrtLogDriverMemory("at exit");
+    if (!PrtSegActive()) {
+        return;
+    }
+    auto& table = DrvHit();
+    std::scoped_lock lock{state.mutex};
+#ifdef RYTY_GPU
+    if (RytyRaceRunning() || g_prt_photo_draw_seen.load(std::memory_order_relaxed)) {
+        state.content_session.store(true, std::memory_order_relaxed);
+    }
+#endif
+    const bool counted = state.content_session.load(std::memory_order_relaxed);
+    if (counted) {
+        ++state.session;
+    }
+    // PRT-DRVMIGRATE: an imported shard with under 10% driver hits (100+ creates) goes once.
+    for (auto& seg : state.segs) {
+        if (!seg->migrated || seg->judged || seg->dropped || seg->hit_slot < 0) {
+            continue;
+        }
+        const u32 creates = table.slots[seg->hit_slot].creates.load(std::memory_order_relaxed);
+        const u32 hits = table.slots[seg->hit_slot].hits.load(std::memory_order_relaxed);
+        if (!PrtDrvHitOn() || creates < 100) {
+            LOG_WARNING(Render_Vulkan, "PRT-DRVMIGRATE: seg{} not judged yet ({} creates this "
+                                       "session, 100 needed)",
+                        seg->id, creates);
+            continue;
+        }
+        if (hits * 10 < creates) {
+            const u32 used = PrtSegDropLocked(state, *seg, std::max<u32>(PrtDrvStaleSessions(), 1));
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-DRVMIGRATE: seg{} (imported shard, {} MB) had {}/{} driver hits "
+                        "({:.1f}%, under 10%): dropped once; {} used pipelines built again at the "
+                        "splash next start",
+                        seg->id, seg->bytes >> 20, hits, creates, PrtPercent(hits, creates), used);
+        } else {
+            seg->judged = true;
+            LOG_WARNING(Render_Vulkan, "PRT-DRVMIGRATE: seg{} kept: {}/{} driver hits ({:.1f}%)",
+                        seg->id, hits, creates, PrtPercent(hits, creates));
+        }
+    }
+    // PRT-DRVSTALE: a sealed segment at least N counted sessions old whose pipelines were mostly
+    // (over half) not used in the last N counted sessions.
+    const u32 window = PrtDrvStaleSessions();
+    if (counted && window != 0) {
+        for (auto& seg : state.segs) {
+            if (!seg->sealed || seg->dropped || (seg->migrated && !seg->judged) ||
+                seg->created_session + window > state.session) {
+                continue;
+            }
+            const auto [total, recent] = PrtSegRecentUse(state, seg->id, window);
+            if (total != 0 && recent * 2 >= total) {
+                continue;
+            }
+            PrtSegDropLocked(state, *seg, window);
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-DRVSTALE: seg{} ({} MB, {} pipelines) mostly unused in the last {} "
+                        "sessions ({} used): dropped; the used ones are built again by the splash "
+                        "prewarm next start",
+                        seg->id, seg->bytes >> 20, total, window, recent);
+        }
+    }
+    u32 sealed = 0;
+    u64 bytes = 0;
+    for (const auto& seg : state.segs) {
+        if (!seg->dropped) {
+            sealed += seg->sealed ? 1 : 0;
+            bytes += seg->bytes;
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PRT-DRVSEG: exit: {} sealed + 1 open segment, {} MB on disk before this save, "
+                "{} pipelines in the index, {} used by the game this session, {} moved to the "
+                "open segment after a driver miss; session {} ({})",
+                sealed, bytes >> 20, state.map.size(), state.used_this_session.load(),
+                state.moved_on_miss.load(), state.session,
+                counted ? "counted: a race or Scapes loaded" : "not counted: no race or Scapes");
 }
 
+// Every second: PRT-DRVHIT's 10 s line, whether a race or Scapes loaded (PRT-DRVSTALE) and
+// PRT-DRVSAVE's idle save of the open segment in menus.
 void PipelineCache::PrtDrvTimer(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:DrvCacheTimer");
     using namespace std::chrono_literals;
@@ -4059,21 +5068,78 @@ void PipelineCache::PrtDrvTimer(std::stop_token stop) {
         for (int step = 0; step < 10 && !stop.stop_requested(); ++step) {
             std::this_thread::sleep_for(100ms);
         }
+        if (stop.stop_requested()) {
+            break;
+        }
         const auto now = std::chrono::steady_clock::now();
-        if (!stop.stop_requested() && now - last_log >= 10s) {
+        if (now - last_log >= 10s) {
             last_log = now;
             PrtDrvHitLog(false);
+        }
+        if (!PrtSegActive()) {
+            continue;
+        }
+        auto& state = Seg();
+        bool in_race = false;
+#ifdef RYTY_GPU
+        in_race = RytyRaceRunning();
+        if (in_race || g_prt_photo_draw_seen.load(std::memory_order_relaxed)) {
+            state.content_session.store(true, std::memory_order_relaxed);
+        }
+#endif
+        if (!PrtDrvIdleSaveOn() || in_race || g_game_in_play.load(std::memory_order_relaxed) ||
+            driver_cache_writing.load()) {
+            continue;
+        }
+        bool due = false;
+        {
+            std::scoped_lock lock{state.mutex};
+            due = state.open_assigned_since_save != 0 && now - state.last_assign >= 20s &&
+                  now - state.last_save >= 60s;
+        }
+        if (!due) {
+            continue;
+        }
+        std::unique_lock lookup{lookup_mutex, std::try_to_lock};
+        if (lookup.owns_lock()) {
+            PrtSaveDriverSegments(false, "idle in menus");
         }
     }
 }
 
 vk::PipelineCache PipelineCache::DriverCacheFor(u64 hash) const {
     PrtDrvHitThreadReset(); // PRT-DRVHIT: this thread's next create is this pipeline's
+    if (PrtSegActive()) {
+        if (const vk::PipelineCache cache = PrtSegCacheFor(hash)) {
+            return cache;
+        }
+        return *pipeline_cache;
+    }
     if (prt_driver_shards.empty()) {
         return *pipeline_cache;
     }
     const u64 index = hash % (prt_driver_shards.size() + 1);
     return index == 0 ? *pipeline_cache : *prt_driver_shards[index - 1].cache;
+}
+
+void PipelineCache::PrtStartDriverCacheTimer() {
+    // PRT-DRVHIT: the single file or the shards get their own slots (the segments have theirs).
+    if (!PrtSegActive()) {
+        if (pipeline_cache) {
+            PrtDrvHitRegister(*pipeline_cache, prt_driver_shards.empty()
+                                                   ? std::string{"single file"}
+                                                   : std::string{"shard0"});
+        }
+        for (size_t i = 0; i < prt_driver_shards.size(); ++i) {
+            PrtDrvHitRegister(*prt_driver_shards[i].cache, fmt::format("shard{}", i + 1));
+        }
+    }
+    if (!PrtSegActive()) {
+        PrtLogDriverMemory("after the driver cache load"); // PRT-DRVMEM
+    }
+    if ((PrtDrvHitOn() || PrtSegActive()) && !prt_drv_timer.joinable()) {
+        prt_drv_timer = std::jthread([this](std::stop_token stop) { PrtDrvTimer(stop); });
+    }
 }
 
 void PipelineCache::CreateDriverCache() {
@@ -4096,6 +5162,13 @@ void PipelineCache::CreateDriverCache() {
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
             fmt::format("{}-{:04x}-{:04x}-{:08x}-{}.vkpipelinecache", serial,
                         identity.vendorID, identity.deviceID, identity.driverVersion, uuid);
+        if (PrtDrvSegOn()) {
+            PrtCreateDriverSegments(driver_cache_path); // PRT-DRVSEG (Round 18)
+            pipelines_at_driver_save = num_new_pipelines;
+            driver_cache_saved_at = std::chrono::steady_clock::now();
+            PrtStartDriverCacheTimer();
+            return;
+        }
         if (PrtDriverShardCount() != 0) {
             PrtCreateDriverShards(driver_cache_path);
             pipelines_at_driver_save = num_new_pipelines;
@@ -4222,6 +5295,12 @@ static std::vector<u8> ReadDriverCacheSnapshot(vk::Device device, vk::PipelineCa
 void PipelineCache::SaveDriverCache(bool wait) {
     // FIX-GT7-050: wait even when a rejected cache or empty path prevents a new save.
     if (wait && driver_cache_writer.joinable()) driver_cache_writer.join();
+    if (PrtSegActive()) { // PRT-DRVSEG (Round 18): the open segment and the index only
+        const char* why = t_prt_save_reason ? t_prt_save_reason : (wait ? "exit" : "new pipelines");
+        t_prt_save_reason = nullptr;
+        PrtSaveDriverSegments(wait, why);
+        return;
+    }
     struct SaveTarget {
         vk::PipelineCache cache;
         std::filesystem::path path;
@@ -4357,6 +5436,7 @@ void PipelineCache::MaybeSaveDriverCache() {
     // PERF-GT7-108: once the compile pack's start-up compile asked for a save, at the next look
     // (its library recipes are in the driver's cache; the writer thread is this thread's).
     if (driver_cache_save_requested.exchange(false, std::memory_order_acq_rel)) {
+        t_prt_save_reason = "requested"; // PRT-DRVSAVE: after a prewarm or the compile pack
         SaveDriverCache(false);
         return;
     }
@@ -4503,6 +5583,7 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
             DriverCacheFor(std::hash<GraphicsPipelineKey>{}(build.key)), build.infos,
             build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata,
             build.preloading);
+        PrtSegAfterCreate(std::hash<GraphicsPipelineKey>{}(build.key)); // PRT-DRVSEG
         // The copies were only needed while building; draws use the cached infos.
         build.pipeline->SetStageInfos(build.canonical);
         build.info_copies = {};
@@ -6578,6 +7659,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         }
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(S().graphics_key);
+    if (is_new) {
+        PrtSegMarkUsed(std::hash<GraphicsPipelineKey>{}(S().graphics_key)); // PRT-DRVSTALE
+    }
     if (is_new && prt_waiting.load(std::memory_order_relaxed) != 0 &&
         !pending_builds.contains(S().graphics_key)) {
         // PRT-PREWARM: built at start from the recorded pipelines.
@@ -7028,6 +8112,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline(bool select_ahead) {
     if (is_new) {
         std::optional<Common::GuestClock::CompilePause> hold; // FIX-044, while it is waited for
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+        PrtSegMarkUsed(pipeline_hash ^ PrtComputeHashSalt); // PRT-DRVSTALE
         if (pending == pending_computes.end()) {
             LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
         }
@@ -7090,8 +8175,12 @@ const ComputePipeline* PipelineCache::GetComputePipeline(bool select_ahead) {
                     const bool foreground = ForegroundCompileOn(); // PERF-GT7-032 (port)
                     if (foreground) Common::BeginForegroundCompile();
                     SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
+                    // PRT-DRVSEG (Round 18): compute pipelines get their segment too.
+                    const u64 seg_hash = std::hash<ComputePipelineKey>{}(key) ^ PrtComputeHashSalt;
                     auto made = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
-                        profile, *pipeline_cache, key, inputs->info, module, inputs->sdata);
+                        profile, DriverCacheFor(seg_hash), key, inputs->info, module,
+                        inputs->sdata);
+                    PrtSegAfterCreate(seg_hash);
                     inputs->built = std::chrono::steady_clock::now();
                     return made;
                 });
@@ -8237,8 +9326,9 @@ static bool PrtSplashHoldOn() {
 }
 
 static std::string PrtBuiltIdentity(const Instance& instance) {
-    return fmt::format("PRT-SPLASHSKIP 1 {} shards {}", PrtUnbuildableIdentity(instance),
-                       PrtDriverShardCount());
+    // Round 18: segments are another layout than shards; a list from before is not reused.
+    return fmt::format("PRT-SPLASHSKIP 1 {} shards {}{}", PrtUnbuildableIdentity(instance),
+                       PrtDriverShardCount(), PrtSegActive() ? " segments" : "");
 }
 
 static bool PrtAnyRecord() {
@@ -8430,6 +9520,30 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
                         launcher_built.insert(std::strtoull(line.c_str(), nullptr, 16));
                     }
                 }
+                // PRT-SPLASHVERIFY (Round 18, RYGT_SPLASH_VERIFY, GT7 on): a record is skipped
+                // only when its pipeline is in a driver cache segment this start loaded. One of a
+                // missing, rejected or dropped segment, or from another driver, is built here.
+                if (PrtSegActive() && PrtSplashVerifyOn()) {
+                    std::map<std::string, u32> reasons;
+                    const size_t listed = launcher_built.size();
+                    std::erase_if(launcher_built, [&](u64 hash) {
+                        const char* why = PrtSegUnverifiedReason(hash);
+                        if (why) {
+                            ++reasons[why];
+                        }
+                        return why != nullptr;
+                    });
+                    std::string text;
+                    for (const auto& [why, count] : reasons) {
+                        text += fmt::format("{}{} {}", text.empty() ? "" : ", ", count, why);
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-SPLASHVERIFY: {} of {} records the launcher pass built are "
+                                "in a loaded driver cache segment; {} are built again at the "
+                                "splash{}{}",
+                                launcher_built.size(), listed, listed - launcher_built.size(),
+                                text.empty() ? "" : ": ", text);
+                }
                 const size_t before = keys.size();
                 std::erase_if(keys, [&](const GraphicsPipelineKey& key) {
                     return launcher_built.contains(std::hash<GraphicsPipelineKey>{}(key));
@@ -8570,6 +9684,7 @@ void PipelineCache::PrtPrewarmPipelines(std::stop_token stop) {
                 ready.pipeline = std::make_unique<GraphicsPipeline>(
                     instance, scheduler, desc_heap, profile, key, DriverCacheFor(hash), infos,
                     runtime_infos, fetch, modules, ready.sdata, true);
+                PrtSegAfterCreate(hash); // PRT-DRVSEG
             } catch (const Common::RecoverableFailure&) {
                 ready.pipeline.reset();
             } catch (...) {
@@ -12540,6 +13655,7 @@ int PipelineCache::SaveDriverCacheMb() {
     std::unique_lock lock{lookup_mutex};
     driver_cache_save_requested.store(false, std::memory_order_release);
     PrtDriverCacheExit(); // Round 18: the launcher pass ends here
+    t_prt_save_reason = "launcher pass";
     SaveDriverCache(true);
     u64 total = 0;
     bool any = false;
@@ -12558,6 +13674,10 @@ int PipelineCache::SaveDriverCacheMb() {
             total += size;
             any = true;
         }
+    }
+    if (PrtSegActive()) { // PRT-DRVSEG: every segment file on disk
+        total = PrtSegBytesOnDisk();
+        any = true;
     }
     return any ? static_cast<int>(total >> 20) : -1;
 }
