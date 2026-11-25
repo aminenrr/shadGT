@@ -905,6 +905,11 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // PRT-DRVHIT (pr-tests, Round 18): pipeline creation feedback (driver cache hit per create).
+    // Core in Vulkan 1.3, which this renderer needs; the extension is enabled too when listed.
+    pipeline_creation_feedback =
+        add_extension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME) ||
+        properties.apiVersion >= VK_API_VERSION_1_3;
     const char* paging_setting = std::getenv("SHADGT_PAGEABLE_VRAM");
     const bool pageable_memory =
         (!paging_setting || paging_setting[0] != '0') &&

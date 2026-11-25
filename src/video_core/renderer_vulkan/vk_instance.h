@@ -714,6 +714,11 @@ public:
         return supports_memory_budget;
     }
 
+    /// PRT-DRVHIT (pr-tests, Round 18): VkPipelineCreationFeedback can be chained to creates.
+    bool IsPipelineCreationFeedbackSupported() const {
+        return pipeline_creation_feedback;
+    }
+
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
@@ -834,6 +839,7 @@ private:
     bool quad_control{};       ///< AMD-306
     bool vertex_order_check{}; ///< AMD-307
     bool supports_memory_budget{};
+    bool pipeline_creation_feedback{}; ///< PRT-DRVHIT (pr-tests, Round 18)
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     u64 device_local_bytes{}; ///< PRT-VRAMAUTO: the device-local heaps' size

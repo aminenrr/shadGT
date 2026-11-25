@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/ordered_parallel_read.h"
 #include "video_core/renderer_vulkan/bounded_read_cache.h"
 #include "video_core/renderer_vulkan/driver_cache_snapshot.h"
+#include "video_core/renderer_vulkan/prt_driver_hit.h" // PRT-DRVHIT (pr-tests, Round 18)
 #include "video_core/renderer_vulkan/pipeline_retention_budget.h"
 #include "video_core/renderer_vulkan/pipeline_cleanup_worker.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
@@ -3376,6 +3377,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() {
     ExitCacheRegistry().Unregister(this); // Wait for an in-flight close save before teardown.
+    PrtDriverCacheExit(); // Round 18: stops the driver cache timer first
     if (prt_prewarm_thread.joinable()) { // PRT-PREWARM: it reads the store, tables and device
         prt_prewarm_thread.request_stop();
         prt_prewarm_thread.join();
@@ -3830,7 +3832,243 @@ void PipelineCache::PrtCreateDriverShards(const std::filesystem::path& single_pa
                                                old_bytes >> 20));
 }
 
+
+// PRT-DRVHIT (pr-tests, Round 18, RYGT_DRIVER_CACHE_HIT_LOG, GT7 on): driver cache hits per cache
+// file from pipeline creation feedback, logged every 10 s and at exit.
+// "0" turns a switch off, anything else on; unset: on in GT7 only.
+static bool PrtGt7Flag(const char* env) {
+    if (env && *env) {
+        return env[0] != '0';
+    }
+    return Common::IsGt7();
+}
+
+static bool PrtDrvHitSwitchOn() {
+    static const bool on = PrtGt7Flag(std::getenv("RYGT_DRIVER_CACHE_HIT_LOG"));
+    return on;
+}
+
+// ---- PRT-DRVHIT -----------------------------------------------------------------------------
+
+static std::atomic<bool> g_prt_drvhit_supported{false};
+
+bool PrtDrvHitOn() {
+    return g_prt_drvhit_supported.load(std::memory_order_relaxed) && PrtDrvHitSwitchOn();
+}
+
+namespace {
+constexpr size_t PrtDrvHitSlots = 32;
+struct PrtDrvHitSlot {
+    std::atomic<u64> handle{0};
+    std::atomic<u32> creates{0};
+    std::atomic<u32> hits{0};
+    std::atomic<u32> valid{0};
+    std::atomic<u64> hit_us{0};
+    std::atomic<u64> miss_us{0};
+};
+struct PrtDrvHitTable {
+    std::array<PrtDrvHitSlot, PrtDrvHitSlots> slots{};
+    PrtDrvHitSlot other{}; // a cache no file owns (none expected)
+    std::mutex label_mutex;
+    std::array<std::string, PrtDrvHitSlots> labels{};
+    std::atomic<u32> used{0};
+    // Logged totals of the 10 s line, read and written by the timer thread only.
+    std::array<u32, PrtDrvHitSlots + 1> last_creates{};
+    std::array<u32, PrtDrvHitSlots + 1> last_hits{};
+};
+PrtDrvHitTable& DrvHit() {
+    static auto* table = new PrtDrvHitTable();
+    return *table;
+}
+thread_local u32 t_drvhit_creates = 0;
+thread_local u32 t_drvhit_misses = 0;
+} // namespace
+
+static u64 PrtCacheBits(vk::PipelineCache cache) {
+    const VkPipelineCache raw = cache;
+    u64 bits = 0;
+    std::memcpy(&bits, &raw, std::min(sizeof(raw), sizeof(bits)));
+    return bits;
+}
+
+// Gives a cache handle its slot (or a new label); the slot index, or -1 when full.
+static int PrtDrvHitRegister(vk::PipelineCache cache, std::string label) {
+    auto& table = DrvHit();
+    const u64 bits = PrtCacheBits(cache);
+    if (bits == 0) {
+        return -1;
+    }
+    std::scoped_lock lock{table.label_mutex};
+    const u32 used = table.used.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < used; ++i) {
+        if (table.slots[i].handle.load(std::memory_order_relaxed) == bits) {
+            table.labels[i] = std::move(label);
+            return static_cast<int>(i);
+        }
+    }
+    if (used >= PrtDrvHitSlots) {
+        return -1;
+    }
+    table.labels[used] = std::move(label);
+    table.slots[used].handle.store(bits, std::memory_order_relaxed);
+    table.used.store(used + 1, std::memory_order_release);
+    return static_cast<int>(used);
+}
+
+static void PrtDrvHitRelabel(int slot, std::string label) {
+    if (slot < 0) {
+        return;
+    }
+    auto& table = DrvHit();
+    std::scoped_lock lock{table.label_mutex};
+    table.labels[slot] = std::move(label);
+}
+
+void PrtDrvHitRecord(vk::PipelineCache cache, const vk::PipelineCreationFeedback& feedback) {
+    auto& table = DrvHit();
+    const u64 bits = PrtCacheBits(cache);
+    PrtDrvHitSlot* slot = &table.other;
+    const u32 used = table.used.load(std::memory_order_acquire);
+    for (u32 i = 0; i < used; ++i) {
+        if (table.slots[i].handle.load(std::memory_order_relaxed) == bits) {
+            slot = &table.slots[i];
+            break;
+        }
+    }
+    const bool valid = static_cast<bool>(feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid);
+    const bool hit =
+        valid && static_cast<bool>(feedback.flags &
+                                   vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit);
+    slot->creates.fetch_add(1, std::memory_order_relaxed);
+    if (valid) {
+        slot->valid.fetch_add(1, std::memory_order_relaxed);
+        (hit ? slot->hit_us : slot->miss_us)
+            .fetch_add(feedback.duration / 1000, std::memory_order_relaxed);
+    }
+    if (hit) {
+        slot->hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    ++t_drvhit_creates;
+    if (valid && !hit) {
+        ++t_drvhit_misses;
+    }
+}
+
+static void PrtDrvHitThreadReset() {
+    t_drvhit_creates = 0;
+    t_drvhit_misses = 0;
+}
+
+static double PrtPercent(u64 part, u64 whole) {
+    return whole == 0 ? 0.0 : 100.0 * double(part) / double(whole);
+}
+
+// One line: the last 10 s (or the whole session at exit) per file with creates.
+static void PrtDrvHitLog(bool at_exit) {
+    if (!PrtDrvHitOn()) {
+        return;
+    }
+    auto& table = DrvHit();
+    const u32 used = table.used.load(std::memory_order_acquire);
+    u64 window_creates = 0, window_hits = 0, total_creates = 0, total_hits = 0, total_valid = 0;
+    std::string parts;
+    for (u32 i = 0; i <= used; ++i) {
+        PrtDrvHitSlot& slot = i < used ? table.slots[i] : table.other;
+        const u32 creates = slot.creates.load(std::memory_order_relaxed);
+        const u32 hits = slot.hits.load(std::memory_order_relaxed);
+        const u32 valid = slot.valid.load(std::memory_order_relaxed);
+        const u32 d_creates = creates - table.last_creates[i];
+        const u32 d_hits = hits - table.last_hits[i];
+        table.last_creates[i] = creates;
+        table.last_hits[i] = hits;
+        window_creates += d_creates;
+        window_hits += d_hits;
+        total_creates += creates;
+        total_hits += hits;
+        total_valid += valid;
+        const u32 shown_creates = at_exit ? creates : d_creates;
+        const u32 shown_hits = at_exit ? hits : d_hits;
+        if (shown_creates == 0) {
+            continue;
+        }
+        std::string label;
+        if (i < used) {
+            std::scoped_lock lock{table.label_mutex};
+            label = table.labels[i];
+        } else {
+            label = "other cache";
+        }
+        if (at_exit) {
+            const u64 hit_ms = slot.hit_us.load(std::memory_order_relaxed) / 1000;
+            const u64 miss_ms = slot.miss_us.load(std::memory_order_relaxed) / 1000;
+            parts += fmt::format("; {} {}/{} hits ({:.1f}%, {} no answer), hits {} ms, misses {} ms",
+                                 label, shown_hits, shown_creates,
+                                 PrtPercent(shown_hits, shown_creates), shown_creates - valid,
+                                 hit_ms, miss_ms);
+        } else {
+            parts += fmt::format("; {} {}/{} ({:.0f}%)", label, shown_hits, shown_creates,
+                                 PrtPercent(shown_hits, shown_creates));
+        }
+    }
+    if (at_exit) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVHIT: session {} pipeline creates, {} driver cache hits ({:.1f}%), {} "
+                    "without feedback{}",
+                    total_creates, total_hits, PrtPercent(total_hits, total_creates),
+                    total_creates - total_valid, parts);
+    } else if (window_creates != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DRVHIT: last 10 s {} creates, {} driver cache hits ({:.0f}%){}; session "
+                    "{}/{} ({:.1f}%)",
+                    window_creates, window_hits, PrtPercent(window_hits, window_creates), parts,
+                    total_hits, total_creates, PrtPercent(total_hits, total_creates));
+    }
+}
+
+void PipelineCache::PrtStartDriverCacheTimer() {
+    if (pipeline_cache) {
+        PrtDrvHitRegister(*pipeline_cache, prt_driver_shards.empty() ? std::string{"single file"}
+                                                                     : std::string{"shard0"});
+    }
+    for (size_t i = 0; i < prt_driver_shards.size(); ++i) {
+        PrtDrvHitRegister(*prt_driver_shards[i].cache, fmt::format("shard{}", i + 1));
+    }
+    if (PrtDrvHitOn() && !prt_drv_timer.joinable()) {
+        prt_drv_timer = std::jthread([this](std::stop_token stop) { PrtDrvTimer(stop); });
+    }
+}
+
+// Exit, once: the session's hit line.
+void PipelineCache::PrtDriverCacheExit() {
+    if (prt_drv_timer.joinable()) {
+        prt_drv_timer.request_stop();
+        prt_drv_timer.join();
+    }
+    static std::atomic<bool> done{false};
+    if (done.exchange(true)) {
+        return;
+    }
+    PrtDrvHitLog(true);
+}
+
+void PipelineCache::PrtDrvTimer(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:DrvCacheTimer");
+    using namespace std::chrono_literals;
+    auto last_log = std::chrono::steady_clock::now();
+    while (!stop.stop_requested()) {
+        for (int step = 0; step < 10 && !stop.stop_requested(); ++step) {
+            std::this_thread::sleep_for(100ms);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!stop.stop_requested() && now - last_log >= 10s) {
+            last_log = now;
+            PrtDrvHitLog(false);
+        }
+    }
+}
+
 vk::PipelineCache PipelineCache::DriverCacheFor(u64 hash) const {
+    PrtDrvHitThreadReset(); // PRT-DRVHIT: this thread's next create is this pipeline's
     if (prt_driver_shards.empty()) {
         return *pipeline_cache;
     }
@@ -3839,6 +4077,14 @@ vk::PipelineCache PipelineCache::DriverCacheFor(u64 hash) const {
 }
 
 void PipelineCache::CreateDriverCache() {
+    // PRT-DRVHIT (Round 18): creation feedback, not with pipeline binaries (they skip this cache).
+    g_prt_drvhit_supported.store(instance.IsPipelineCreationFeedbackSupported() &&
+                                     !instance.IsPipelineBinarySupported(),
+                                 std::memory_order_relaxed);
+    if (PrtDrvHitSwitchOn() && !g_prt_drvhit_supported.load(std::memory_order_relaxed)) {
+        LOG_WARNING(Render_Vulkan, "PRT-DRVHIT: off, no pipeline creation feedback here (or "
+                                   "pipeline binaries in use)");
+    }
     std::vector<u8> data;
     try {
     Common::RecoverableScope recoverable;
@@ -3854,6 +4100,7 @@ void PipelineCache::CreateDriverCache() {
             PrtCreateDriverShards(driver_cache_path);
             pipelines_at_driver_save = num_new_pipelines;
             driver_cache_saved_at = std::chrono::steady_clock::now();
+            PrtStartDriverCacheTimer();
             return;
         }
         RotateOversizedDriverCache(driver_cache_path); // FIX-SGT-010
@@ -3943,6 +4190,7 @@ void PipelineCache::CreateDriverCache() {
     LOG_INFO(Render_Vulkan, "Driver pipeline cache: loaded {} bytes, hash {:016x}, file {}",
              data.size(), data.empty() ? 0ull : XXH3_64bits(data.data(), data.size()),
              driver_cache_path.string());
+    PrtStartDriverCacheTimer();
 }
 
 // A disk-cache snapshot is optional. Query its size before allocating, and never let an
@@ -12291,6 +12539,7 @@ void PipelineCache::StopStartupBuilds() {
 int PipelineCache::SaveDriverCacheMb() {
     std::unique_lock lock{lookup_mutex};
     driver_cache_save_requested.store(false, std::memory_order_release);
+    PrtDriverCacheExit(); // Round 18: the launcher pass ends here
     SaveDriverCache(true);
     u64 total = 0;
     bool any = false;

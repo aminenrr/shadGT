@@ -50,6 +50,7 @@
 #include "video_core/renderer_vulkan/shared_creation_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_binary_store.h" // BIN-001
+#include "video_core/renderer_vulkan/prt_driver_hit.h" // PRT-DRVHIT (pr-tests, Round 18)
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -1394,8 +1395,11 @@ GraphicsPipeline::GraphicsPipeline(
             BuildWatch part_watch{debug_str, i == 1 ? "pre-raster library"
                                              : i == 2 ? "fragment library"
                                                       : "interface library"};
+            // PRT-DRVHIT (pr-tests, Round 18): driver cache hit or miss of this library.
+            PrtDrvHitProbe library_probe;
+            const auto library_info = library_probe.Chain(part_infos[i], pipeline_cache);
             auto [library_result, library] = PipelineBinaryStore::CreateGraphics(
-                instance, device, pipeline_cache, part_infos[i]); // BIN-001
+                instance, device, pipeline_cache, library_info); // BIN-001
             // AMD-OOM-001: AMD's compiler ran out of system memory (ErrorOutOfHostMemory,
             // "LLVM ERROR: out of memory") with several builds at once, and the assertion below
             // ended GT Sport. Wait, then retry alone (the heavy-build slot), up to six times.
@@ -1410,18 +1414,19 @@ GraphicsPipeline::GraphicsPipeline(
                 std::this_thread::sleep_for(std::chrono::milliseconds{250 * attempt});
                 HeavyBuildGate alone{!(tessellated && i == 1)};
                 auto retried = PipelineBinaryStore::CreateGraphics(instance, device,
-                                                                   pipeline_cache, part_infos[i]);
+                                                                   pipeline_cache, library_info);
                 library_result = retried.result;
                 library = retried.value;
             }
             if (library_result != vk::Result::eSuccess) {
                 auto retried = CreateWithRetries("library of", debug_str, [&] {
                     return PipelineBinaryStore::CreateGraphics(instance, device, pipeline_cache,
-                                                               part_infos[i]);
+                                                               library_info);
                 }); // FIX-GT7-101
                 library_result = retried.result;
                 library = retried.value;
             }
+            library_probe.Done(library_result);
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
@@ -1547,9 +1552,12 @@ GraphicsPipeline::GraphicsPipeline(
             .flags = pipeline_info.flags,
             .layout = *pipeline_layout,
         };
+        PrtDrvHitProbe link_probe; // PRT-DRVHIT (pr-tests, Round 18)
+        const auto link_probed = link_probe.Chain(link_info, pipeline_cache);
         auto [link_result, linked] = CreateWithRetries("link of", debug_str, [&] {
-            return device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+            return device.createGraphicsPipelineUnique(pipeline_cache, link_probed);
         }); // FIX-GT7-101
+        link_probe.Done(link_result);
         ASSERT_MSG(link_result == vk::Result::eSuccess, "Failed to link graphics pipeline: {}",
                    vk::to_string(link_result));
         pipeline = std::move(linked);
@@ -1610,7 +1618,10 @@ GraphicsPipeline::GraphicsPipeline(
             BuildWatch watch{debug_str, "optimized link"};
             HeavyBuildGate gate{tessellated};
             const auto link_start = std::chrono::steady_clock::now();
-            auto [result, optimized] = device.createGraphicsPipeline(cache, optimized_info);
+            PrtDrvHitProbe optimized_probe; // PRT-DRVHIT (pr-tests, Round 18)
+            auto [result, optimized] = device.createGraphicsPipeline(
+                cache, optimized_probe.Chain(optimized_info, cache));
+            optimized_probe.Done(result);
             if (result == vk::Result::eSuccess) {
                 optimized_pipeline.store(optimized, std::memory_order_release);
             }
@@ -1637,17 +1648,20 @@ GraphicsPipeline::GraphicsPipeline(
     if (!preloading) {
         whole_watch.emplace(debug_str, "whole pipeline compile");
     }
+    PrtDrvHitProbe whole_probe; // PRT-DRVHIT (pr-tests, Round 18)
+    const auto whole_info = whole_probe.Chain(pipeline_info, pipeline_cache);
     auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
         // PERF-GTS-482: AMD keeps no whole pipeline with dynamic vertex input in the driver
         // cache; the binary store keeps them across launches instead.
         if (instance.IsPipelineBinaryWholeOnly()) {
             auto made = PipelineBinaryStore::CreateGraphics(instance, device, pipeline_cache,
-                                                            pipeline_info);
+                                                            whole_info);
             return vk::ResultValue<vk::UniquePipeline>{
                 made.result, vk::UniquePipeline{made.value, device}};
         }
-        return device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+        return device.createGraphicsPipelineUnique(pipeline_cache, whole_info);
     }); // FIX-GT7-101
+    whole_probe.Done(pipeline_result);
     whole_watch.reset();
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
     // PRT-QUIETLOG (Round 8): the driver create line only for creates of 20 ms or more.

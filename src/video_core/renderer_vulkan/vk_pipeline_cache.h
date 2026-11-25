@@ -260,6 +260,7 @@ public:
     // while the renderer and Vulkan device are alive, excluding cache lookups.
     void PersistDriverCacheForExit() {
         std::unique_lock lock{lookup_mutex};
+        PrtDriverCacheExit(); // Round 18: PRT-DRVHIT exit line
         SaveDriverCache(true);
     }
 
@@ -645,6 +646,11 @@ private:
     std::vector<PrtDriverShard> prt_driver_shards;
     void PrtCreateDriverShards(const std::filesystem::path& base);
     vk::PipelineCache DriverCacheFor(u64 hash) const;
+    /// Round 18 (pr-tests): PRT-DRVHIT timer and exit line.
+    void PrtDriverCacheExit();
+    void PrtStartDriverCacheTimer();
+    void PrtDrvTimer(std::stop_token stop);
+    std::jthread prt_drv_timer;
 
     std::unordered_set<u64> logged_swizzled_blends;
 

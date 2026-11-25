@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/prt_driver_hit.h" // PRT-DRVHIT (pr-tests, Round 18)
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -133,10 +134,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
+    PrtDrvHitProbe probe; // PRT-DRVHIT (pr-tests, Round 18)
+    const auto probed_ci = probe.Chain(compute_pipeline_ci, pipeline_cache);
     auto [pipeline_result, pipe] = CreateWithRetries("compute pipeline", debug_str, [&] {
-        return instance.GetDevice().createComputePipelineUnique(pipeline_cache,
-                                                                compute_pipeline_ci);
+        return instance.GetDevice().createComputePipelineUnique(pipeline_cache, probed_ci);
     }); // FIX-GT7-101
+    probe.Done(pipeline_result);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -345,7 +348,10 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
     }
     SCOPE_EXIT { if (gate) HeavyPipelineGate().release(); };
     if (stop.stop_requested()) return false;
-    auto [pipeline_result, pipeline] = device.createComputePipelineUnique(cache, pipeline_ci);
+    PrtDrvHitProbe probe; // PRT-DRVHIT (pr-tests, Round 18)
+    auto [pipeline_result, pipeline] =
+        device.createComputePipelineUnique(cache, probe.Chain(pipeline_ci, cache));
+    probe.Done(pipeline_result);
     return pipeline_result == vk::Result::eSuccess;
 }
 
