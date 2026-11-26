@@ -1586,7 +1586,8 @@ GraphicsPipeline::GraphicsPipeline(
         const auto layout = *pipeline_layout;
         const bool queued = PipelineLinkWorkers::Instance().TryPush(
             [this, device, layout, library_handles, promise,
-             cache = pipeline_cache, debug_str, tessellated](bool stopping) {
+             cache = pipeline_cache, debug_str, tessellated,
+             store_instance = &instance](bool stopping) {
             struct Complete {
                 std::shared_ptr<std::promise<void>> promise;
                 ~Complete() { promise->set_value(); }
@@ -1619,8 +1620,13 @@ GraphicsPipeline::GraphicsPipeline(
             HeavyBuildGate gate{tessellated};
             const auto link_start = std::chrono::steady_clock::now();
             PrtDrvHitProbe optimized_probe; // PRT-DRVHIT (pr-tests, Round 18)
-            auto [result, optimized] = device.createGraphicsPipeline(
-                cache, optimized_probe.Chain(optimized_info, cache));
+            // FIX-SGT-192: an optimized link is a full compile; stored, not in the driver cache.
+            auto [result, optimized] =
+                PipelineBinaryStore::StoresEverything(*store_instance)
+                    ? PipelineBinaryStore::CreateGraphics(*store_instance, device, cache,
+                                                          optimized_info)
+                    : device.createGraphicsPipeline(
+                          cache, optimized_probe.Chain(optimized_info, cache));
             optimized_probe.Done(result);
             if (result == vk::Result::eSuccess) {
                 optimized_pipeline.store(optimized, std::memory_order_release);
@@ -1653,9 +1659,11 @@ GraphicsPipeline::GraphicsPipeline(
     auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
         // PERF-GTS-482: AMD keeps no whole pipeline with dynamic vertex input in the driver
         // cache; the binary store keeps them across launches instead.
-        if (instance.IsPipelineBinaryWholeOnly()) {
+        // FIX-SGT-192: and every whole pipeline wherever the store keeps everything.
+        if (instance.IsPipelineBinaryWholeOnly() ||
+            PipelineBinaryStore::StoresEverything(instance)) {
             auto made = PipelineBinaryStore::CreateGraphics(instance, device, pipeline_cache,
-                                                            whole_info);
+                                                            pipeline_info);
             return vk::ResultValue<vk::UniquePipeline>{
                 made.result, vk::UniquePipeline{made.value, device}};
         }

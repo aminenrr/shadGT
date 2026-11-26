@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/prt_driver_hit.h" // PRT-DRVHIT (pr-tests, Round 18)
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary_store.h" // FIX-SGT-192
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -137,6 +138,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     PrtDrvHitProbe probe; // PRT-DRVHIT (pr-tests, Round 18)
     const auto probed_ci = probe.Chain(compute_pipeline_ci, pipeline_cache);
     auto [pipeline_result, pipe] = CreateWithRetries("compute pipeline", debug_str, [&] {
+        // FIX-SGT-192: through the binary store where it keeps every pipeline.
+        if (PipelineBinaryStore::StoresEverything(instance)) {
+            auto made = PipelineBinaryStore::CreateCompute(instance, instance.GetDevice(),
+                                                           pipeline_cache, compute_pipeline_ci);
+            return vk::ResultValue<vk::UniquePipeline>{
+                made.result, vk::UniquePipeline{made.value, instance.GetDevice()}};
+        }
         return instance.GetDevice().createComputePipelineUnique(pipeline_cache, probed_ci);
     }); // FIX-GT7-101
     probe.Done(pipeline_result);
@@ -296,6 +304,7 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
     if (module_result != vk::Result::eSuccess) {
         return false;
     }
+    RememberModuleHash(*module, std::span<const u32>{words.data() + at, spirv_words}); // FIX-SGT-192
     const vk::DescriptorSetLayoutCreateInfo set_ci = {
         .flags = push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                       : vk::DescriptorSetLayoutCreateFlagBits{},
@@ -348,6 +357,14 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
     }
     SCOPE_EXIT { if (gate) HeavyPipelineGate().release(); };
     if (stop.stop_requested()) return false;
+    // FIX-SGT-192: with the binary store keeping every pipeline, the warm-up stores it there.
+    if (PipelineBinaryStore::StoresEverything(instance)) {
+        if (PipelineBinaryStore::Stored(instance, device, pipeline_ci)) return true;
+        auto [made_result, made] =
+            PipelineBinaryStore::CreateCompute(instance, device, cache, pipeline_ci);
+        if (made_result == vk::Result::eSuccess) device.destroyPipeline(made);
+        return made_result == vk::Result::eSuccess;
+    }
     PrtDrvHitProbe probe; // PRT-DRVHIT (pr-tests, Round 18)
     auto [pipeline_result, pipeline] =
         device.createComputePipelineUnique(cache, probe.Chain(pipeline_ci, cache));

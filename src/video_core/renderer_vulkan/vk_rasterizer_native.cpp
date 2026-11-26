@@ -25872,11 +25872,36 @@ void NativeRenderer::EvictImages() {
             }
             return true;
         }
-        if ((!volume && entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60) ||
-            kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
+        // PRT-HDRKEEP (pr-tests, Round 24, RYGT_HDR_SKY_KEEP, GT7 on): small HDR GPU-drawn
+        // pictures (sky/cloud/irradiance LUTs, <= 8 MB) stay past idle 2 s even if drawn once
+        // or with no CPU content hash, while guest memory is untouched (fixes cyan map clouds).
+        static const bool hdr_keep_on = [] {
+            const char* env = std::getenv("RYGT_HDR_SKY_KEEP");
+            return !(env && env[0] == '0');
+        }();
+        const bool hdr_sky = hdr_keep_on && !entry.info.props.is_depth && size <= (u64{8} << 20) &&
+            (entry.info.pixel_format == vk::Format::eB10G11R11UfloatPack32 ||
+             entry.info.pixel_format == vk::Format::eR16G16B16A16Sfloat ||
+             entry.info.pixel_format == vk::Format::eR16Sfloat);
+        const bool mem_ok = hdr_sky ? (entry.content_hash == 0 || registry->MemoryUnchanged(entry))
+                                    : registry->MemoryUnchanged(entry);
+        if ((!volume && !hdr_sky &&
+             entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60) ||
+            kept_bytes + size > KeptBudget || !mem_ok) {
             return false;
         }
         entry.kept.store(true, std::memory_order_relaxed);
+        if (hdr_sky) {
+            static std::atomic<u32> hdr_logged{};
+            if (const u32 n = hdr_logged++; n < 32 || n % 200 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-HDRKEEP: kept HDR GPU picture {:#x}+{:#x} {}x{} {} (frame {}, "
+                            "kept {:.1f} MB)",
+                            address, size, entry.info.size.width, entry.info.size.height,
+                            vk::to_string(entry.info.pixel_format), frame,
+                            (kept_bytes + size) / 1048576.0);
+            }
+        }
         }
         kept_bytes += size;
         WatchPages(address, size);
