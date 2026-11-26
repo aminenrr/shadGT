@@ -73,6 +73,7 @@
 
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/rygt_port_switch.h"
 #include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -2188,6 +2189,43 @@ static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAdd
     return mapping_end > address && mapping_end - mapping <= copy_below;
 }
 
+// FIX-SGT-140 (diagnosis, SHADGT_DIAG_OOM_EVERY=<n>, diagnostics builds only): every nth upload
+// chunk a caller can do without, and every nth write-back, fails as if device memory had run
+// out, so the recovery paths run without a full card.
+static bool DiagForcedOutOfMemory() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        static const u64 every = [] {
+            const char* env = Common::DiagEnv("SHADGT_DIAG_OOM_EVERY");
+            return env && *env ? u64{std::strtoull(env, nullptr, 10)} : u64{0};
+        }();
+        static std::atomic<u64> calls{};
+        return every != 0 && calls.fetch_add(1, std::memory_order_relaxed) % every == every - 1;
+    }
+}
+
+// FIX-SGT-140: out-of-memory lines: the first 16, then one in 256.
+static bool OutOfMemoryLogDue(std::atomic<u32>& logged);
+
+// FIX-SGT-140 port (pr-tests, Round 22, RYGT_OOM_RECOVER, GT7 on; 0 = off): device memory running
+// out frees, waits and skips instead of stopping the renderer. Off: as before (NAT-100 stops it).
+static bool PrtOomRecoverOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_OOM_RECOVER");
+        if (env && *env) {
+            return env[0] != '0';
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+static bool OutOfMemoryLogDue(std::atomic<u32>& logged) {
+    const u32 n = logged.fetch_add(1, std::memory_order_relaxed);
+    return n < 16 || n % 256 == 0;
+}
+
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -2250,7 +2288,21 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                 {"allocate", "mapping", "readable-prefix", "zero-tail", "guarded-copy",
                  "sparse-copy", "wrap-buffer", "local-stage"}};
             detail.Next(0,address,size);
-            const auto [buffer, offset, destination] = Allocate(size, r.instance.StorageMinAlignment());
+            // FIX-SGT-140 (RyGT #103): with device memory gone (an 8 GB card, a track change
+            // while shaders compile) this stopped the renderer (NAT-100). Without upload memory
+            // the registry's own CPU copy is tried, and when that fails too the texture keeps
+            // what it has until its next upload.
+            const auto [buffer, offset, destination] =
+                Allocate(size, r.instance.StorageMinAlignment(), nullptr, true);
+            if (!destination) {
+                static std::atomic<u32> logged{};
+                if (OutOfMemoryLogDue(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-140: texture {:#x}+{:#x} not staged: upload memory ran out",
+                                address, size);
+                }
+                return staged;
+            }
             detail.Next(1);
             u64 readable = 0;
             if (r.memory->IsValidMapping(address)) {
@@ -5040,12 +5092,32 @@ void NativeRenderer::FlushWritebacks() {
                 UNREACHABLE_MSG("native image download import coverage or alignment failed");
                 return;
             }
-            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
-                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
-                : device->CreateBuffer({.size = size,
+            const auto make_scatter = [&] {
+                return device->CreateBuffer({.size = size,
                     .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferSrc |
                              Native::Rhi::BufferUsageTransferDst,
                     .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native image download scatter"});
+            };
+            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
+                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
+                : make_scatter();
+            if (!out && !chunked && !direct_output && PrtOomRecoverOn()) {
+                RelieveDeviceMemory(); // FIX-SGT-140: the submitted work frees what it held
+                out = make_scatter();
+            }
+            if (!out && !chunked && !direct_output && PrtOomRecoverOn()) {
+                // FIX-SGT-140 (RyGT #103): device memory ran out. Nothing is recorded for the
+                // picture yet: its write-back is left out (guest memory keeps what it had until
+                // the picture is drawn and goes back again), not the renderer stopped.
+                static std::atomic<u32> logged{};
+                if (OutOfMemoryLogDue(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-140: write-back of the picture at {:#x}+{:#x} skipped: "
+                                "no device memory for its scatter buffer",
+                                address, size);
+                }
+                continue;
+            }
             if (!out && !chunked) {
                 UNREACHABLE_MSG("native image download wrapper allocation failed");
                 return;
@@ -5288,6 +5360,33 @@ void NativeRenderer::FlushWritebacks() {
             NATIVE_DIAGNOSTIC(++stats.writebacks);
             continue;
         }
+        // FIX-SGT-140 (RyGT #103): what RecordDownload makes (the tiling parameters, a 64 KB
+        // allocation, and unbatched its scratch) is made here, before anything is recorded for
+        // the picture. With device memory gone it stopped the renderer ("native image download
+        // recording failed"); now, after a wait for the submitted work, the write-back is left
+        // out for this time.
+        const auto prepared = [&] {
+            return !PrtOomRecoverOn() ||
+                   (!DiagForcedOutOfMemory() && registry->PrepareDownload(*entry, use_batch));
+        };
+        bool ready = prepared();
+        if (!ready) {
+            RelieveDeviceMemory();
+            ready = prepared();
+        }
+        if (!ready) {
+            static std::atomic<u32> logged{};
+            if (OutOfMemoryLogDue(logged)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-SGT-140: write-back of the picture at {:#x}+{:#x} skipped: "
+                            "no device memory for its tiling buffers",
+                            address, size);
+            }
+            Native::Rhi::g_device_memory_pressure.store(true, std::memory_order_relaxed);
+            s.keep.push_back(std::move(plan.out));
+            for (auto& part : plan.imports) s.imported_view_leases.push_back(std::move(part.lease));
+            continue;
+        }
         if (!plan.scatter.empty()) {
             const vk::Buffer scratch{Handle<VkBuffer_T>(plan.out->NativeHandle())};
             for (const auto& part : plan.imports)
@@ -5477,7 +5576,29 @@ static char NativeNoReuse() {
     return mode;
 }
 
-NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
+// FIX-SGT-140 (RyGT #103): device memory ran out with every upload chunk held by work not yet
+// done, and the texture cache's eviction had not freed enough. At most once a frame, wait for the
+// work already submitted (nothing new is submitted here: the stream being recorded stays open),
+// then free what it held: the images, views and buffers retired since. The frame's end then
+// evicts harder (VRAM-PRESSURE-001). false: already done this frame.
+bool NativeRenderer::RelieveDeviceMemory() {
+    if (!PrtOomRecoverOn()) {
+        return false; // RYGT_OOM_RECOVER=0: as before
+    }
+    Native::Rhi::g_device_memory_pressure.store(true, std::memory_order_relaxed);
+    if (oom_relief_frame.exchange(frame, std::memory_order_relaxed) == frame) {
+        return false;
+    }
+    const u64 current = r.scheduler.CurrentTick();
+    if (current > 1) {
+        r.scheduler.Wait(current - 1); // the last submitted tick: no flush
+    }
+    device->Collect();
+    return true;
+}
+
+NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size, bool may_fail) {
+    may_fail = may_fail && PrtOomRecoverOn(); // RYGT_OOM_RECOVER=0: never skips (as before)
     Native::SlowCallTrace<6> trace{t_timed, "take-upload-chunk",
         {"mutex", "timeline-query", "trim-free", "reclaim-retired", "take-free", "create-buffer"}};
     trace.Next(0, 0, size);
@@ -5516,11 +5637,17 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
     }
+    // FIX-SGT-140: memory ran out already this frame (and the wait was spent): a caller that can
+    // do without gets none, and what is left goes to those that can't.
+    if (may_fail && oom_relief_frame.load(std::memory_order_relaxed) == frame) {
+        return {};
+    }
     Chunk chunk;
     trace.Next(5);
-    const auto create = [&] {
+    const bool forced_failure = may_fail && DiagForcedOutOfMemory(); // FIX-SGT-140 (diagnosis)
+    const auto create = [&](u64 capacity, bool recycle = true) {
         Chunk result;
-        const u64 capacity = UploadChunkCapacity(size, ChunkSize());
+        if (forced_failure) return result;
         result.buffer = device->CreateBuffer({
         .size = capacity,
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
@@ -5532,14 +5659,14 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         // the standard chunk) took 100 to 145 ms to create, and the chunk cache's 128 MB
         // budget freed it again before the next large texture: a long frame each time.
         // Freed, its memory waits in the upload copy pool for the next one of its size.
-        .recycle = capacity > ChunkSize(),
+        .recycle = recycle && capacity > ChunkSize(),
         });
         return result;
     };
-    chunk = create();
-    if (!chunk.buffer || !chunk.buffer->Mapped()) {
-        LOG_WARNING(Render_Vulkan,
-                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+    const u64 capacity = UploadChunkCapacity(size, ChunkSize());
+    const auto usable = [](const Chunk& made) { return made.buffer && made.buffer->Mapped(); };
+    chunk = create(capacity);
+    const auto recover = [&] {
         device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
         chunk = RecoverUploadMemory(
             size, r.scheduler.CurrentTick(), true, free_chunks, retiring_chunks,
@@ -5548,20 +5675,55 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
             [&](std::unique_ptr<Native::Rhi::Buffer> buffer) {
                 device->DestroyCompletedBuffer(std::move(buffer));
             },
-            [&] { device->Collect(); return create(); });
+            [&] { device->Collect(); return create(capacity); });
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
+    };
+    if (!usable(chunk)) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+        recover();
     }
-    ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
-               size);
+    if (!usable(chunk)) {
+        // FIX-SGT-140: the work already submitted frees what it holds once done; then a chunk
+        // of just the size asked for (not the standard 4 MB, or the next power of two).
+        const bool relieved = RelieveDeviceMemory();
+        if (relieved) recover();
+        if (!usable(chunk) && capacity > size) {
+            device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+            // Not recycled: its size class would round it up again.
+            chunk = create(Common::AlignUp(size, u64{64} << 10), false);
+        }
+        static std::atomic<u32> logged{};
+        if (OutOfMemoryLogDue(logged)) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-140: upload memory ran out ({} bytes): {} after waiting for "
+                        "the submitted work{}{}",
+                        size, usable(chunk) ? "found" : "none", relieved ? "" : " (waited already this frame)",
+                        usable(chunk) || !may_fail ? "" : "; this upload is skipped");
+        }
+    }
+    if (!usable(chunk) && may_fail) {
+        device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+        return {};
+    }
+    ASSERT_MSG(usable(chunk), "NAT-100: no upload memory ({} bytes)", size);
     return chunk;
 }
 
-std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven) {
+std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven,
+                                                          bool may_fail) {
     Stream& s = Ctx().stream;
     align = std::max<u64>(align, 16);
     if (s.chunks.empty() ||
         Common::AlignUp(s.chunk_used, align) + size > s.chunks.back().buffer->Size()) {
-        s.chunks.push_back(TakeChunk(size));
+        // FIX-SGT-140: may_fail, a caller that can do without (it gets no memory) when device
+        // memory has run out.
+        Chunk chunk = TakeChunk(size, may_fail);
+        if (!chunk.buffer) {
+            if (backing_proven) *backing_proven = false;
+            return {vk::Buffer{}, 0, nullptr};
+        }
+        s.chunks.push_back(std::move(chunk));
         s.chunk_used = 0;
     }
     const auto& buffer = *s.chunks.back().buffer;
@@ -8646,6 +8808,75 @@ static bool ListedInPlace(VAddr address, u64 size) {
     }
     const VAddr begin = PerFrameListed().first;
     return begin != 0 && address < PerFrameEnd() && address + size > begin;
+}
+
+/// FIX-GT7-195 (RyGT #99, SHADGT_PERFRAME_READ_CUT=0: as before): a read that starts in GT7's
+/// per-frame memory and reaches more than 64 MB past its listed end is cut at the per-frame
+/// memory's end. These are GT7's unbounded reads (sized to the end of the mapping): they end where
+/// the per-frame memory does while nothing is mapped after it. After about half an hour of play
+/// the game mapped more memory right after it (to 0x23f800000), the same reads became 1016 MB
+/// (0x200000000+0x3f800000), no span view could alias that ("not all shared views"), and they fell
+/// back to a 1 GiB region refreshed every frame: heavy stutter, then 0 FPS until a restart.
+/// FIX-GT7-122 already refuses such a range as the per-frame memory's end; its binding now stops
+/// there too. Writes keep their size.
+static u64 PerFrameReadCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        return RyGT::PortSwitchOn("RYGT_PERFRAME_READ_CUT", "SHADGT_PERFRAME_READ_CUT");
+    }();
+    if (!on || written || size == 0) {
+        return size;
+    }
+    const auto [begin, listed_end] = PerFrameListed();
+    const VAddr end = PerFrameEnd();
+    if (begin == 0 || base < begin || base >= end || base + size <= listed_end + 64_MB) {
+        return size;
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-GT7-195: read {:#x}+{:#x} cut at the end of GT7's per-frame memory "
+                    "({:#x})",
+                    base, size, end);
+    }
+    return end - base;
+}
+
+/// FIX-GT7-196 (RyGT #99, SHADGT_LISTED_READ_CUT=0: as before): a read over one of the other listed
+/// in-place ranges (GT7's culling block at 0x1020000000) that reaches more than 64 MB past that
+/// range's end is cut there. It is FIX-GT7-195's read outside the per-frame memory: an unbounded
+/// buffer from 0x1015603260, sized to the end of the mapping, grew from 690 MB to 2.6 GB over a
+/// session of License Test retries as the game mapped more after it. Each growth retired its span
+/// view and imported a bigger one (150-180 ms each), and past 1 GiB (FIX-SGT-041) no span view could
+/// hold it and it fell back to a region: freezes, then 0 FPS until a restart. The 64 MB keeps
+/// FIX-SGT-014's rain read (77-85 MB from 0x101d8d9490, ending about 34 MB past the block) whole.
+/// Writes keep their size.
+static u64 ListedReadCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        return RyGT::PortSwitchOn("RYGT_LISTED_READ_CUT", "SHADGT_LISTED_READ_CUT");
+    }();
+    if (!on || written || size == 0) {
+        return size;
+    }
+    const VAddr per_frame = PerFrameListed().first;
+    const VAddr per_frame_end = PerFrameEnd();
+    for (const auto& [range_begin, range_end] : InplaceRanges()) {
+        if (per_frame != 0 && range_begin >= per_frame && range_end <= per_frame_end) {
+            continue; // FIX-GT7-195's
+        }
+        const VAddr limit = range_end + 64_MB;
+        if (base >= range_end || base + size <= limit) {
+            continue;
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-196: read {:#x}+{:#x} cut 64 MB past the listed range "
+                        "{:#x}-{:#x}",
+                        base, size, range_begin, range_end);
+        }
+        return limit - base;
+    }
+    return size;
 }
 
 void NativeRenderer::NotePerFrameRange(VAddr address, u64 size) {
@@ -12182,6 +12413,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             if (bindable && size != 0) {
 #if !defined(NDEBUG)
                 // FIX-174 (diagnosis, SHADGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
@@ -15850,7 +16083,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         for (const auto* entry : targets->colors) {
             attached(entry);
         }
-        attached(targets->depth);
+        if (!targets->depth_read_only) attached(targets->depth); // PERF-SGT-167
         for (size_t cb = 0; cb < targets->colors.size(); ++cb) {
             const auto* entry = targets->colors[cb];
             note(entry, &targets->color_ranges[cb]);
@@ -15918,7 +16151,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
                 }
             }
         }
-        note(targets->depth);
+        if (!targets->depth_read_only) note(targets->depth); // PERF-SGT-167
     }
     for (const auto* entry : b.stored) {
         note(entry);
@@ -17207,8 +17440,23 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     const bool depth_writes = db_feedback.depth_clear || db_feedback.stencil_clear ||
         (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable) ||
         (db_feedback.has_stencil && regs.depth_control.stencil_enable);
-    const auto depth_feedback = Native::DecideDepthFeedback(
+    auto depth_feedback = Native::DecideDepthFeedback(
         sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
+    // PERF-SGT-167 (SHADGT_DEPTH_READ_IN_GENERAL, 0 = off): a draw that samples its depth target
+    // and writes neither depth nor stencil leaves the target in the GENERAL layout it is kept in,
+    // which allows both uses. It used to go to the read-only layout and back around every such
+    // draw, with the render pass ended and begun again each time. On AMD's driver each change is
+    // real GPU work: RGP showed a depth-stencil expand before and a HiZ resummarize after each of
+    // GT7's ~18 such draws a frame in a race (36 indices each), ~0.33 ms a draw on a Radeon 610M.
+    // The depth is then not counted as written by the draw either, so a run of such draws stays
+    // in one pass; the first one still waits for earlier writes to its depth (NeedsBarrierFor).
+    static const bool depth_read_in_general = [] {
+        return RyGT::PortSwitchOn("RYGT_DEPTH_READ_IN_GENERAL", "SHADGT_DEPTH_READ_IN_GENERAL");
+    }();
+    if (depth_read_in_general && depth_feedback.read_only) {
+        depth_feedback = {};
+        targets.depth_read_only = true;
+    }
     // NEO-GTS-511: the pixel shader's positions table (the draw's own positions, as given to
     // Vulkan) replaces PA_SC_AA_MASK in the push constants: such a pipeline has no AA mask and
     // no hull shader (vk_pipeline_cache.cpp). Before any push of the bindings below.
@@ -21418,6 +21666,8 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             // A region can appear after a worker's overlap check. Recheck any
             // truncated/empty range on the serialized recorder rather than
             // publishing an untracked truncated descriptor.
@@ -22281,7 +22531,17 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
         const char* env = std::getenv("SHADGT_NATIVE_FILL_PATTERNS");
         return env && *env ? u64{std::strtoull(env, nullptr, 10)} : u64{64};
     }();
-    constexpr u64 KeepBytes = 256_MB;
+    // PRT-FILLTRIM (pr-tests, Round 22, RYGT_FILL_PATTERN_TRIM, GT7 on; 0 = off): over the VRAM
+    // budget (PRT-VRAMTRIM) the kept pattern buffers are cut to 64 MB when the next one is made.
+    // R21: 254 MB from 00:45 to the end while 0.9 to 1.2 GB over budget.
+    static const bool fill_trim = [] {
+        const char* env = std::getenv("RYGT_FILL_PATTERN_TRIM");
+        if (env && *env) {
+            return env[0] != '0' && Common::IsGt7();
+        }
+        return Common::IsGt7();
+    }();
+    const u64 KeepBytes = fill_trim && prt_trim_over ? 64_MB : 256_MB;
     const u64 key = u64(lo) | (u64(hi) << 32);
     FillPattern& slot = fill_patterns[key];
     slot.used = ++pattern_clock;
@@ -24412,6 +24672,9 @@ void NativeRenderer::PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames) {
         ++released;
         return true;
     });
+    prt_rel2_released += released; // PRT-GPUPIC summary
+    prt_rel2_released_bytes += freed;
+    prt_rel2_again += written_again;
     if (released != 0 || written_again != 0) {
         static std::atomic<u32> released_logged{};
         if (const u32 n = released_logged++; n < 32 || n % 200 == 0) {
@@ -24454,6 +24717,8 @@ void NativeRenderer::PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames) {
         }
         prt_release2_pending.push_back(item);
     }
+    prt_rel2_queued += picked.size(); // PRT-GPUPIC summary
+    prt_rel2_queued_bytes += picked_bytes;
     if (!picked.empty()) {
         static std::atomic<u32> queued_logged{};
         if (const u32 n = queued_logged++; n < 32 || n % 200 == 0) {
@@ -24464,6 +24729,314 @@ void NativeRenderer::PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames) {
                         frame);
         }
     }
+}
+
+// ---- Round 22 (pr-tests): PRT-GPUPIC, PRT-VMAFRAG (GT7 only) ----------------------------------
+// R21 (owner, 2026-11-26 01:10): the main map's sky and fog came out solid green after many track
+// changes; PRT-TEXSTALE found no guest texture stale, so the suspects are GPU-drawn pictures: let
+// go (PRT-VRAMREL2 writes one back to guest memory first, then a use uploads those bytes: a lossy
+// write-back would give a wrong but steady picture TEXSTALE can't see), or a texture made from
+// guest memory at the address of a live GPU picture.
+static bool PrtGpuPicOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_GPU_PIC_LOG");
+        if (env && *env) {
+            return env[0] != '0' && Common::IsGt7();
+        }
+        return Common::IsGt7();
+    }();
+    return on;
+}
+
+namespace {
+struct PrtGpuGone {
+    u64 frame = 0;
+    u8 why = 0;
+    u32 width = 0, height = 0;
+    vk::Format format{};
+    u32 tile = 0;
+    u32 size = 0;
+    bool in_race = false;
+};
+struct PrtGpuPicState {
+    std::unordered_map<VAddr, PrtGpuGone> gone;
+    std::vector<u64> shard_scanned;
+    u32 shard = 0;
+    std::unordered_set<const Native::ImageEntry*> undrawn_logged;
+    std::array<u64, 8> gone_by{}, again_by{};
+    u64 again_texture = 0, alias = 0, alias_other_format = 0, undrawn = 0;
+    u64 detailed = 0, alias_detailed = 0, undrawn_detailed = 0;
+    u64 trim_over_frames = 0;
+    std::chrono::steady_clock::time_point logged{};
+};
+PrtGpuPicState& PrtGpuPic() {
+    static auto* state = new PrtGpuPicState();
+    return *state;
+}
+constexpr std::array<const char*, 7> PrtGpuWhyText{
+    "?", "PRT-VRAMREL2 (written back, released)", "replaced at its address (FIX-SGT-158)",
+    "memory pressure (FIX-SGT-140)", "PRT-VRAMTRIM over budget", "idle 2 s", "other"};
+} // namespace
+
+void NativeRenderer::PrtGpuPicNoteGone(const Native::ImageEntry& entry, u8 why) {
+    if (!PrtGpuPicOn()) {
+        return;
+    }
+    auto& state = PrtGpuPic();
+    if (state.gone.size() >= 65536) {
+        state.gone.clear();
+    }
+    why = std::min<u8>(why, 6);
+    state.gone[entry.info.guest_address] = {
+        frame, why, entry.info.size.width, entry.info.size.height, entry.info.pixel_format,
+        u32(entry.info.tile_mode), entry.info.guest_size, RytyGtsInRace() || RytyRaceRunning()};
+    ++state.gone_by[why];
+}
+
+void NativeRenderer::PrtGpuPicChecks() {
+    if (!PrtGpuPicOn()) {
+        return;
+    }
+    auto& state = PrtGpuPic();
+    const bool context = RytyGtsInRace() || RytyRaceRunning();
+    const u32 shards = Native::ImageRegistry::ShardCount();
+    if (state.shard_scanned.size() != shards) {
+        state.shard_scanned.assign(shards, frame);
+    }
+    if (prt_trim_over) {
+        ++state.trim_over_frames;
+    }
+    // New entries since each shard's last look (4 shards a frame: every entry within 16 frames).
+    std::vector<Native::ImageEntry*> fresh;
+    std::vector<Native::ImageEntry*> undrawn;
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 shard = state.shard;
+        const u64 since = state.shard_scanned[shard];
+        registry->ForEachImageInShard(shard, [&](Native::ImageEntry& entry) {
+            if (!entry.image) {
+                return;
+            }
+            if (entry.made_frame >= since && fresh.size() < 256) {
+                fresh.push_back(&entry);
+            }
+            if (!context && !entry.from_cpu &&
+                entry.write_version.load(std::memory_order_relaxed) == 0 &&
+                entry.last_use.load(std::memory_order_relaxed) >= entry.made_frame + 30 &&
+                entry.last_use.load(std::memory_order_relaxed) + 1 >= frame &&
+                undrawn.size() < 16 && !state.undrawn_logged.contains(&entry)) {
+                undrawn.push_back(&entry);
+            }
+        });
+        state.shard_scanned[shard] = frame;
+        state.shard = (state.shard + 1) % shards;
+    }
+    for (Native::ImageEntry* entry : fresh) {
+        const VAddr address = entry->info.guest_address;
+        if (const auto it = state.gone.find(address); it != state.gone.end()) {
+            const PrtGpuGone gone = it->second;
+            state.gone.erase(it);
+            ++state.again_by[gone.why];
+            if (entry->from_cpu) {
+                ++state.again_texture;
+                if (state.detailed < 50) {
+                    ++state.detailed;
+                    LOG_WARNING(Render_Vulkan,
+                                "PRT-GPUPIC [{}]: GPU picture {:#x}+{:#x} {}x{} {} tile {} (let go "
+                                "by {} {} frames ago, {}) made again as a texture from guest "
+                                "memory: {}x{} {} tile {} size {:#x}, {}",
+                                Common::PrtHitch::LocalClock(), address, gone.size, gone.width,
+                                gone.height, vk::to_string(gone.format), gone.tile,
+                                PrtGpuWhyText[gone.why], frame - gone.frame,
+                                gone.in_race ? "in a race" : "out of a race",
+                                entry->info.size.width, entry->info.size.height,
+                                vk::to_string(entry->info.pixel_format),
+                                u32(entry->info.tile_mode), entry->info.guest_size,
+                                context ? "in a race" : "out of a race");
+                }
+            }
+        }
+        if (!entry->from_cpu) {
+            continue;
+        }
+        // PRT-TEXALIAS: a texture made from guest memory where a live GPU picture starts.
+        const Native::ImageEntry* gpu = nullptr;
+        registry->ForEachOverlapping(address, address + 1, [&](Native::ImageEntry& other) {
+            if (!gpu && &other != entry && !other.from_cpu && other.image &&
+                other.info.guest_address == address &&
+                !other.reused.load(std::memory_order_relaxed) &&
+                other.write_version.load(std::memory_order_relaxed) != 0) {
+                gpu = &other;
+            }
+        });
+        if (!gpu) {
+            continue;
+        }
+        ++state.alias;
+        const bool other_format = gpu->info.pixel_format != entry->info.pixel_format;
+        state.alias_other_format += other_format ? 1 : 0;
+        if (state.alias_detailed < 50) {
+            ++state.alias_detailed;
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-TEXALIAS [{}]: texture {:#x}+{:#x} {}x{} {} tile {} made from guest "
+                        "memory while a GPU picture there is live: {:#x} {}x{} {} tile {} "
+                        "(made frame {}, last used {} frames ago){}, {}",
+                        Common::PrtHitch::LocalClock(), address, entry->info.guest_size,
+                        entry->info.size.width, entry->info.size.height,
+                        vk::to_string(entry->info.pixel_format), u32(entry->info.tile_mode),
+                        gpu->info.guest_size, gpu->info.size.width, gpu->info.size.height,
+                        vk::to_string(gpu->info.pixel_format), u32(gpu->info.tile_mode),
+                        gpu->made_frame,
+                        frame - std::min(frame, gpu->last_use.load(std::memory_order_relaxed)),
+                        other_format ? ", other format" : ", same format",
+                        context ? "in a race" : "out of a race");
+        }
+    }
+    for (Native::ImageEntry* entry : undrawn) {
+        state.undrawn_logged.insert(entry);
+        ++state.undrawn;
+        if (state.undrawn_detailed < 20) {
+            ++state.undrawn_detailed;
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-GPUPIC [{}]: GPU picture {:#x}+{:#x} {}x{} {} tile {} used for {} "
+                        "frames out of a race and never drawn (content from guest memory or a "
+                        "clear)",
+                        Common::PrtHitch::LocalClock(), entry->info.guest_address,
+                        entry->info.guest_size, entry->info.size.width, entry->info.size.height,
+                        vk::to_string(entry->info.pixel_format), u32(entry->info.tile_mode),
+                        entry->last_use.load(std::memory_order_relaxed) - entry->made_frame);
+        }
+    }
+    if (state.undrawn_logged.size() > 4096) {
+        state.undrawn_logged.clear();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state.logged < std::chrono::seconds{10}) {
+        return;
+    }
+    state.logged = now;
+    const auto sum = [](const std::array<u64, 8>& a) { return std::accumulate(a.begin(), a.end(), u64{0}); };
+    const u64 gone_all = sum(state.gone_by);
+    if (gone_all != 0 || sum(state.again_by) != 0 || state.alias != 0 || state.undrawn != 0 ||
+        prt_rel2_queued != 0 || prt_rel2_released != 0 || state.trim_over_frames != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-GPUPIC [{}]: last 10 s {}: GPU pictures let go {} (VRAMREL2 {}, replaced "
+                    "{}, pressure {}, VRAMTRIM {}, idle {}, other {}), made again at their "
+                    "address {} (as textures from guest memory {}); PRT-TEXALIAS textures made "
+                    "over a live GPU picture {} ({} other format); GPU pictures used undrawn {}; "
+                    "PRT-VRAMREL2 queued {} ({:.1f} MB), released {} ({:.1f} MB), used again {}; "
+                    "PRT-VRAMTRIM over budget {} of the frames",
+                    Common::PrtHitch::LocalClock(), context ? "(in a race)" : "(out of a race)",
+                    gone_all, state.gone_by[1], state.gone_by[2], state.gone_by[3],
+                    state.gone_by[4], state.gone_by[5], state.gone_by[6], sum(state.again_by),
+                    state.again_texture, state.alias, state.alias_other_format, state.undrawn,
+                    prt_rel2_queued, prt_rel2_queued_bytes / 1048576.0, prt_rel2_released,
+                    prt_rel2_released_bytes / 1048576.0, prt_rel2_again, state.trim_over_frames);
+    }
+    state.gone_by = {};
+    state.again_by = {};
+    state.again_texture = state.alias = state.alias_other_format = state.undrawn = 0;
+    state.trim_over_frames = 0;
+    prt_rel2_queued = prt_rel2_queued_bytes = prt_rel2_released = prt_rel2_released_bytes = 0;
+    prt_rel2_again = 0;
+}
+
+// PRT-VMAFRAG (pr-tests, Round 22, RYGT_VMA_FRAG, GT7 on; 0 = off). R21 end: 5486 MB of VRAM blocks
+// held 3788 MB (1698 MB free inside, in 2125 ranges, largest 31.8 MB) while VRAM was 855 MB over
+// budget: texture eviction frees allocations, the blocks stay. Every 10 s: blocks, allocated and
+// free per pool. Over the budget, every 5 s the empty blocks (default blocks and the Tiny, Small
+// and Medium image pools) are freed.
+void NativeRenderer::PrtVmaFrag() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_VMA_FRAG");
+        if (env && *env) {
+            return env[0] != '0' && Common::IsGt7();
+        }
+        return Common::IsGt7();
+    }();
+    const VmaAllocator allocator = on ? r.instance.GetAllocator() : VmaAllocator{};
+    if (!allocator) {
+        return;
+    }
+    static std::chrono::steady_clock::time_point trimmed_at{}, logged_at{};
+    static u64 trimmed_bytes = 0, trims = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (prt_trim_over && now - trimmed_at >= std::chrono::seconds{5}) {
+        trimmed_at = now;
+        const u64 freed =
+            Vulkan::TrimEmptyVmaBlocks(allocator) + Vulkan::TrimEmptySmallImagePoolBlocks(allocator);
+        trimmed_bytes += freed;
+        trims += freed != 0 ? 1 : 0;
+    }
+    if (now - logged_at < std::chrono::seconds{10}) {
+        return;
+    }
+    logged_at = now;
+    const VkPhysicalDeviceMemoryProperties* props = nullptr;
+    vmaGetMemoryProperties(allocator, &props);
+    if (!props) {
+        return;
+    }
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(allocator, &stats);
+    u64 blocks = 0, allocated = 0, block_count = 0;
+    for (u32 type = 0; type < props->memoryTypeCount; ++type) {
+        if ((props->memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+            continue;
+        }
+        const auto& st = stats.memoryType[type].statistics;
+        blocks += st.blockBytes;
+        allocated += st.allocationBytes;
+        block_count += st.blockCount;
+    }
+    struct PoolSum {
+        u64 blocks = 0, block_bytes = 0, allocated = 0, allocations = 0;
+    };
+    std::map<std::string, PoolSum> pools;
+    Vulkan::SmallImagePoolFrag(
+        allocator,
+        [](const Vulkan::VmaPoolFrag& frag, void* user) {
+            auto& sum = (*static_cast<std::map<std::string, PoolSum>*>(user))[frag.name];
+            sum.blocks += frag.blocks;
+            sum.block_bytes += frag.block_bytes;
+            sum.allocated += frag.allocation_bytes;
+            sum.allocations += frag.allocations;
+        },
+        &pools);
+    const auto mb = [](u64 bytes) { return double(bytes) / 1048576.0; };
+    u64 pool_blocks = 0, pool_allocated = 0;
+    std::string pool_text;
+    for (const auto& [name, sum] : pools) {
+        pool_blocks += sum.block_bytes;
+        pool_allocated += sum.allocated;
+        pool_text += fmt::format("; {}: {} blocks {:.0f} MB, {:.0f} MB allocated ({} images), "
+                                 "{:.0f} MB free",
+                                 name, sum.blocks, mb(sum.block_bytes), mb(sum.allocated),
+                                 sum.allocations,
+                                 mb(sum.block_bytes > sum.allocated ? sum.block_bytes - sum.allocated
+                                                                    : 0));
+    }
+    const u64 free_inside = blocks > allocated ? blocks - allocated : 0;
+    const u64 budget = r.instance.GetTotalMemoryBudget();
+    const u64 used = budget ? r.instance.GetDeviceMemoryUsage() : 0;
+    const u64 over = used > budget ? used - budget : 0;
+    const u64 default_blocks = blocks > pool_blocks ? blocks - pool_blocks : 0;
+    const u64 default_alloc = allocated > pool_allocated ? allocated - pool_allocated : 0;
+    LOG_WARNING(Render_Vulkan,
+                "PRT-VMAFRAG [{}]: VRAM {} of {} MB{}; device-local VMA {} blocks {:.0f} MB, "
+                "{:.0f} MB allocated, {:.0f} MB free inside ({:.0f}%); default blocks {:.0f} MB "
+                "with {:.0f} MB free{}; over budget by {} MB, free inside covers {}; empty "
+                "blocks freed last 10 s {:.0f} MB ({} trims)",
+                Common::PrtHitch::LocalClock(), used >> 20, budget >> 20,
+                RytyGtsInRace() || RytyRaceRunning() ? " (in a race)" : "", block_count,
+                mb(blocks), mb(allocated), mb(free_inside),
+                blocks ? 100.0 * double(free_inside) / double(blocks) : 0.0, mb(default_blocks),
+                mb(default_blocks > default_alloc ? default_blocks - default_alloc : 0), pool_text,
+                over >> 20,
+                over == 0 ? std::string{"n/a"}
+                          : fmt::format("{:.0f}%", std::min(100.0, 100.0 * double(free_inside) /
+                                                                      double(over))),
+                mb(trimmed_bytes), trims);
+    trimmed_bytes = trims = 0;
 }
 
 // ---- Round 21 (pr-tests): PRT-TEXSTALE, PRT-TEXREFRESH, PRT-PROTECTFAIL (GT7 only) -----------
@@ -24482,7 +25055,7 @@ static bool PrtTexStaleOn() {
         if (env && *env) {
             return env[0] != '0' && Common::IsGt7();
         }
-        return Common::IsGt7();
+        return false; // Round 22: default off (code kept); 1 = on in GT7
     }();
     return on;
 }
@@ -24497,7 +25070,7 @@ static bool PrtTexRefreshOn() {
         if (env && *env) {
             return env[0] != '0' && Common::IsGt7();
         }
-        return Common::IsGt7();
+        return false; // Round 22: default off (code kept); 1 = on in GT7
     }();
     return on;
 }
@@ -24917,6 +25490,8 @@ void NativeRenderer::EvictImages() {
         }
     }
     PrtTextureChecks(); // Round 21: PRT-TEXSTALE, PRT-TEXREFRESH, PRT-PROTECTFAIL
+    PrtGpuPicChecks();  // Round 22: PRT-GPUPIC
+    PrtVmaFrag();       // Round 22: PRT-VMAFRAG
     // NAT-108: images not used for two seconds go (GT Sport's scratch pool holds render
     // targets of ever-changing sizes: the UI's blur panels, effects).
     constexpr u64 KeepFrames = 120;
@@ -25178,7 +25753,9 @@ void NativeRenderer::EvictImages() {
     // This pass keeps none of them, so the next attempt finds the room.
     const bool pressure = Native::Rhi::g_device_memory_pressure.exchange(false,
                                                                          std::memory_order_relaxed);
-    if (pressure) {
+    // FIX-SGT-140: rate-limited; under lasting pressure this came every frame.
+    static std::atomic<u32> pressure_logged{};
+    if (pressure && OutOfMemoryLogDue(pressure_logged)) {
         LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
                                    "released instead of kept");
     }
@@ -25627,6 +26204,32 @@ void NativeRenderer::EvictImages() {
                         big_regions.empty() ? std::string{"none"} : big_regions);
         }
     }
+    // FIX-SGT-140 (RyGT #103, pr-tests Round 22 port, RYGT_OOM_RECOVER, GT7 on): that was not enough on an 8 GB card at a track change while
+    // shaders compiled: the pass still retired at most 16 pictures, from 8 of the 64 shards, and
+    // kept per-frame textures in the recycle pool. Under pressure it now goes through every
+    // shard with no cap, lets textures from the CPU go after PressureIdleFrames (they upload
+    // again from guest memory; what the GPU drew keeps KeepFrames) and empties the pool.
+    constexpr u64 PressureIdleFrames = 30;
+    if (pressure && PrtOomRecoverOn() && RecycleFrameTextures()) {
+        u32 dropped = 0;
+        std::scoped_lock lock{views_mutex};
+        std::scoped_lock recycle_lock{recycle_mutex};
+        for (auto& [key, pool] : recycle_pool) {
+            for (auto& free : pool) {
+                for (auto& record : free.records) {
+                    retired_views.emplace_back(tick, std::move(record.view));
+                }
+                if (free.image) recycle_keys.erase(free.image->NativeHandle());
+                ++dropped;
+            }
+            pool.clear(); // the images go once the GPU is done with them
+        }
+        recycle_free = 0;
+        if (dropped != 0) {
+            LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} pooled per-frame textures released",
+                        dropped);
+        }
+    }
     if (pressure || over_budget || texture_budget == 0) {
         kept_textures.clear();
         kept_texture_scan.clear();
@@ -25686,6 +26289,11 @@ void NativeRenderer::EvictImages() {
     };
     trace.Next(3);
     const auto on_evict = [&](Native::ImageEntry& entry) {
+        // PRT-GPUPIC (Round 22): a GPU-drawn picture let go, and why.
+        if (!entry.from_cpu && entry.image &&
+            entry.write_version.load(std::memory_order_relaxed) != 0) {
+            PrtGpuPicNoteGone(entry, prt_release2_done.contains(&entry) ? u8{1} : prt_gpupic_why);
+        }
         if (kept_textures.erase(&entry) != 0) {
             kept_texture_bytes -= std::min<u64>(kept_texture_bytes,
                                                 std::max<u64>(entry.info.guest_size, 1));
@@ -25741,7 +26349,7 @@ void NativeRenderer::EvictImages() {
                     recycle_views.erase(kept);
                 }
                 if (key != recycle_keys.end() && entry.from_cpu && entry.sources.empty() &&
-                    recycle_free < 96) {
+                    recycle_free < 96 && !pressure) { // FIX-SGT-140
                     RecycledImage free{std::move(entry.image), std::move(waiting),
                                        entry.backend_usage, entry.backend_features};
                     if (const auto it = views.find(&entry); it != views.end()) {
@@ -25782,15 +26390,47 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     };
+    // FIX-SGT-158: render targets a new target of another layout replaced at their address. Before
+    // the idle eviction below, which could free one of them first (the list names live entries).
+    {
+        prt_gpupic_why = 2; // PRT-GPUPIC: replaced (FIX-SGT-158)
+        const u32 freed = registry->EvictSuperseded(frame, on_evict);
+        prt_gpupic_why = 6;
+        static std::atomic<u32> superseded_logged{};
+        if (freed != 0) {
+            if (const u32 n = superseded_logged++; n < 8 || n % 500 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "FIX-SGT-158: {} render targets replaced at their address freed "
+                         "(unused 4 frames, not kept two seconds)", freed);
+            }
+        }
+    }
     const auto on_main_evict = [&](Native::ImageEntry& entry) {
         if (trim_now) {
             PrtNoteLetGo(entry, 2); // PRT-TEXSTALE (Round 21): PRT-VRAMTRIM over the budget
         }
         on_evict(entry);
     };
-    registry->Evict(frame - KeepFrames, on_main_evict, [&](Native::ImageEntry& entry) {
-        return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
-    }, trim_now ? 64u : 16u);
+    // FIX-SGT-140 (Round 22 port, RYGT_OOM_RECOVER): under memory pressure every shard, no cap,
+    // CPU textures after PressureIdleFrames; drawn pictures keep KeepFrames.
+    const bool oom_pass = pressure && PrtOomRecoverOn();
+    prt_gpupic_why = oom_pass || pressure ? u8{3} : trim_now ? u8{4} : u8{5}; // PRT-GPUPIC
+    const u32 evicted = registry->Evict(
+        frame - (oom_pass ? PressureIdleFrames : KeepFrames), on_main_evict,
+        [&](Native::ImageEntry& entry) {
+            if (oom_pass && !entry.from_cpu &&
+                entry.last_use.load(std::memory_order_relaxed) >= frame - KeepFrames) {
+                return true;
+            }
+            return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
+        },
+        oom_pass ? ~u32{0} : (trim_now ? 64u : 16u));
+    prt_gpupic_why = 6;
+    static std::atomic<u32> evict_logged{};
+    if (oom_pass && evicted != 0 && OutOfMemoryLogDue(evict_logged)) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} idle pictures released under memory pressure",
+                    evicted);
+    }
     // PRT-VRAMIDLE (Round 8, RYGT_VRAM_TRIM_IDLE_FRAMES, GT7 30; 0 = off; only with PRT-VRAMTRIM
     // over budget): textures loaded from guest memory (a reload is an upload, their bytes are
     // still there) go after this many idle frames instead of 120, up to 64 a frame. Pictures the

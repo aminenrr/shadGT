@@ -96,6 +96,34 @@ static std::atomic<vk::DeviceSize> g_empty_vma_bytes_freed{};
 vk::DeviceSize EmptyVmaBytesFreed() {
     return g_empty_vma_bytes_freed.load(std::memory_order_relaxed);
 }
+void SmallImagePoolFrag(VmaAllocator allocator, void (*each)(const VmaPoolFrag&, void*),
+                        void* user) {
+    std::scoped_lock lock{small_image_pools_mutex};
+    const auto it = small_image_pools.find(allocator);
+    if (it == small_image_pools.end()) return;
+    for (const auto& [key, pool] : it->second) {
+        if (!pool) continue;
+        VmaStatistics stats{};
+        vmaGetPoolStatistics(allocator, pool, &stats);
+        const char* name = nullptr;
+        vmaGetPoolName(allocator, pool, &name);
+        VmaPoolFrag frag{.name = name ? name : "pool", .block_size = key.second,
+                         .block_bytes = stats.blockBytes, .allocation_bytes = stats.allocationBytes,
+                         .blocks = stats.blockCount, .allocations = stats.allocationCount};
+        each(frag, user);
+    }
+}
+vk::DeviceSize TrimEmptySmallImagePoolBlocks(VmaAllocator allocator) {
+    std::scoped_lock lock{small_image_pools_mutex};
+    const auto it = small_image_pools.find(allocator);
+    if (it == small_image_pools.end()) return 0;
+    vk::DeviceSize freed = 0;
+    for (const auto& [key, pool] : it->second) {
+        if (pool) freed += pool->m_BlockVector.TrimEmptyBlocks();
+    }
+    g_empty_vma_bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+    return freed;
+}
 vk::DeviceSize TrimEmptyVmaBlocks(VmaAllocator allocator) {
     const VkPhysicalDeviceMemoryProperties* props = nullptr;
     vmaGetMemoryProperties(allocator, &props);

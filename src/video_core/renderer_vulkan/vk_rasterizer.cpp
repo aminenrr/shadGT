@@ -3521,8 +3521,8 @@ static bool PrtRbWaitV2On() {
     return on;
 }
 
-// PRT-RBBATCH v2 (pr-tests, Round 21, RYGT_READBACK_BATCH_ORDER, GT7 on with RYGT_READBACK_BATCH,
-// owner OK 2026-11-25 14:27; 0 = Round 20 rule): a fence deferred only to keep an address's order
+// PRT-RBBATCH v2 (pr-tests, Round 21, RYGT_READBACK_BATCH_ORDER, off since Round 22 (owner GO
+// 2026-11-26 01:35); 1 = on in GT7 with RYGT_READBACK_BATCH; off = Round 20 rule): a fence deferred only to keep an address's order
 // (FIX-049: an earlier deferred write, no readback data of its own) also rides the held batch
 // instead of submitting at once. Same guard as Round 20: its label still lands after the GPU work
 // and after every earlier deferred label (deferred operations run in tick order); Scheduler::Wait,
@@ -3538,7 +3538,7 @@ static bool PrtRbBatchOrderOn() {
         if (env && *env) {
             return env[0] != '0';
         }
-        return true;
+        return false; // Round 22: default off (Round 20 rule); 1 = on
     }();
     return on && PrtReadbackBatchUs() != 0;
 }

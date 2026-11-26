@@ -26,4 +26,16 @@ VK_DEFINE_HANDLE(VmaAllocator)
 namespace Vulkan {
 vk::DeviceSize TrimEmptyVmaBlocks(VmaAllocator allocator);
 vk::DeviceSize EmptyVmaBytesFreed();
+// PRT-VMAFRAG (pr-tests, Round 22): the small image pools' blocks (Tiny/Small/Medium images), and
+// their empty blocks freed. Default-pool blocks: TrimEmptyVmaBlocks.
+struct VmaPoolFrag {
+    const char* name = "";
+    vk::DeviceSize block_size = 0;
+    vk::DeviceSize block_bytes = 0;
+    vk::DeviceSize allocation_bytes = 0;
+    uint32_t blocks = 0;
+    uint32_t allocations = 0;
+};
+void SmallImagePoolFrag(VmaAllocator allocator, void (*each)(const VmaPoolFrag&, void*), void* user);
+vk::DeviceSize TrimEmptySmallImagePoolBlocks(VmaAllocator allocator);
 }

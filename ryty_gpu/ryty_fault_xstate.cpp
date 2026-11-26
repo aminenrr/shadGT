@@ -47,17 +47,58 @@ unsigned long long ComputeSavedComponents() {
 const unsigned long long g_saved_components = ComputeSavedComponents();
 
 // The standard-form XSAVE area for those components ends below 2,700 bytes (AVX-512's last
-// component ends at 2,688); 4 KB leaves room. On the faulting thread's own stack, so a fault
-// inside the handler gets an area of its own.
-constexpr std::size_t AreaSize = 4096;
+// component ends at 2,688); 3 KB leaves room.
+constexpr std::size_t AreaSize = 3072;
+
+// FIX-SGT-141 (RyGT #78): the areas are the thread's own, not on its stack. FIX-SGT-121 put a 4 KB
+// area on the faulting thread's stack, and a GT7 worker ('WorkT') whose small stack was nearly used
+// up when its store faulted ran out of it under the handler (0xc00000fd in _alloca_probe below
+// CallKeepingAvxState, under IsMapped's lock). Each nesting level (a fault inside the handler) takes
+// the next area; past them, the handler runs without keeping the state, as before FIX-SGT-121.
+// Plain data, so the thread-local block needs no initialiser that could run AVX code.
+constexpr unsigned Levels = 4;
+struct FaultAreas {
+    unsigned depth;
+    unsigned char bytes[Levels * AreaSize + 64]; // + 64: aligned by hand (XSAVE needs 64)
+};
+thread_local FaultAreas t_areas;
+
+// Whether the standard-form area for the saved components fits AreaSize: each component's end
+// (CPUID leaf 0xD, sub-leaf n: EAX its size, EBX its offset). Checked when the library loads.
+bool ComputeAreaFits() {
+    int info[4] = {};
+    __cpuid(info, 0);
+    if (info[0] < 0xD) {
+        return false;
+    }
+    for (int component = 2; component < 8; ++component) {
+        if ((g_saved_components >> component & 1) == 0) {
+            continue;
+        }
+        __cpuidex(info, 0xD, component);
+        const unsigned end = static_cast<unsigned>(info[0]) + static_cast<unsigned>(info[1]);
+        if (end > AreaSize) {
+            return false;
+        }
+    }
+    return true;
+}
+const bool g_area_fits = g_saved_components != 0 && ComputeAreaFits();
+
+// FIX-SGT-141 port (pr-tests, Round 22, RYGT_FAULT_XSTATE_TLS, on; 0 = the FIX-SGT-121 area on the
+// faulting stack, as before). Read when the library loads, before the game is known, so it applies
+// to both games. Upstream marks it not run yet.
+bool ComputeTlsAreas() {
+    const char* env = std::getenv("RYGT_FAULT_XSTATE_TLS");
+    return !(env && env[0] == '0');
+}
+const bool g_tls_areas = ComputeTlsAreas();
 
 #if defined(__clang__) || defined(__GNUC__)
 __attribute__((target("xsave")))
 #endif
-int CallKeepingAvxState(void* exception_pointers, unsigned long long mask) {
-    alignas(64) unsigned char area[AreaSize];
-    // The XSAVE header (bytes 512-575): XCOMP_BV must be 0 for XRSTOR's standard form, and
-    // XSAVE leaves it as it finds it.
+int CallKeepingAvxStateOnStack(void* exception_pointers, unsigned long long mask) {
+    alignas(64) unsigned char area[4096];
     for (std::size_t i = 512; i < 576; ++i) {
         area[i] = 0;
     }
@@ -67,11 +108,42 @@ int CallKeepingAvxState(void* exception_pointers, unsigned long long mask) {
     return result;
 }
 
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((target("xsave")))
+#endif
+int CallKeepingAvxState(void* exception_pointers, unsigned long long mask) {
+    FaultAreas& areas = t_areas;
+    const unsigned level = areas.depth;
+    if (level >= Levels) {
+        return RytyGpuHandleWriteFaultBody(exception_pointers);
+    }
+    const std::uintptr_t first =
+        (reinterpret_cast<std::uintptr_t>(areas.bytes) + 63) & ~std::uintptr_t{63};
+    unsigned char* const area = reinterpret_cast<unsigned char*>(first) + level * AreaSize;
+    // The XSAVE header (bytes 512-575): XCOMP_BV must be 0 for XRSTOR's standard form, and
+    // XSAVE leaves it as it finds it.
+    for (std::size_t i = 512; i < 576; ++i) {
+        area[i] = 0;
+    }
+    areas.depth = level + 1;
+    _xsave64(area, mask);
+    const int result = RytyGpuHandleWriteFaultBody(exception_pointers);
+    _xrstor64(area, mask);
+    areas.depth = level;
+    return result;
+}
+
 } // namespace
 
 extern "C" __declspec(dllexport) int RytyGpuHandleWriteFault(void* exception_pointers) {
     const unsigned long long mask = g_saved_components;
     if (mask == 0) {
+        return RytyGpuHandleWriteFaultBody(exception_pointers);
+    }
+    if (!g_tls_areas) {
+        return CallKeepingAvxStateOnStack(exception_pointers, mask); // RYGT_FAULT_XSTATE_TLS=0
+    }
+    if (!g_area_fits) {
         return RytyGpuHandleWriteFaultBody(exception_pointers);
     }
     return CallKeepingAvxState(exception_pointers, mask);

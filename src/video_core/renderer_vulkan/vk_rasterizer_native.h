@@ -250,6 +250,7 @@ private:
         std::array<vk::Format, 8> color_formats{};
         std::array<DrawnRange, 8> color_ranges{}; ///< FIX-208
         const Native::ImageEntry* depth = nullptr;
+        bool depth_read_only = false; ///< PERF-SGT-167: the draw tests and samples the depth, writes none
     };
 
     struct WritebackPlan;
@@ -594,8 +595,11 @@ private:
     void ChunkFlushCheck();
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
-    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr);
-    Chunk TakeChunk(u64 size);
+    /// FIX-SGT-140: may_fail, a null buffer and pointer when device memory has run out.
+    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr,
+                                              bool may_fail = false);
+    Chunk TakeChunk(u64 size, bool may_fail = false);
+    bool RelieveDeviceMemory(); // FIX-SGT-140
     void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
@@ -2066,6 +2070,8 @@ private:
     }
 
     std::mutex chunk_mutex;
+    /// FIX-SGT-140: the frame RelieveDeviceMemory last waited in.
+    std::atomic<u64> oom_relief_frame{~u64{0}};
     std::vector<Chunk> free_chunks;
     size_t free_chunks_low = 0; // FIX-GT7-046: the fewest free since the last trim
     Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;
@@ -2149,6 +2155,20 @@ private:
     /// PRT-TEXSTALE: a texture VRAMHEAD (1), VRAMTRIM (2) or VRAMIDLE (3) let go, so one made
     /// again at its address and size is reported as made after that.
     void PrtNoteLetGo(const Native::ImageEntry& entry, u8 why);
+    /// PRT-GPUPIC (pr-tests, Round 22, RYGT_GPU_PIC_LOG, GT7, log only): once a frame from
+    /// EvictImages: GPU pictures made again after they were let go, textures made over a live GPU
+    /// picture (PRT-TEXALIAS), GPU pictures used undrawn; 10 s summary.
+    void PrtGpuPicChecks();
+    /// PRT-GPUPIC: a GPU-drawn picture let go; why: 1 PRT-VRAMREL2 write-back, 2 replaced
+    /// (FIX-SGT-158), 3 memory pressure (FIX-SGT-140), 4 PRT-VRAMTRIM over budget, 5 idle 2 s,
+    /// 6 other.
+    void PrtGpuPicNoteGone(const Native::ImageEntry& entry, u8 why);
+    u8 prt_gpupic_why = 6;
+    /// PRT-GPUPIC: PRT-VRAMREL2 counts for the 10 s summary (its own lines stop after 32).
+    u64 prt_rel2_queued = 0, prt_rel2_queued_bytes = 0;
+    u64 prt_rel2_released = 0, prt_rel2_released_bytes = 0, prt_rel2_again = 0;
+    /// PRT-VMAFRAG (pr-tests, Round 22, RYGT_VMA_FRAG, GT7): once a frame from EvictImages.
+    void PrtVmaFrag();
     struct ReportBase {
         u64 uploads = 0, upload_bytes = 0, evicted = 0;
         std::array<u64, 3> stale{};
