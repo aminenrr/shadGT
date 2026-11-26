@@ -3866,6 +3866,35 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
                            : readbacks_pending                  ? u32(RbBackground)
                                                                 : u32(RbHold);
     const s64 rb2_from_ns = PrtRbWaitV2On() ? PrtRbNowNs() : 0;
+    // PRT-RBSTALL (pr-tests, Round 23, RYGT_RB_STALL_LOG, GT7 on = 200 ms; 0 = off): log individual
+    // DeferFenceSignal waits over the threshold with readback range and VRAM.
+    static const u64 rb_stall_ms = []() -> u64 {
+        if (!Common::IsGt7()) {
+            return 0;
+        }
+        const char* env = std::getenv("RYGT_RB_STALL_LOG");
+        if (!env || !*env) {
+            return 200;
+        }
+        if (env[0] == '0') {
+            return 0;
+        }
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(env, &end, 10);
+        return (end && end != env && v > 0) ? u64(v) : 200;
+    }();
+    const s64 rb_stall_from_ns = rb_stall_ms ? (rb2_from_ns ? rb2_from_ns : PrtRbNowNs()) : 0;
+    const u32 rb_count = static_cast<u32>(readbacks.size() + async_readbacks.size());
+    const VAddr rb_first_addr = !readbacks.empty()
+                                    ? readbacks.front().address
+                                    : (!async_readbacks.empty() && async_readbacks.front()
+                                           ? async_readbacks.front()->address
+                                           : 0);
+    const u64 rb_first_size = !readbacks.empty()
+                                  ? readbacks.front().size
+                                  : (!async_readbacks.empty() && async_readbacks.front()
+                                         ? async_readbacks.front()->size
+                                         : 0);
     const char* const rb_file = loc.file_name();
     const u32 rb_line = static_cast<u32>(loc.line());
     {
@@ -3894,7 +3923,8 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
 #endif
          brings_data, readbacks = std::move(readbacks),
          async_readbacks = std::move(async_readbacks), signal = std::move(signal), rb_from_ns,
-         rb_file, rb_line, rb_bytes, rb2_reason, rb2_from_ns]() mutable {
+         rb_file, rb_line, rb_bytes, rb2_reason, rb2_from_ns, rb_stall_from_ns, rb_count,
+         rb_first_addr, rb_first_size]() mutable {
             texture_cache.CompleteReadbacks(readbacks);
             buffer_cache.CompleteAsyncReadbacks(async_readbacks);
             if (rb_from_ns != 0) { // PRT-RBWAIT (Round 20)
@@ -3908,6 +3938,34 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
             if (rb2_from_ns != 0) { // PRT-RBWAIT v2 (Round 21)
                 PrtRbWait2Note(rb_file, rb_line, rb2_reason,
                                u64(std::max<s64>(PrtRbNowNs() - rb2_from_ns, 0) / 1000));
+            }
+            if (rb_stall_from_ns != 0) { // PRT-RBSTALL (Round 23)
+                const u64 wait_ms =
+                    u64(std::max<s64>(PrtRbNowNs() - rb_stall_from_ns, 0) / 1000000);
+                if (wait_ms >= rb_stall_ms) {
+                    static std::atomic<u64> stall_logged{0};
+                    const u64 n = ++stall_logged;
+                    if (n <= 64 || n % 10 == 0) {
+                        static constexpr const char* ReasonNames[] = {"data", "order", "bg-rb",
+                                                                      "hold"};
+                        const char* why = rb2_reason < 4 ? ReasonNames[rb2_reason] : "?";
+                        const char* base = rb_file ? rb_file : "?";
+                        for (const char* p = base; *p; ++p) {
+                            if (*p == '/' || *p == '\\') {
+                                base = p + 1;
+                            }
+                        }
+                        const u64 vram_mb = instance.GetDeviceMemoryUsage() >> 20;
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRT-RBSTALL [{}]: {} ms wait ({}) at {}:{} label {:#x}; "
+                                    "readbacks {} ({:.2f} MB, first {:#x}+{:#x}); deferred {}; "
+                                    "VRAM {} MB (#{})",
+                                    Common::PrtHitch::LocalClock(), wait_ms, why, base, rb_line,
+                                    address, rb_count, double(rb_bytes) / 1048576.0, rb_first_addr,
+                                    rb_first_size, deferred_fences.load(std::memory_order_relaxed),
+                                    vram_mb, n);
+                    }
+                }
             }
 #ifndef NDEBUG
             RecordDeferredFenceLatency(deferred_at);

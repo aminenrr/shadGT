@@ -2169,6 +2169,8 @@ private:
     u64 prt_rel2_released = 0, prt_rel2_released_bytes = 0, prt_rel2_again = 0;
     /// PRT-VMAFRAG (pr-tests, Round 22, RYGT_VMA_FRAG, GT7): once a frame from EvictImages.
     void PrtVmaFrag();
+    /// PRT-VMADEFRAG (pr-tests, Round 23, RYGT_VMA_DEFRAG, GT7): race-end/menu VMA compaction.
+    void PrtVmaDefrag();
     struct ReportBase {
         u64 uploads = 0, upload_bytes = 0, evicted = 0;
         std::array<u64, 3> stale{};

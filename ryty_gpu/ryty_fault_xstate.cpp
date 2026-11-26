@@ -19,18 +19,31 @@
 #include <windows.h>
 #include <immintrin.h>
 #include <intrin.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include "ryty_gpu/fault_xstate_repair.h"
 
 extern "C" int RytyGpuHandleWriteFaultBody(void* exception_pointers);
 
 namespace {
 
-// XCR0 components saved: AVX (YMM upper halves) and the three AVX-512 ones. 0 when the OS keeps
-// none of them (no XSAVE, or no AVX), or when SHADGT_FAULT_XSTATE=0.
-unsigned long long ComputeSavedComponents() {
+int ReadMode() {
     const char* env = std::getenv("SHADGT_FAULT_XSTATE");
     if (env && env[0] == '0') {
+        return 0;
+    }
+    if (env && env[0] == '2') {
+        return 2;
+    }
+    return 1;
+}
+
+// XCR0 components saved: AVX (YMM upper halves) and the three AVX-512 ones. 0 when the OS keeps
+// none of them (no XSAVE, or no AVX), or when SHADGT_FAULT_XSTATE=0.
+unsigned long long ComputeSavedComponents(int mode) {
+    if (mode == 0) {
         return 0ull;
     }
     int info[4] = {};
@@ -44,7 +57,53 @@ unsigned long long ComputeSavedComponents() {
 
 // Set when the library loads, not in a fault: getenv and the C runtime's string functions may
 // use AVX themselves, which would clobber the registers before they are saved.
-const unsigned long long g_saved_components = ComputeSavedComponents();
+const int g_mode = ReadMode();
+const unsigned long long g_saved_components = ComputeSavedComponents(g_mode);
+// FIX-SGT-194 port (pr-tests, Round 23, RYGT_FAULT_XSTATE_REPAIR, on; 0 = off). Read at DLL load.
+const bool g_repair = [] {
+    if (g_mode != 1) {
+        return false;
+    }
+    const char* env = std::getenv("RYGT_FAULT_XSTATE_REPAIR");
+    return !(env && env[0] == '0');
+}();
+const bool g_components_ready = (RytyFaultXState::Components(), true);
+
+void NoteRepair(const EXCEPTION_POINTERS* pointers, const RytyFaultXState::RepairResult& repair) {
+    static std::atomic<unsigned long long> count{0};
+    const unsigned long long n = ++count;
+    if (n > 20 && n % 1000 != 0) {
+        return;
+    }
+    const auto* record = pointers->ExceptionRecord;
+    std::fprintf(stderr,
+                 "[fault] FIX-SGT-194: the exception context left out AVX state in use (in use %#llx, "
+                 "XSTATE_BV %#llx, XCOMP_BV %#llx); put back before the resume (%llu so far) at rip "
+                 "%p, %s of %p\n",
+                 static_cast<unsigned long long>(repair.live),
+                 static_cast<unsigned long long>(repair.named),
+                 static_cast<unsigned long long>(repair.compacted), n, record->ExceptionAddress,
+                 record->NumberParameters >= 2 && record->ExceptionInformation[0] == 1 ? "write"
+                                                                                       : "access",
+                 reinterpret_cast<void*>(record->NumberParameters >= 2
+                                             ? record->ExceptionInformation[1]
+                                             : 0));
+}
+
+void MaybeRepairContext(void* exception_pointers, const unsigned char* area,
+                        unsigned long long mask) {
+    if (!g_repair) {
+        return;
+    }
+    auto* pointers = static_cast<EXCEPTION_POINTERS*>(exception_pointers);
+    if (pointers != nullptr && pointers->ExceptionRecord != nullptr &&
+        pointers->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        const auto repair = RytyFaultXState::Repair(pointers->ContextRecord, area, mask);
+        if (repair.outcome == RytyFaultXState::RepairResult::Repaired) {
+            NoteRepair(pointers, repair);
+        }
+    }
+}
 
 // The standard-form XSAVE area for those components ends below 2,700 bytes (AVX-512's last
 // component ends at 2,688); 3 KB leaves room.
@@ -104,6 +163,7 @@ int CallKeepingAvxStateOnStack(void* exception_pointers, unsigned long long mask
     }
     _xsave64(area, mask);
     const int result = RytyGpuHandleWriteFaultBody(exception_pointers);
+    MaybeRepairContext(exception_pointers, area, mask);
     _xrstor64(area, mask);
     return result;
 }
@@ -128,6 +188,7 @@ int CallKeepingAvxState(void* exception_pointers, unsigned long long mask) {
     areas.depth = level + 1;
     _xsave64(area, mask);
     const int result = RytyGpuHandleWriteFaultBody(exception_pointers);
+    MaybeRepairContext(exception_pointers, area, mask);
     _xrstor64(area, mask);
     areas.depth = level;
     return result;

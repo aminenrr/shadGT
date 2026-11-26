@@ -8841,6 +8841,33 @@ static u64 PerFrameReadCut(VAddr base, u64 size, bool written) {
     return end - base;
 }
 
+/// FIX-SGT-191 (RyGT #120, pr-tests Round 23 port, RYGT_PERFRAME_WRITE_CUT / SHADGT_PERFRAME_WRITE_CUT):
+/// a written range that starts in GT7's per-frame memory and reaches more than 64 MB past its
+/// listed end is cut where the memory stops being committed, and at the per-frame memory's end at
+/// most (prevents rain weather-radar 310 MB fallback region stutter and device lost).
+static u64 PerFrameWriteCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        return RyGT::PortSwitchOn("RYGT_PERFRAME_WRITE_CUT", "SHADGT_PERFRAME_WRITE_CUT");
+    }();
+    if (!on || !written || size == 0) {
+        return size;
+    }
+    const auto [begin, listed_end] = PerFrameListed();
+    const VAddr end = PerFrameEnd();
+    if (begin == 0 || base < begin || base >= end || base + size <= listed_end + 64_MB) {
+        return size;
+    }
+    const u64 cut = Native::ReadablePrefix(reinterpret_cast<const void*>(base), end - base);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-191: written range {:#x}+{:#x} cut to {:#x} (GT7's per-frame memory "
+                    "ends at {:#x}, committed to {:#x})",
+                    base, size, cut, end, base + cut);
+    }
+    return cut;
+}
+
 /// FIX-GT7-196 (RyGT #99, SHADGT_LISTED_READ_CUT=0: as before): a read over one of the other listed
 /// in-place ranges (GT7's culling block at 0x1020000000) that reaches more than 64 MB past that
 /// range's end is cut there. It is FIX-GT7-195's read outside the per-frame memory: an unbounded
@@ -12414,6 +12441,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
             if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = PerFrameWriteCut(base, size, desc.is_written); // FIX-SGT-191
             if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             if (bindable && size != 0) {
 #if !defined(NDEBUG)
@@ -21667,6 +21695,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
             if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = PerFrameWriteCut(base, size, desc.is_written); // FIX-SGT-191
             if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             // A region can appear after a worker's overlap check. Recheck any
             // truncated/empty range on the serialized recorder rather than
@@ -24642,9 +24671,9 @@ void NativeRenderer::PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames) {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_VRAM_OVER_RELEASE2");
         if (env && *env) {
-            return env[0] != '0';
+            return env[0] != '0' && Common::IsGt7();
         }
-        return Common::IsGt7();
+        return false; // Round 23: off by default (write-backs broke roulette/map pictures)
     }();
     if (!on || frame % 30 != 0) {
         return;
@@ -24668,6 +24697,15 @@ void NativeRenderer::PrtReleaseKeptOverBudget(u64 frame, u64 keep_frames) {
             kept_bytes -= std::min(kept_bytes, item.bytes);
         }
         prt_release2_done.insert(&entry);
+        static std::atomic<u32> rel2_item_logged{};
+        if (rel2_item_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-GPUPIC [{}]: VRAMREL2 released {:#x}+{:#x} {}x{} {} ({:.1f} MB, "
+                        "frame {})",
+                        Common::PrtHitch::LocalClock(), entry.info.guest_address,
+                        entry.info.guest_size, entry.info.size.width, entry.info.size.height,
+                        vk::to_string(entry.info.pixel_format), mb(item.bytes), frame);
+        }
         freed += item.bytes;
         ++released;
         return true;
@@ -24799,6 +24837,21 @@ void NativeRenderer::PrtGpuPicChecks() {
     }
     auto& state = PrtGpuPic();
     const bool context = RytyGtsInRace() || RytyRaceRunning();
+    // Round 23: give each post-race menu/roulette/podium a fresh 50-line detail budget.
+    static bool prev_context = false;
+    if (prev_context && !context) {
+        if (state.detailed != 0 || state.alias_detailed != 0 || state.undrawn_detailed != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-GPUPIC [{}]: race ended, resetting detail budgets (was recreated {}, "
+                        "alias {}, undrawn {})",
+                        Common::PrtHitch::LocalClock(), state.detailed, state.alias_detailed,
+                        state.undrawn_detailed);
+        }
+        state.detailed = 0;
+        state.alias_detailed = 0;
+        state.undrawn_detailed = 0;
+    }
+    prev_context = context;
     const u32 shards = Native::ImageRegistry::ShardCount();
     if (state.shard_scanned.size() != shards) {
         state.shard_scanned.assign(shards, frame);
@@ -25037,6 +25090,144 @@ void NativeRenderer::PrtVmaFrag() {
                                                                       double(over))),
                 mb(trimmed_bytes), trims);
     trimmed_bytes = trims = 0;
+}
+
+// PRT-VMADEFRAG (pr-tests, Round 23, RYGT_VMA_DEFRAG, default OFF for first test; 1 = on in GT7):
+// At race-end transitions and out-of-race menus when VRAM is over budget with 512 MB+ free inside
+// device-local VMA blocks (at most once every 30 s), evicts idle guest-memory textures (pure CPU
+// textures, never GPU-drawn pictures), drains the GPU, drops recycled buffers and frees emptied
+// VMA blocks (default + small/medium/tiny image pools). Never runs mid-race.
+void NativeRenderer::PrtVmaDefrag() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_VMA_DEFRAG");
+        return env && env[0] != '0' && Common::IsGt7();
+    }();
+    if (!on) {
+        return;
+    }
+    const bool in_race = RytyGtsInRace() || RytyRaceRunning();
+    static bool was_in_race = false;
+    const bool race_ended = was_in_race && !in_race;
+    was_in_race = in_race;
+    if (in_race) {
+        return;
+    }
+    const VmaAllocator allocator = r.instance.GetAllocator();
+    if (!allocator || !registry || !device) {
+        return;
+    }
+    static std::chrono::steady_clock::time_point last_defrag{};
+    const auto now = std::chrono::steady_clock::now();
+    if (!race_ended && (!prt_trim_over || now - last_defrag < std::chrono::seconds{30})) {
+        return;
+    }
+    if (race_ended && now - last_defrag < std::chrono::seconds{5}) {
+        return;
+    }
+    const auto query_vma_free = [&]() -> u64 {
+        const VkPhysicalDeviceMemoryProperties* props = nullptr;
+        vmaGetMemoryProperties(allocator, &props);
+        if (!props) {
+            return 0;
+        }
+        VmaTotalStatistics stats{};
+        vmaCalculateStatistics(allocator, &stats);
+        u64 blocks = 0, allocated = 0;
+        for (u32 type = 0; type < props->memoryTypeCount; ++type) {
+            if ((props->memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ==
+                0) {
+                continue;
+            }
+            blocks += stats.memoryType[type].statistics.blockBytes;
+            allocated += stats.memoryType[type].statistics.allocationBytes;
+        }
+        return blocks > allocated ? blocks - allocated : 0;
+    };
+    const u64 budget = r.instance.GetTotalMemoryBudget();
+    const u64 vram_before = budget ? r.instance.GetDeviceMemoryUsage() : 0;
+    const u64 free_before = query_vma_free();
+    constexpr u64 MinFreeInside = u64{512} << 20;
+    if (!race_ended && free_before < MinFreeInside) {
+        return;
+    }
+    if (race_ended && budget && vram_before + (u64{512} << 20) < budget &&
+        free_before < MinFreeInside) {
+        return;
+    }
+    last_defrag = now;
+    const auto started = std::chrono::steady_clock::now();
+
+    // Collect idle pure guest-memory textures (never GPU-drawn, no target links) to unpin blocks.
+    constexpr u64 MinIdle = 15;
+    const u64 cutoff = frame > MinIdle ? frame - MinIdle : 0;
+    std::vector<const Native::ImageEntry*> candidates;
+    u64 cand_bytes = 0;
+    const u32 shards = Native::ImageRegistry::ShardCount();
+    for (u32 s = 0; s < shards; ++s) {
+        registry->ForEachImageInShard(s, [&](Native::ImageEntry& entry) {
+            if (!entry.image || !entry.from_cpu || entry.kept.load(std::memory_order_relaxed)) {
+                return;
+            }
+            if (entry.write_version.load(std::memory_order_relaxed) != 0) {
+                return;
+            }
+            if (entry.last_use.load(std::memory_order_relaxed) >= cutoff) {
+                return;
+            }
+            {
+                std::scoped_lock lk{entry.sources_mutex};
+                if (!entry.sources.empty() || !entry.dependents.empty()) {
+                    return;
+                }
+            }
+            candidates.push_back(&entry);
+            cand_bytes += entry.info.guest_size;
+        });
+    }
+    u32 evicted = 0;
+    if (!candidates.empty()) {
+        evicted = registry->EvictListed(candidates, cutoff, [](Native::ImageEntry&) {});
+        if (evicted != 0) {
+            ReleaseUnusedWatches();
+        }
+    }
+    // Drain GPU so retired images/buffers can be collected and their VMA blocks returned to OS.
+    r.scheduler.Finish();
+    device->Collect();
+    device->TrimKeptCopies(0);
+    const u64 trimmed =
+        Vulkan::TrimEmptyVmaBlocks(allocator) + Vulkan::TrimEmptySmallImagePoolBlocks(allocator);
+    const u64 vram_after = budget ? r.instance.GetDeviceMemoryUsage() : 0;
+    const u64 free_after = query_vma_free();
+
+    // Tally remaining live images by CPU vs GPU so we know what still pins fragmented blocks.
+    u64 rem_cpu = 0, rem_cpu_bytes = 0, rem_gpu = 0, rem_gpu_bytes = 0;
+    for (u32 s = 0; s < shards; ++s) {
+        registry->ForEachImageInShard(s, [&](Native::ImageEntry& entry) {
+            if (!entry.image) {
+                return;
+            }
+            if (entry.from_cpu && entry.write_version.load(std::memory_order_relaxed) == 0) {
+                ++rem_cpu;
+                rem_cpu_bytes += entry.info.guest_size;
+            } else {
+                ++rem_gpu;
+                rem_gpu_bytes += entry.info.guest_size;
+            }
+        });
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+            .count();
+    LOG_WARNING(Render_Vulkan,
+                "PRT-VMADEFRAG [{}] ({}): VRAM {} -> {} MB (budget {} MB), VMA free-inside {} -> "
+                "{} MB; evicted {} idle CPU textures ({:.1f} MB), freed {:.1f} MB empty VMA "
+                "blocks in {:.1f} ms (remaining: {} CPU {:.1f} MB, {} GPU {:.1f} MB)",
+                Common::PrtHitch::LocalClock(), race_ended ? "race end" : "menu over budget",
+                vram_before >> 20, vram_after >> 20, budget >> 20, free_before >> 20,
+                free_after >> 20, evicted, double(cand_bytes) / 1048576.0,
+                double(trimmed) / 1048576.0, ms, rem_cpu, double(rem_cpu_bytes) / 1048576.0,
+                rem_gpu, double(rem_gpu_bytes) / 1048576.0);
 }
 
 // ---- Round 21 (pr-tests): PRT-TEXSTALE, PRT-TEXREFRESH, PRT-PROTECTFAIL (GT7 only) -----------
@@ -25492,6 +25683,7 @@ void NativeRenderer::EvictImages() {
     PrtTextureChecks(); // Round 21: PRT-TEXSTALE, PRT-TEXREFRESH, PRT-PROTECTFAIL
     PrtGpuPicChecks();  // Round 22: PRT-GPUPIC
     PrtVmaFrag();       // Round 22: PRT-VMAFRAG
+    PrtVmaDefrag();     // Round 23: PRT-VMADEFRAG
     // NAT-108: images not used for two seconds go (GT Sport's scratch pool holds render
     // targets of ever-changing sizes: the UI's blur panels, effects).
     constexpr u64 KeepFrames = 120;
